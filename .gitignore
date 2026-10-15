@@ -1,0 +1,30 @@
+# Rust build output
+/target/
+
+# Rust backup files from rustfmt
+**/*.rs.bk
+
+# Debug info (Windows/MSVC)
+*.pdb
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS dev: disk images and emulator output
+*.img
+*.iso
+*.bin
+*.qcow2
+*.log
+
+# Environment / secrets (API keys for AI tools, etc.)
+.env
+.env.*
