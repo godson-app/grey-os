@@ -1,7 +1,39 @@
-[package]
-name = "grey-os"
+[workspace]
+members = ["kernel"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+
+[package]
+name = "grey-os"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+default-run = "qemu-uefi"
+
+[lints]
+workspace = true
 
 [dependencies]
-bootloader = "0.9"
+anyhow = "1"
+ovmf-prebuilt = "0.2"
+
+[build-dependencies]
+anyhow = "1"
+kernel = { path = "kernel", artifact = "bin", target = "x86_64-unknown-none" }
+bootloader = "0.11"
+
+[profile.release]
+lto = true
+codegen-units = 1
