@@ -15,7 +15,7 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 
 - [x] Boots in QEMU through UEFI firmware
 - [x] Framebuffer fill (pixel-format aware)
-- [ ] Serial logging and a printing panic handler
+- [x] Serial logging on COM1 and a panic handler that reports to serial and screen
 - [ ] Framebuffer text console and `println!`
 - [ ] Interrupts and exception handling
 - [ ] Memory management (frame allocator, paging, heap)
@@ -37,9 +37,63 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 cargo run
 ```
 
-This builds the kernel, wraps it in a bootable UEFI disk image with the `bootloader` crate, and launches QEMU. On success you will see the bootloader log briefly, then a blue-teal screen drawn by the kernel.
+This builds the kernel, wraps it in a bootable UEFI disk image with the `bootloader` crate, and launches QEMU. On success you will see the bootloader log briefly, then the screen is painted with the boot colour and the kernel exits QEMU with a success status. The serial log lands in this terminal.
 
 The first build is slow because it compiles the bootloader and fetches firmware.
+
+A healthy boot prints approximately:
+
+```text
+grey-os: serial console online (COM1, 115200 8N1)
+grey-os: framebuffer 1280x800, stride 1280, 4 bytes/pixel
+grey-os: display adapter online (direct-to-framebuffer, no back buffer yet)
+grey-os: boot ok
+```
+
+The geometry comes from the firmware; the kernel reports what GOP actually gave it
+rather than assuming a resolution. Because the kernel exits through QEMU's
+`isa-debug-exit` device, the QEMU window closes as soon as boot finishes and
+`cargo run` exits with status 0. A panic prints its message and location to the
+terminal, paints the screen red when a framebuffer is available, and exits with
+status 1.
+
+## `xtask`
+
+The same boot, automated:
+
+```bash
+cargo xtask build   # stage both images in target/grey-os/
+cargo xtask run     # build, then boot the UEFI image with a window
+cargo xtask test    # build, then boot headless; assert `grey-os: boot ok` and exit 33
+```
+
+`test` checks the serial marker _and_ the exit status, and fails on a hang rather
+than waiting forever. `--no-build` skips the nested `cargo build`, `--bios` boots the
+BIOS image instead (built, never verified - see `ROADMAP.md`).
+
+These commands need the alias in `.cargo/config.toml`:
+
+```toml
+[alias]
+xtask = "run --package xtask --"
+```
+
+Without it, `cargo run --package xtask -- test` does the same thing.
+
+Lint the two halves separately: the kernel is `x86_64`-only `no_std` code and does
+not compile for the host architecture (ADR-006 in `DECISIONS.md`).
+
+```bash
+cargo clippy --workspace --exclude kernel                   # host tools + xtask
+cargo clippy --package kernel --target x86_64-unknown-none   # the kernel
+```
+
+Milestone status and acceptance criteria are in `ROADMAP.md`; the reasoning behind
+the build, the drivers and the QEMU setup is in `DECISIONS.md`.
+
+Both disk images are also copied to `target/grey-os/` (`grey-os-uefi.img` and
+`grey-os-bios.img`) so tooling does not have to hunt through hashed build-script
+output directories. Nothing in this repository ever writes to a real disk.
 
 ## Project layout
 

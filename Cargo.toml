@@ -1,5 +1,12 @@
 [workspace]
-members = ["kernel"]
+members = ["kernel", "xtask"]
+# Bare `cargo build/clippy/test` means the host-side image builder and
+# runner only. The kernel is a member so it can be linted for its real
+# target, which must be requested explicitly:
+#   cargo clippy --package kernel --target x86_64-unknown-none
+# Running these for the host fails on asm! registers and the
+# x86_64-gated `bootloader_api::entry_point` macro.
+default-members = ["."]
 resolver = "2"
 
 [workspace.package]

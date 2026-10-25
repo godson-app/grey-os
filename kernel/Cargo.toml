@@ -7,6 +7,9 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "grey_os"
+
 [[bin]]
 name = "kernel"
 test = false
