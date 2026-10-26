@@ -20,7 +20,10 @@ pub const BACKGROUND: Color = Color::new(0x1f, 0x6f, 0x8b);
 pub const PANIC: Color = Color::new(0xb0, 0x1b, 0x2f);
 
 /// Reads the firmware's layout, or `None` if this renderer cannot draw into it.
-fn describe(framebuffer: &FrameBuffer) -> Option<(Geometry, ChannelOrder)> {
+///
+/// Public because a back buffer has to be built with exactly the panel's geometry and
+/// channel order: it is copied onto the panel byte for byte (see [`Canvas::blit`]).
+pub fn layout(framebuffer: &FrameBuffer) -> Option<(Geometry, ChannelOrder)> {
     let info = framebuffer.info();
     let order = match info.pixel_format {
         PixelFormat::Rgb => ChannelOrder::Rgb,
@@ -36,7 +39,7 @@ fn describe(framebuffer: &FrameBuffer) -> Option<(Geometry, ChannelOrder)> {
 
 /// Wraps the live framebuffer in a [`Canvas`], or `None` if it cannot be drawn.
 pub fn canvas(framebuffer: &mut FrameBuffer) -> Option<Canvas<'_>> {
-    let (geometry, order) = describe(framebuffer)?;
+    let (geometry, order) = layout(framebuffer)?;
     Canvas::new(framebuffer.buffer_mut(), geometry, order)
 }
 

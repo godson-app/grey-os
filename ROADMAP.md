@@ -13,8 +13,8 @@ milestone by milestone, so that this file never claims more than was agreed.
 
 | Milestone | Theme                                        | Status                                                              |
 | --------- | -------------------------------------------- | ------------------------------------------------------------------- |
-| M0        | Boot, serial diagnostics, diagnosable panics | **Done** - both acceptance criteria automated; the BIOS image stays unrun |
-| M1        | Display primitives, text, on-screen boot log | **In progress** - the boot log is on screen; the back buffer is not |
+| M0        | Boot, serial diagnostics, diagnosable panics | **Done** - acceptance criteria automated; the BIOS image boots to the kernel's framebuffer check (ADR-009) |
+| M1        | Display primitives, text, on-screen boot log | **In progress** - log on screen and back-buffered; TrueType scope undecided |
 | M2        | Interrupts, exceptions, timers               | Not started                                                         |
 | M3        | Physical and virtual memory management       | Not started                                                         |
 | M4        | Heap allocation and kernel data structures   | Not started (the heap itself moved into M1, see ADR-017)            |
@@ -43,10 +43,12 @@ fails in a way that is visible on a machine with no serial cable attached.
       in `kernel/build.rs`, and `cargo xtask test` rebuilds, boots and asserts
       `[panic]`, the message, the location and the painted panel, then exit 35
       (ADR-023).
+- [x] BIOS image executed: SeaBIOS boots it, the bootloader hands over to the kernel, and
+      the kernel refuses the 24-bit VBE surface it is given (`Bgr, 3 bytes/pixel,
+      1280x720`) with a FATAL line that names the layout (ADR-009). Booting is proven;
+      rendering under BIOS is not, and is not M1's target.
 
-**Open.**
-
-- [ ] BIOS image boots. Built and wired to `cargo xtask run --bios` but never run.
+**Open.** Nothing for M0.
 
 **Acceptance criteria.**
 
@@ -92,17 +94,26 @@ fails in a way that is visible on a machine with no serial cable attached.
       panel, one glyph per canvas call, a scroll that copies pixels instead of redrawing
       them, and a panic screen that keeps the log above the report (ADR-025).
 - [x] The M0 boot log on screen, 78x48 cells at scale 2 on the 1280x800 surface OVMF picks.
+- [x] Back buffer (ADR-026): `display.rs` allocates a 4,000 KiB surface with the panel's own
+      geometry and channel order, the console draws into it, and `Canvas::blit` copies the
+      rows that changed onto the panel - one band copy per line instead of per-pixel writes
+      into panel memory, and the whole grid after a scroll because every row moved. A failed
+      allocation falls back to the ADR-025 path and the boot log says which one is live.
 
 **Open.**
 
-- Double buffering: draw off-screen, present once per frame over a back buffer sized from
-  the heap, with `Canvas::blit` for the final copy. `scroll_up` already copies rows within
-  one surface, which is the same primitive without the second buffer.
-- TrueType rasterisation in `no_std` with a glyph cache.
+- TrueType rasterisation in `no_std` with a glyph cache. Recommended out of M1 and into its
+  own milestone: an sfnt parser, Bézier flattening, a scanline fill and a cache is four
+  pieces of machinery, the cache would fight a bump allocator that never frees, and the face
+  brings a licence question (ADR-024's bitmaps are public domain and settled). Awaiting the
+  scope decision, so M1 is not declared done on a recommendation alone.
 - An open-licence TrueType face (Selawik, Open Sans, Noto) when that item lands; the
   bitmap font shipping now is public domain, recorded in ADR-024.
 - The framebuffer's physical span, so ADR-021's overlap guard stops being inert. Needs a
   page-table walk, which is M3's machinery; today the boot log says the guard is unarmed.
+- Rendering under BIOS/VBE: the legacy image boots but is handed a 24-bit surface this
+  renderer refuses (ADR-009). Either a 24-bit path in `canvas.rs` or a 32-bit VBE mode; not
+  needed while UEFI is the target.
 
 **Acceptance criteria.** The boot log is legible at the firmware-selected
 resolution; a panic paints the panel red with the message rendered in text; screen
@@ -110,11 +121,13 @@ output is presentable without dropping frames on a 1280x800 surface.
 
 Status against them: the log is legible - every line of the boot log was read back off a
 QEMU screenshot with the font table, at 78x48 cells on 1280x800, and the earliest regions
-scroll off because the map is longer than the screen. A panic paints 0xb01b2f, keeps the
-log above the report and renders both in text. The last criterion is the open one:
-repaints are limited to dirty rows and a scroll copies pixels, which brought an emulated
-boot from 12.7 s to 3.5 s (2 s of that is firmware), but there is still no back buffer, so
-a repaint is visible on the panel as it happens.
+scroll off because the map is longer than the screen. A panic paints the whole panel
+0xb01b2f (a screendump check found the grid area was still teal until ADR-026 fixed it),
+keeps the log above the report and renders both in text. The third criterion is met by the
+back buffer: a line is complete in RAM before any of its pixels reach the panel, so a
+repaint is presented in one band copy rather than watched glyph by glyph. Measured emulated
+boot: 3.49 s, of which about 2 s is firmware - unchanged from before the buffer, because the
+time is in QEMU's firmware and in the ~110 memory-map lines, not in the presenting.
 
 ## M2 onward - provisional themes
 
@@ -128,7 +141,7 @@ is approved, per the brief's one-at-a-time rule.
 | ------------------------ | ----------------------------------------------------------------- |
 | QEMU UEFI (OVMF), x86_64 | Primary target. Boots, logs, exits cleanly.                       |
 | QEMU UEFI, 1280x800      | What OVMF actually selects; the kernel logs whatever it is given. |
-| QEMU BIOS (SeaBIOS)      | Image built, invocation wired, never executed.                    |
+| QEMU BIOS (SeaBIOS)      | Boots to the kernel, which refuses VBE's 24-bit surface (ADR-009). |
 | Real x86_64 hardware     | **Not ready.** The UEFI image boots from the root of a FAT32      |
 
 stick with secure boot disabled, but with no filesystem or storage driver there is

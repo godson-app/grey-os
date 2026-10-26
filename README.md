@@ -19,6 +19,7 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 - [x] Heap allocation: a bump allocator over a region picked from the memory map, proved by a boot-time write/read-back (ADR-021, ADR-022)
 - [x] Glyph rendering: a public-domain 8x8 bitmap font and an integer-scaled text renderer, host-tested (ADR-024)
 - [x] On-screen text console: the boot log goes to serial and to the panel, scrolling included (ADR-025)
+- [x] Back buffer and `Canvas::blit`: the console draws into a heap surface and the panel receives only the rows that changed (ADR-026)
 - [ ] Interrupts and exception handling
 - [ ] Memory management (frame allocator, paging)
 - [ ] Scheduler and kernel threads
@@ -57,6 +58,7 @@ grey-os: heap ready 0x28001780000..0x2801bb6c000, 430000 KiB reserved
 grey-os: heap probe ok: 4 KiB read back, 1 allocations, 4096 bytes in use
 grey-os: framebuffer 1280x800, stride 1280, 4 bytes/pixel
 grey-os: display adapter online, 78x48 cells at scale 2
+grey-os: console draws into a 4000 KiB back buffer
 grey-os: boot ok
 ```
 
@@ -148,11 +150,11 @@ grey-os/
     └── src/
         ├── main.rs        # entry point, boot sequence, panic handler
         ├── lib.rs         # module list: what the host tests can reach
-        ├── canvas.rs      # geometry, one Colour, fill/fill_rect/blend_rect/scroll_up
+        ├── canvas.rs      # geometry, one Colour, fill/blend/scroll/blit
         ├── font.rs        # public-domain 8x8 bitmaps, printable ASCII (ADR-024)
         ├── text.rs        # glyph drawing at an integer scale, metrics
         ├── console.rs     # character grid: cursor, wrapping, scrolling (ADR-025)
-        ├── display.rs     # console instance, panel repaint, panic screen
+        ├── display.rs     # console instance, back buffer, panel repaint, panic screen
         ├── framebuffer.rs # boot-info framebuffer -> Canvas adapter
         ├── memory.rs      # memory map, heap region selection
         ├── heap.rs        # bump allocator behind `GlobalAlloc`

@@ -146,6 +146,15 @@ cheapest fallback for an old machine.
 **Consequences.** No false confidence. It is one command away from being tested, and
 `xtask test` does not touch it.
 
+**Outcome (M1).** Executed at last, and the honest result is that it boots but does not
+render. SeaBIOS loads the image, the bootloader maps the kernel and jumps to it, and the
+kernel reaches its framebuffer check with COM1 up - then refuses the surface VBE offers:
+`Bgr, 3 bytes/pixel, 1280x720`, a 24-bit mode, where the renderer only draws 32-bit pixels
+(`canvas::BYTES_PER_PIXEL`). So the image is executed and the failure is the kernel's own
+stated limitation rather than an untested path. Teaching `Canvas` 24-bit surfaces, or asking
+VBE for a 32-bit mode, is work for a milestone that cares about BIOS; the UEFI path is what
+M1 is verified on.
+
 ## ADR-010: The kernel logs the geometry firmware gives it
 
 **Status:** accepted, M0.
@@ -553,5 +562,40 @@ The remaining per-glyph cost is why a back buffer and a proper `blit` are still 
 list. The first two log lines (serial online, and any failure before the heap exists) are
 serial-only by nature, and the grid is sized at boot, so a mode change would need a new
 console.
+
+## ADR-026: The console draws into a back buffer and the panel receives the rows that changed
+
+**Status:** accepted, M1.
+
+**Context.** ADR-025 put the log on the panel but painted it glyph by glyph directly into the
+firmware's framebuffer. Three things came with that. A line was visible while it was being
+drawn, so a screenshot - or a human - could catch half a glyph. Every pixel a glyph wrote was
+a separate write into panel memory. And the last M1 criterion, "presentable without dropping
+frames", cannot be met while drawing and presenting are the same operation, because there is
+nothing to present *from*.
+
+**Decision.** `display.rs` allocates one full-screen surface from the bump heap at boot -
+4,000 KiB on the 1280x800 panel OVMF picks - with the panel's own `Geometry` and
+`ChannelOrder`, and the console draws into it. `Canvas::blit` then copies onto the panel only
+the area that changed: the dirty band for an appended line, the whole grid after a scroll,
+because a scroll moved every row of it. `blit` is a `copy_from_slice` per row, so the panel is
+written in bands instead of per pixel, and it refuses two surfaces whose channel order or
+pixel size differ - a byte copy would put red where blue belongs, and copying nothing is the
+only honest answer. `Console::mark_painted` lets a full `render` leave the grid current, so
+the line after a repaint costs one row rather than a screen. A failed allocation, or a boot
+before the heap exists, falls back to the ADR-025 path of drawing straight onto the panel, and
+the boot log names the one in use.
+
+**Consequences.** A line now reaches the panel as one band copy after it is complete in RAM,
+which is what makes a repaint presentable rather than watchable, and the cost of a line no
+longer grows with the number of pixels its glyphs touch in panel memory. Measured: emulated
+boot 3.49 s against 3.5 s before (about 2 s of which is firmware), 4 MiB of a 430 MiB heap,
+one extra `memcpy` of roughly 1 MB per scroll. The buffer doubles the memory a screen needs,
+so a much larger panel would want a bounded one - a band buffer rather than a full surface -
+which is a change to the same three functions when it is needed. The panic path had to be told
+the new background: verifying this with a screendump showed the grid area still on the boot
+teal, because `paint` had always used `BACKGROUND` and only the margins were red - so
+ADR-025's "paints the screen 0xb01b2f" was true only around the text, and now it is true of the
+whole panel.
 
 

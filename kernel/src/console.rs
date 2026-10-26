@@ -204,6 +204,14 @@ impl Console {
         self.dirty_from
     }
 
+    /// Marks every row as already painted.
+    ///
+    /// For the caller that has just drawn the whole grid with [`Console::render`]: without
+    /// it the next [`Console::present`] would repaint rows that are already on the screen.
+    pub fn mark_painted(&mut self) {
+        self.dirty_from = self.rows;
+    }
+
     /// Rows scrolled since the last call, and resets the count.
     ///
     /// The display copies the pixels up by that many rows instead of repainting them: the
@@ -473,6 +481,26 @@ mod tests {
     #[test]
     fn a_new_console_needs_painting_from_the_top() {
         assert_eq!(console().dirty_from(), 0);
+    }
+
+    #[test]
+    fn a_full_render_leaves_nothing_dirty() {
+        let mut console = console();
+        console.write("drawn by render\n");
+        let mut pixels = blank();
+        {
+            let mut surface = canvas(&mut pixels);
+            console.render(&mut surface, (0, 0), FG, BG, 1);
+            console.mark_painted();
+        }
+        assert_eq!(console.dirty_from(), console.rows());
+        // A present straight afterwards must not repaint: the grid is already drawn.
+        pixels.fill(0x7f);
+        {
+            let mut surface = canvas(&mut pixels);
+            console.present(&mut surface, (0, 0), FG, BG, 1);
+        }
+        assert!(pixels.iter().all(|byte| *byte == 0x7f));
     }
 
     #[test]

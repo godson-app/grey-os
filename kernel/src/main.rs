@@ -157,7 +157,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     };
     let info = screen.info();
     if !framebuffer::fill(screen, framebuffer::BACKGROUND) {
-        println!("grey-os: FATAL: framebuffer layout unsupported (need 4-byte RGB or BGR)");
+        // Say what the firmware offered: under BIOS a VBE mode can be 24-bit or palettised,
+        // and "unsupported" alone leaves the next person guessing which.
+        println!("grey-os: FATAL: framebuffer layout unsupported");
+        println!(
+            "grey-os: framebuffer {:?}, {} bytes/pixel, stride {}, {}x{}",
+            info.pixel_format, info.bytes_per_pixel, info.stride, info.width, info.height
+        );
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
     }
     framebuffer::install(screen);
@@ -216,6 +222,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             "grey-os: display adapter online, {columns}x{rows} cells at scale {}",
             display::SCALE
         );
+        match display::back_buffer_bytes() {
+            // The console draws into this and copies the rows that changed onto the panel,
+            // which is what stops a line from being painted glyph by glyph on the panel.
+            Some(bytes) => println!(
+                "grey-os: console draws into a {} KiB back buffer",
+                bytes / 1024
+            ),
+            None => println!("grey-os: console draws straight to the panel, no back buffer"),
+        }
     }
 
     // The M0 acceptance criterion "a forced panic prints `[panic] <message>` and its

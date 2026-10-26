@@ -243,6 +243,44 @@ impl<'a> Canvas<'a> {
         );
     }
 
+    /// Copies `rect` from `source` onto this surface, clipped to both.
+    ///
+    /// This is the present half of drawing into a back buffer: whole rows move at once, so
+    /// the cost is proportional to the pixels copied rather than to the glyphs they came
+    /// from, and the panel is written once per band instead of once per pixel.
+    ///
+    /// The two surfaces must share a layout - the same bytes per pixel and the same
+    /// [`ChannelOrder`]. The copy is by bytes, so a surface in the other order would take
+    /// red for blue; that case copies nothing rather than painting wrong colours.
+    pub fn blit(&mut self, source: &Canvas<'_>, rect: Rect) {
+        if source.geometry.bytes_per_pixel != self.geometry.bytes_per_pixel
+            || source.order != self.order
+        {
+            return;
+        }
+        let Some((x, y, width, height)) = rect.clip(self.geometry.width, self.geometry.height)
+        else {
+            return;
+        };
+        // Clip again against the source. A back buffer always has the panel's geometry, but
+        // reading past the last row of a smaller source would be out of bounds, and this is
+        // the only place in the module where two buffers are indexed at once.
+        let width = width.min(source.geometry.width.saturating_sub(x));
+        let height = height.min(source.geometry.height.saturating_sub(y));
+        if width == 0 || height == 0 {
+            return;
+        }
+        let destination_stride = self.geometry.stride * BYTES_PER_PIXEL;
+        let source_stride = source.geometry.stride * BYTES_PER_PIXEL;
+        let offset = x * BYTES_PER_PIXEL;
+        let count = width * BYTES_PER_PIXEL;
+        for row in 0..height {
+            let from = (y + row) * source_stride + offset;
+            let to = (y + row) * destination_stride + offset;
+            self.pixels[to..to + count].copy_from_slice(&source.pixels[from..from + count]);
+        }
+    }
+
     /// Paints `color` on the pixels of `rect` for which `keep` returns true, clipped to the
     /// surface.
     ///
@@ -567,5 +605,107 @@ mod tests {
             canvas.scroll_up(Rect::new(0, 0, 4, 3), 0, Color::BLACK);
         }
         assert!(pixels.iter().all(|byte| *byte == u8::MAX));
+    }
+
+    #[test]
+    fn blitting_copies_the_rect_and_its_padding_stays_put() {
+        let mut source_pixels = blank();
+        {
+            let mut source = canvas(&mut source_pixels);
+            source.fill(Color::WHITE);
+        }
+        let mut pixels = blank();
+        {
+            let source = canvas(&mut source_pixels);
+            let mut destination = canvas(&mut pixels);
+            destination.blit(&source, Rect::new(1, 1, 2, 2));
+        }
+        for (x, y) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+            assert_eq!(
+                pixel(&pixels, x, y),
+                [u8::MAX; BYTES_PER_PIXEL],
+                "({x}, {y})"
+            );
+        }
+        assert_eq!(
+            pixel(&pixels, 0, 0),
+            [0; BYTES_PER_PIXEL],
+            "outside the rect"
+        );
+        assert_eq!(
+            pixel(&pixels, 3, 1),
+            [0; BYTES_PER_PIXEL],
+            "outside the rect"
+        );
+        // The two padding columns are not part of the image and must not be copied into.
+        for y in 0..3 {
+            assert_eq!(
+                pixel(&pixels, 4, y),
+                [0; BYTES_PER_PIXEL],
+                "padding, row {y}"
+            );
+            assert_eq!(
+                pixel(&pixels, 5, y),
+                [0; BYTES_PER_PIXEL],
+                "padding, row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn blitting_clips_a_rect_that_hangs_off_the_surface() {
+        let mut source_pixels = blank();
+        {
+            let mut source = canvas(&mut source_pixels);
+            source.fill(Color::WHITE);
+        }
+        let mut pixels = blank();
+        {
+            let source = canvas(&mut source_pixels);
+            let mut destination = canvas(&mut pixels);
+            // Two columns and two rows of this rect are off the surface, on each side.
+            destination.blit(&source, Rect::new(-2, -2, 6, 5));
+        }
+        // Only the part that is on the surface arrives, at the same coordinates it had.
+        for y in 0..3 {
+            for x in 0..4 {
+                assert_eq!(
+                    pixel(&pixels, x, y),
+                    [u8::MAX; BYTES_PER_PIXEL],
+                    "({x}, {y})"
+                );
+            }
+        }
+        assert_eq!(pixel(&pixels, 4, 0), [0; BYTES_PER_PIXEL], "padding");
+
+        let mut untouched = blank();
+        {
+            let source = canvas(&mut source_pixels);
+            let mut destination = canvas(&mut untouched);
+            destination.blit(&source, Rect::new(0, 0, 4, 0));
+        }
+        assert!(
+            untouched.iter().all(|byte| *byte == 0),
+            "a zero-height rect"
+        );
+    }
+
+    #[test]
+    fn blitting_refuses_a_surface_in_the_other_channel_order() {
+        let mut source_pixels = blank();
+        {
+            let mut source = Canvas::new(&mut source_pixels, GEOMETRY, ChannelOrder::Rgb)
+                .expect("geometry fits");
+            source.fill(Color::WHITE);
+        }
+        let mut pixels = blank();
+        {
+            let source = Canvas::new(&mut source_pixels, GEOMETRY, ChannelOrder::Rgb)
+                .expect("geometry fits");
+            // This canvas is Bgr, so a byte copy would swap red and blue. Nothing is copied.
+            let mut destination = canvas(&mut pixels);
+            destination.blit(&source, Rect::new(0, 0, 4, 3));
+        }
+        assert!(pixels.iter().all(|byte| *byte == 0));
     }
 }
