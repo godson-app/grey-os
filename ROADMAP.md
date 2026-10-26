@@ -14,7 +14,7 @@ milestone by milestone, so that this file never claims more than was agreed.
 | Milestone | Theme                                        | Status                                                              |
 | --------- | -------------------------------------------- | ------------------------------------------------------------------- |
 | M0        | Boot, serial diagnostics, diagnosable panics | **Done** - both acceptance criteria automated; the BIOS image stays unrun |
-| M1        | Display primitives, text, on-screen boot log | **In progress** - canvas, framebuffer adapter and heap have landed  |
+| M1        | Display primitives, text, on-screen boot log | **In progress** - the boot log is on screen; the back buffer is not |
 | M2        | Interrupts, exceptions, timers               | Not started                                                         |
 | M3        | Physical and virtual memory management       | Not started                                                         |
 | M4        | Heap allocation and kernel data structures   | Not started (the heap itself moved into M1, see ADR-017)            |
@@ -84,24 +84,37 @@ fails in a way that is visible on a machine with no serial cable attached.
       (ADR-023).
 - [x] `font.rs`: public-domain 8x8 bitmaps for printable ASCII, provenance and upstream
       checksum in the header (ADR-024).
-- [x] `text.rs`: glyph drawing with integer scaling, ink runs coalesced into one rect per
-      run, clipping delegated to `fill_rect`, and 16 host tests covering bit order,
-      scaling, clipping, pen advance and metrics.
+- [x] `text.rs`: glyph drawing with integer scaling, clipping delegated to `fill_rect`, and
+      16 host tests covering bit order, scaling, clipping, pen advance and metrics.
+- [x] `console.rs`: a character grid with a cursor, wrapping, `\t`/`\r` handling, scrolling
+      and dirty-row tracking, host-tested against real glyph output.
+- [x] `display.rs`: the console instance on the heap, `println!` writing to serial and the
+      panel, one glyph per canvas call, a scroll that copies pixels instead of redrawing
+      them, and a panic screen that keeps the log above the report (ADR-025).
+- [x] The M0 boot log on screen, 78x48 cells at scale 2 on the 1280x800 surface OVMF picks.
 
 **Open.**
 
-- Double buffering: draw off-screen, present once per frame. Needs `Canvas::blit`, which
-  is the one primitives item still missing - `fill`, `fill_rect` and `blend_rect` are in.
+- Double buffering: draw off-screen, present once per frame over a back buffer sized from
+  the heap, with `Canvas::blit` for the final copy. `scroll_up` already copies rows within
+  one surface, which is the same primitive without the second buffer.
 - TrueType rasterisation in `no_std` with a glyph cache.
 - An open-licence TrueType face (Selawik, Open Sans, Noto) when that item lands; the
   bitmap font shipping now is public domain, recorded in ADR-024.
-- The M0 boot log rendered on screen through the new text path.
 - The framebuffer's physical span, so ADR-021's overlap guard stops being inert. Needs a
   page-table walk, which is M3's machinery; today the boot log says the guard is unarmed.
 
 **Acceptance criteria.** The boot log is legible at the firmware-selected
 resolution; a panic paints the panel red with the message rendered in text; screen
 output is presentable without dropping frames on a 1280x800 surface.
+
+Status against them: the log is legible - every line of the boot log was read back off a
+QEMU screenshot with the font table, at 78x48 cells on 1280x800, and the earliest regions
+scroll off because the map is longer than the screen. A panic paints 0xb01b2f, keeps the
+log above the report and renders both in text. The last criterion is the open one:
+repaints are limited to dirty rows and a scroll copies pixels, which brought an emulated
+boot from 12.7 s to 3.5 s (2 s of that is firmware), but there is still no back buffer, so
+a repaint is visible on the panel as it happens.
 
 ## M2 onward - provisional themes
 

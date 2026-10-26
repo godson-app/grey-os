@@ -515,3 +515,43 @@ upstream; `F`'s first row is the test that pins it down, since mirrored `A` or `
 perfectly plausible.
 
 
+## ADR-025: The boot log goes to a heap-allocated cell grid, painted by dirty rows
+
+**Status:** accepted, M1.
+
+**Context.** Printing to a panel needs a text model. Immediate mode - draw each line at a
+cursor and never look back - cannot scroll, because the pixels above are the only copy of
+the earlier lines. A ring of formatted strings costs a format per line and cannot render
+twice with a different background. A grid of characters costs one byte per cell and makes
+wrapping, `\r`, tabs and scrolling arithmetic instead of pixel work, which also means they
+can be tested on the host.
+
+Two smaller questions came with it. Where the grid lives: it cannot be a local in
+`kernel_main`, because the panic handler has no caller to borrow it from. And how a
+repaint stays cheap: the firmware's memory map is about 110 lines on a 512 MiB guest, far
+more than the 48 rows a 1280x800 panel holds at scale 2, so most lines arrive after the
+screen is full and every one of them scrolls.
+
+**Decision.** `console.rs` is a pure grid - `Vec<u8>`, cursor, wrap, scroll, dirty-row
+tracking - allocated once at boot from the bump allocator and covered by host tests.
+`display.rs` (x86_64) owns the single instance behind an `AtomicPtr`, exactly like the
+framebuffer, so `println!` and the panic handler reach the same log without passing
+references. Logging writes the text, appends the newline and repaints only the rows marked
+dirty; a scroll copies the pixels up with `Canvas::scroll_up` (a `copy_within` per row) and
+repaints the two rows that moved. A panic fills the panel 0xb01b2f, appends the report to
+the grid and repaints everything with red as the background, so the log stays visible above
+the message. The boot sequence also had to be reordered: discovery first, logging after
+`display::init`, so the panel receives the whole log rather than its tail.
+
+**Consequences.** Writing a character never allocates, which is what makes the console
+usable from the panic handler after something has gone wrong. Wrapping, tabs and scrolling
+are unit-tested rather than eyeballed, and the boot log was read back off a QEMU screenshot
+by matching cells against the font table - the check that the panel really says what the
+serial port says. Costs, all measured: a full repaint per line took 12.7 s of emulated boot
+before dirty rows and the pixel-copy scroll, 3.5 s after, of which about 2 s is firmware.
+The remaining per-glyph cost is why a back buffer and a proper `blit` are still on M1's
+list. The first two log lines (serial online, and any failure before the heap exists) are
+serial-only by nature, and the grid is sized at boot, so a mode change would need a new
+console.
+
+

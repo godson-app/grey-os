@@ -18,7 +18,7 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 - [x] Serial logging on COM1 and a panic handler that reports to serial and screen
 - [x] Heap allocation: a bump allocator over a region picked from the memory map, proved by a boot-time write/read-back (ADR-021, ADR-022)
 - [x] Glyph rendering: a public-domain 8x8 bitmap font and an integer-scaled text renderer, host-tested (ADR-024)
-- [ ] Framebuffer text console and `println!`
+- [x] On-screen text console: the boot log goes to serial and to the panel, scrolling included (ADR-025)
 - [ ] Interrupts and exception handling
 - [ ] Memory management (frame allocator, paging)
 - [ ] Scheduler and kernel threads
@@ -47,16 +47,16 @@ A healthy boot prints approximately:
 
 ```text
 grey-os: serial console online (COM1, 115200 8N1)
-grey-os: WARNING: framebuffer physical base unpublished, so the heap is not kept off it
+grey-os: WARNING: framebuffer physical base unknown, heap guard unarmed
 grey-os: memory 0x0000000000-0x0000087000     540 KiB usable
 grey-os: memory 0x0000087000-0x0000088000       4 KiB usable
 ...                                    # one line per firmware region, elided here
 grey-os: memory usable total 512824 KiB
 grey-os: heap candidate 0x0001780000-0x001bb6c000 (430000 KiB)
 grey-os: heap ready 0x28001780000..0x2801bb6c000, 430000 KiB reserved
-grey-os: heap probe: 4 KiB written and read back, 1 allocations, 4096 bytes in use
+grey-os: heap probe ok: 4 KiB read back, 1 allocations, 4096 bytes in use
 grey-os: framebuffer 1280x800, stride 1280, 4 bytes/pixel
-grey-os: display adapter online (direct-to-framebuffer, no back buffer yet)
+grey-os: display adapter online, 78x48 cells at scale 2
 grey-os: boot ok
 ```
 
@@ -67,10 +67,15 @@ physical-memory window (`0x28001780000` here, 2.5 TiB above zero). The `WARNING`
 expected for now: `bootloader_api` 0.11 does not publish the framebuffer's physical
 address, so the heap cannot yet be proved clear of it - see ADR-021 and ADR-022.
 
+The same lines are drawn on the panel: the 8x8 font at scale 2, 78 columns by 48 rows on
+the 1280x800 surface, 16 pixels in from each edge. The firmware's memory map is longer
+than 48 lines, so the earliest regions scroll off before boot finishes - the panel shows
+the tail of the log and the serial port keeps all of it.
+
 Because the kernel exits through QEMU's `isa-debug-exit` device, the QEMU window closes
 as soon as boot finishes and `cargo run` exits with status 0. A panic prints its message
-and location to the terminal, paints the screen red when a framebuffer is available, and
-exits with status 1.
+and location to the terminal and exits with status 1, after painting the panel 0xb01b2f,
+keeping the log so far on it and rendering the report underneath in text.
 
 ## `xtask`
 
@@ -143,9 +148,11 @@ grey-os/
     └── src/
         ├── main.rs        # entry point, boot sequence, panic handler
         ├── lib.rs         # module list: what the host tests can reach
-        ├── canvas.rs      # geometry, one Colour, fill/fill_rect/blend_rect
+        ├── canvas.rs      # geometry, one Colour, fill/fill_rect/blend_rect/scroll_up
         ├── font.rs        # public-domain 8x8 bitmaps, printable ASCII (ADR-024)
         ├── text.rs        # glyph drawing at an integer scale, metrics
+        ├── console.rs     # character grid: cursor, wrapping, scrolling (ADR-025)
+        ├── display.rs     # console instance, panel repaint, panic screen
         ├── framebuffer.rs # boot-info framebuffer -> Canvas adapter
         ├── memory.rs      # memory map, heap region selection
         ├── heap.rs        # bump allocator behind `GlobalAlloc`

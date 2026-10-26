@@ -11,12 +11,19 @@
 
 #![cfg_attr(not(test), no_std)]
 
+// The kernel has no `std`, and the host tests get `alloc` through it, so declaring the
+// crate here lets the console's `Vec` and `String` be written once for both builds.
+extern crate alloc;
+
 pub mod canvas;
+pub mod console;
 pub mod font;
 pub mod heap;
 pub mod memory;
 pub mod text;
 
+#[cfg(target_arch = "x86_64")]
+pub mod display;
 #[cfg(target_arch = "x86_64")]
 pub mod framebuffer;
 #[cfg(target_arch = "x86_64")]

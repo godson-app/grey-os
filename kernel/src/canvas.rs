@@ -209,6 +209,70 @@ impl<'a> Canvas<'a> {
         });
     }
 
+    /// Moves the pixels of `rect` up by `dy` pixels and fills the gap with `color`.
+    ///
+    /// This is a console scroll: `copy_within` moves whole rows, so the work is proportional
+    /// to pixels rather than to glyphs. The alternative - clearing the band and redrawing
+    /// the text that was already there - spends seconds on a boot log that outgrows the
+    /// screen, because every line then repaints every row.
+    pub fn scroll_up(&mut self, rect: Rect, dy: u32, color: Color) {
+        let Some((x, y, width, height)) = rect.clip(self.geometry.width, self.geometry.height)
+        else {
+            return;
+        };
+        let dy = (usize::try_from(dy).unwrap_or(usize::MAX)).min(height);
+        if dy == 0 {
+            return;
+        }
+        if dy == height {
+            return self.fill_rect(rect, color);
+        }
+        let stride_bytes = self.geometry.stride * BYTES_PER_PIXEL;
+        let offset = x * BYTES_PER_PIXEL;
+        let count = width * BYTES_PER_PIXEL;
+        // `copy_within` handles the overlap, and `new` proved every index here is inside
+        // the buffer, padding rows included.
+        for row in y..y + height - dy {
+            let source = (row + dy) * stride_bytes + offset;
+            self.pixels
+                .copy_within(source..source + count, row * stride_bytes + offset);
+        }
+        self.fill_rect(
+            Rect::new(x as i32, (y + height - dy) as i32, width as u32, dy as u32),
+            color,
+        );
+    }
+
+    /// Paints `color` on the pixels of `rect` for which `keep` returns true, clipped to the
+    /// surface.
+    ///
+    /// `keep` receives each pixel's coordinates relative to `rect`'s top-left corner, so a
+    /// caller can hand over a bitmap without knowing where the rect was clipped. This is
+    /// what makes a glyph one call: drawing it as a mask costs a fraction of the ~30
+    /// `fill_rect` calls per ink run it used to take, which was measurable in the boot log.
+    pub fn fill_where(&mut self, rect: Rect, color: Color, keep: impl Fn(u32, u32) -> bool) {
+        let Some((x, y, width, height)) = rect.clip(self.geometry.width, self.geometry.height)
+        else {
+            return;
+        };
+        let encoded = self.encode(color, u8::MAX);
+        let stride_bytes = self.geometry.stride * BYTES_PER_PIXEL;
+        // Clipping only ever moves the origin right and down, so these are never negative.
+        let origin_x = (x as i64 - i64::from(rect.x)) as u32;
+        let origin_y = (y as i64 - i64::from(rect.y)) as u32;
+        for row_index in 0..height {
+            let start = (y + row_index) * stride_bytes;
+            let row = &mut self.pixels[start..start + stride_bytes];
+            for column in 0..width {
+                if !keep(origin_x + column as u32, origin_y + row_index as u32) {
+                    continue;
+                }
+                let offset = (x + column) * BYTES_PER_PIXEL;
+                row[offset..offset + BYTES_PER_PIXEL].copy_from_slice(&encoded);
+            }
+        }
+    }
+
     /// Runs `paint` once per visible row of `rect`, handing it the row, the byte
     /// offset of the rect inside that row, and the byte width to paint.
     fn paint(&mut self, rect: Rect, mut paint: impl FnMut(&mut [u8], usize, usize)) {
@@ -220,17 +284,16 @@ impl<'a> Canvas<'a> {
         let count = width * BYTES_PER_PIXEL;
         // `new` proved the buffer holds `height` full rows, so every row here has
         // room for `offset + count`.
-        for row in self.rows().skip(y).take(height) {
+        //
+        // The first row is indexed directly rather than reached with `rows().skip(y)`:
+        // skipping walks every row above the rect, and text drawing makes thousands of
+        // these calls per line, nearly all of them low on the screen.
+        let stride_bytes = self.geometry.stride * BYTES_PER_PIXEL;
+        let start = y * stride_bytes;
+        let end = start + height * stride_bytes;
+        for row in self.pixels[start..end].chunks_mut(stride_bytes) {
             paint(row, offset, count);
         }
-    }
-
-    /// Iterates the surface one row at a time, padding included.
-    fn rows(&mut self) -> impl Iterator<Item = &mut [u8]> + '_ {
-        let stride_bytes = self.geometry.stride * BYTES_PER_PIXEL;
-        self.pixels
-            .chunks_mut(stride_bytes)
-            .take(self.geometry.height)
     }
 
     /// The bytes one pixel occupies, in the firmware's order.
@@ -432,5 +495,77 @@ mod tests {
             .expect("geometry fits")
             .fill_rect(Rect::new(0, 0, 1, 1), color);
         assert_eq!(pixel(&rgb_pixels, 0, 0), [1, 2, 3, u8::MAX]);
+    }
+
+    #[test]
+    fn fills_only_the_pixels_the_mask_selects() {
+        let mut pixels = blank();
+        {
+            let mut canvas = canvas(&mut pixels);
+            // A 2x2 rect at the top left, keeping only the diagonal.
+            canvas.fill_where(Rect::new(0, 0, 2, 2), Color::WHITE, |x, y| x == y);
+        }
+        assert_eq!(pixel(&pixels, 0, 0), [u8::MAX; BYTES_PER_PIXEL]);
+        assert_eq!(pixel(&pixels, 1, 1), [u8::MAX; BYTES_PER_PIXEL]);
+        assert_eq!(pixel(&pixels, 1, 0), [0; BYTES_PER_PIXEL]);
+        assert_eq!(pixel(&pixels, 0, 1), [0; BYTES_PER_PIXEL]);
+    }
+
+    #[test]
+    fn a_clipped_mask_is_still_in_step_with_the_rect() {
+        let mut pixels = blank();
+        {
+            let mut canvas = canvas(&mut pixels);
+            // Half of the rect is off the left edge, so the mask must be sampled from
+            // column 2 at x = 0 - the rect's own coordinates, not the surface's.
+            canvas.fill_where(Rect::new(-2, 0, 4, 1), Color::WHITE, |x, _| x >= 2);
+        }
+        assert_eq!(pixel(&pixels, 0, 0), [u8::MAX; BYTES_PER_PIXEL]);
+        assert_eq!(pixel(&pixels, 1, 0), [u8::MAX; BYTES_PER_PIXEL]);
+        assert_eq!(pixel(&pixels, 2, 0), [0; BYTES_PER_PIXEL]);
+    }
+
+    #[test]
+    fn scrolling_moves_rows_up_and_fills_the_gap() {
+        let mut pixels = blank();
+        {
+            let mut canvas = canvas(&mut pixels);
+            canvas.fill(Color::WHITE);
+            canvas.fill_rect(Rect::new(0, 0, 4, 1), Color::new(0, 0, 1));
+            canvas.fill_rect(Rect::new(0, 1, 4, 1), Color::new(0, 0, 2));
+            canvas.scroll_up(Rect::new(0, 0, 4, 3), 1, Color::BLACK);
+        }
+        // Row 1 moved up to row 0, row 2 stayed white, and the vacated row is black. The
+        // test canvas is Bgr, so `Color::new(0, 0, n)` lands as [n, 0, 0].
+        assert_eq!(pixel(&pixels, 0, 0), [2, 0, 0, u8::MAX]);
+        assert_eq!(pixel(&pixels, 0, 1), [u8::MAX; BYTES_PER_PIXEL]);
+        assert_eq!(pixel(&pixels, 0, 2), [0, 0, 0, u8::MAX]);
+    }
+
+    #[test]
+    fn scrolling_by_the_whole_height_clears_the_rect() {
+        let mut pixels = blank();
+        {
+            let mut canvas = canvas(&mut pixels);
+            canvas.fill(Color::WHITE);
+            canvas.scroll_up(Rect::new(0, 0, 4, 3), 3, Color::BLACK);
+        }
+        // The visible area is black; the padding columns are outside the rect and keep
+        // what `fill` put there.
+        for y in 0..3 {
+            assert_eq!(pixel(&pixels, 0, y), [0, 0, 0, u8::MAX]);
+            assert_eq!(pixel(&pixels, 4, y), [u8::MAX; BYTES_PER_PIXEL]);
+        }
+    }
+
+    #[test]
+    fn scrolling_by_nothing_changes_nothing() {
+        let mut pixels = blank();
+        {
+            let mut canvas = canvas(&mut pixels);
+            canvas.fill(Color::WHITE);
+            canvas.scroll_up(Rect::new(0, 0, 4, 3), 0, Color::BLACK);
+        }
+        assert!(pixels.iter().all(|byte| *byte == u8::MAX));
     }
 }

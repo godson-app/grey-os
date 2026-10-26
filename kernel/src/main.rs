@@ -10,16 +10,20 @@ use bootloader_api::info::MemoryRegionKind;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
-use grey_os::{framebuffer, halt_loop, heap, memory, qemu, serial};
+use grey_os::{display, framebuffer, halt_loop, heap, memory, qemu, serial};
 
-/// Prints one line to the serial console.
+/// Prints one line to the serial console and, once `display::init` has run, to the panel.
+///
+/// Serial first: it is the channel that keeps working when the screen does not.
 macro_rules! println {
-    () => {
-        grey_os::serial::print_args(format_args!(""))
-    };
-    ($($arg:tt)*) => {
-        grey_os::serial::print_args(format_args!($($arg)*))
-    };
+    () => {{
+        grey_os::serial::print_args(format_args!(""));
+        grey_os::display::print_args(format_args!(""));
+    }};
+    ($($arg:tt)*) => {{
+        grey_os::serial::print_args(format_args!($($arg)*));
+        grey_os::display::print_args(format_args!($($arg)*));
+    }};
 }
 
 /// The kernel's only allocator: a bump allocator over the region the boot sequence
@@ -61,36 +65,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // walk its own page tables (ROADMAP M3), the guard in `pick_heap_region` has no
     // span to enforce, and this says so rather than reserving a made-up range.
     let framebuffer_span: Option<memory::Span> = None;
-    if framebuffer_span.is_none() {
-        println!(
-            "grey-os: WARNING: framebuffer physical base unpublished, so the heap is not kept off it"
-        );
-    }
 
-    // The memory map is firmware data rather than a fact we chose, so log it before
-    // anything spends it. This is the last checkpoint before the heap exists.
+    // Discovery runs before reporting: the console lives on the heap and draws into the
+    // framebuffer, so neither exists yet. Deferring the first log line about the map is
+    // what puts the whole boot log on the panel instead of only its tail.
     let mut usable_bytes: u64 = 0;
     for region in boot_info.memory_regions.iter() {
-        let span = memory::Span::new(region.start, region.end);
-        let kind = match region.kind {
-            MemoryRegionKind::Usable => "usable",
-            MemoryRegionKind::Bootloader => "bootloader",
-            // `MemoryRegionKind` is `#[non_exhaustive]`: a kind a newer firmware
-            // reports is not usable here, and "reserved" is the safe reading.
-            _ => "reserved",
-        };
         if region.kind == MemoryRegionKind::Usable {
-            usable_bytes = usable_bytes.saturating_add(span.len());
+            usable_bytes =
+                usable_bytes.saturating_add(memory::Span::new(region.start, region.end).len());
         }
-        println!(
-            "grey-os: memory {:#012x}-{:#012x} {:>7} KiB {}",
-            span.start,
-            span.end,
-            span.len() / 1024,
-            kind
-        );
     }
-    println!("grey-os: memory usable total {} KiB", usable_bytes / 1024);
 
     let heap_span = memory::pick_heap_region(
         boot_info
@@ -103,107 +88,134 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }),
         framebuffer_span,
     );
-    match heap_span {
-        Some(span) => println!(
-            "grey-os: heap candidate {:#012x}-{:#012x} ({} KiB)",
-            span.start,
-            span.end,
-            span.len() / 1024
-        ),
-        None => {
-            println!("grey-os: FATAL: no usable memory region to draw a heap from");
-            qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    let Some(span) = heap_span else {
+        println!("grey-os: FATAL: no usable memory region to draw a heap from");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    };
+
+    // The span picked above is physical memory that firmware happens to map somewhere of
+    // its choosing. Convert it through `physical_memory_offset` before the allocator sees
+    // it: handing `GlobalAlloc` a physical address writes to whatever is mapped at that
+    // virtual address, which is silent corruption rather than a failed boot.
+    //
+    // The window enabled by `BOOTLOADER_CONFIG` above. Read here rather than at the top of
+    // the function: this is the only place that needs it.
+    let offset = boot_info
+        .physical_memory_offset
+        .as_mut()
+        .map(|offset| *offset);
+    let range = offset.and_then(|offset| {
+        let start = offset.checked_add(span.start)?;
+        let end = offset.checked_add(span.end)?;
+        Some((usize::try_from(start).ok()?, usize::try_from(end).ok()?))
+    });
+    let Some((start, end)) = range else {
+        // Two ways to get here, and they need different fixes, so say which.
+        match offset {
+            Some(offset) => println!(
+                "grey-os: FATAL: heap {:#x}..{:#x} does not fit past the {offset:#x} mapping",
+                span.start, span.end
+            ),
+            None => println!(
+                "grey-os: FATAL: boot info carries no physical memory offset, so the heap cannot be reached"
+            ),
         }
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    };
+    // SAFETY: `start..end` is a region the firmware reports as usable, nothing else writes
+    // there, the bootloader maps all of physical memory writable at
+    // `physical_memory_offset` (ADR-022), and this is the only call to `init`.
+    if !unsafe { HEAP.init(start, end) } {
+        println!("grey-os: FATAL: heap range {start:#x}..{end:#x} is not usable");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
     }
 
-    // The span picked above is physical memory that firmware happens to map somewhere
-    // of its choosing. Convert it through `physical_memory_offset` before the
-    // allocator sees it: handing `GlobalAlloc` a physical address writes to whatever
-    // is mapped at that virtual address, which is silent corruption rather than a
-    // failed boot.
-    if let Some(span) = heap_span {
-        // The window enabled by `BOOTLOADER_CONFIG` above. Read here rather than at the
-        // top of the function: this is the only place that needs it.
-        let offset = boot_info
-            .physical_memory_offset
-            .as_mut()
-            .map(|offset| *offset);
-        let range = offset.and_then(|offset| {
-            let start = offset.checked_add(span.start)?;
-            let end = offset.checked_add(span.end)?;
-            Some((usize::try_from(start).ok()?, usize::try_from(end).ok()?))
-        });
-        let Some((start, end)) = range else {
-            // Two ways to get here, and they need different fixes, so say which.
-            match offset {
-                Some(offset) => println!(
-                    "grey-os: FATAL: heap {:#x}..{:#x} does not fit past the {offset:#x} mapping",
-                    span.start, span.end
-                ),
-                None => println!(
-                    "grey-os: FATAL: boot info carries no physical memory offset, so the heap cannot be reached"
-                ),
-            }
-            qemu::exit_qemu(qemu::QemuExitCode::Failed);
-        };
-        // SAFETY: `start..end` is a region the firmware reports as usable, nothing else
-        // writes there, the bootloader maps all of physical memory writable at
-        // `physical_memory_offset` (ADR-022), and this is the only call to `init`.
-        if !unsafe { HEAP.init(start, end) } {
-            println!("grey-os: FATAL: heap range {start:#x}..{end:#x} is not usable");
-            qemu::exit_qemu(qemu::QemuExitCode::Failed);
-        }
-        let stats = HEAP.stats();
-        println!(
-            "grey-os: heap ready {:#x}..{:#x}, {} KiB reserved",
-            stats.base,
-            stats.end,
-            stats.end.saturating_sub(stats.base) / 1024
-        );
-
-        // A heap is only worth anything if the memory behind it is really mapped at the
-        // virtual address the allocator returns. Write a whole page through a `Box` and
-        // read it back: a wrong `physical_memory_offset` faults here, at boot, instead of
-        // in a driver later. This is the kernel's only allocation until a driver needs
-        // one, and it is why the log line below is a claim and not a hope.
-        let mut page = alloc::boxed::Box::new([0u8; 4096]);
-        for (index, byte) in page.iter_mut().enumerate() {
-            *byte = index as u8;
-        }
-        if page
-            .iter()
-            .enumerate()
-            .any(|(index, byte)| *byte != index as u8)
-        {
-            println!("grey-os: FATAL: heap memory did not read back what was written");
-            qemu::exit_qemu(qemu::QemuExitCode::Failed);
-        }
-        let stats = HEAP.stats();
-        println!(
-            "grey-os: heap probe: 4 KiB written and read back, {} allocations, {} bytes in use",
-            stats.allocations, stats.bytes_in_use
-        );
+    // A heap is only worth anything if the memory behind it is really mapped at the
+    // virtual address the allocator returns. Write a whole page through a `Box` and read
+    // it back: a wrong `physical_memory_offset` faults here, at boot, instead of in a
+    // driver later. This is the kernel's only allocation until a driver needs one, and it
+    // is why the log line below is a claim and not a hope.
+    let mut page = alloc::boxed::Box::new([0u8; 4096]);
+    for (index, byte) in page.iter_mut().enumerate() {
+        *byte = index as u8;
     }
-    // UEFI has no VGA text mode, so we draw to the framebuffer instead. This is
-    // the only display path: GOP from boot information, no GPU drivers.
-    if let Some(screen) = boot_info.framebuffer.as_mut() {
-        let info = screen.info();
-        println!(
-            "grey-os: framebuffer {}x{}, stride {}, {} bytes/pixel",
-            info.width, info.height, info.stride, info.bytes_per_pixel
-        );
-
-        if !framebuffer::fill(screen, framebuffer::BACKGROUND) {
-            println!("grey-os: FATAL: framebuffer layout unsupported (need 4-byte RGB or BGR)");
-            qemu::exit_qemu(qemu::QemuExitCode::Failed);
-        }
-        framebuffer::install(screen);
-
-        println!("grey-os: display adapter online (direct-to-framebuffer, no back buffer yet)");
-    } else {
+    if page
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| *byte != index as u8)
+    {
+        println!("grey-os: FATAL: heap memory did not read back what was written");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    let probed = HEAP.stats();
+    // UEFI has no VGA text mode, so we draw to the framebuffer instead. This is the only
+    // display path: GOP from boot information, no GPU drivers.
+    let Some(screen) = boot_info.framebuffer.as_mut() else {
         // Failing loudly beats booting into a black screen nobody can diagnose.
         println!("grey-os: FATAL: boot info carries no framebuffer; GOP is required");
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    };
+    let info = screen.info();
+    if !framebuffer::fill(screen, framebuffer::BACKGROUND) {
+        println!("grey-os: FATAL: framebuffer layout unsupported (need 4-byte RGB or BGR)");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    framebuffer::install(screen);
+    // The console needs the heap above for its grid and the framebuffer for its pixels.
+    if !display::init() {
+        println!("grey-os: FATAL: panel has no room for one character cell");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+
+    // From here every line goes to serial and to the panel. Serial first in each macro
+    // call, because it is the channel that survives a screen going dark later.
+    if framebuffer_span.is_none() {
+        println!("grey-os: WARNING: framebuffer physical base unknown, heap guard unarmed");
+    }
+    for region in boot_info.memory_regions.iter() {
+        let span = memory::Span::new(region.start, region.end);
+        let kind = match region.kind {
+            MemoryRegionKind::Usable => "usable",
+            MemoryRegionKind::Bootloader => "bootloader",
+            // `MemoryRegionKind` is `#[non_exhaustive]`: a kind a newer firmware reports is
+            // not usable here, and "reserved" is the safe reading.
+            _ => "reserved",
+        };
+        println!(
+            "grey-os: memory {:#012x}-{:#012x} {:>7} KiB {}",
+            span.start,
+            span.end,
+            span.len() / 1024,
+            kind
+        );
+    }
+    println!("grey-os: memory usable total {} KiB", usable_bytes / 1024);
+    println!(
+        "grey-os: heap candidate {:#012x}-{:#012x} ({} KiB)",
+        span.start,
+        span.end,
+        span.len() / 1024
+    );
+    let stats = HEAP.stats();
+    println!(
+        "grey-os: heap ready {:#x}..{:#x}, {} KiB reserved",
+        stats.base,
+        stats.end,
+        stats.end.saturating_sub(stats.base) / 1024
+    );
+    println!(
+        "grey-os: heap probe ok: 4 KiB read back, {} allocations, {} bytes in use",
+        probed.allocations, probed.bytes_in_use
+    );
+    println!(
+        "grey-os: framebuffer {}x{}, stride {}, {} bytes/pixel",
+        info.width, info.height, info.stride, info.bytes_per_pixel
+    );
+    if let Some((columns, rows)) = display::grid() {
+        println!(
+            "grey-os: display adapter online, {columns}x{rows} cells at scale {}",
+            display::SCALE
+        );
     }
 
     // The M0 acceptance criterion "a forced panic prints `[panic] <message>` and its
@@ -245,11 +257,12 @@ fn panic(info: &PanicInfo<'_>) -> ! {
         ));
     }
 
-    // Show the failure on the panel too: hardware rarely has a serial cable
-    // attached, and a black screen is undiagnosable. The outcome is reported on
-    // serial as well, because nothing outside the guest can see the screen: that
-    // line is what lets `cargo xtask test` cover this half of the path at all.
-    if framebuffer::with_screen(|screen| framebuffer::fill(screen, framebuffer::PANIC)) {
+    // Show the failure on the panel too: hardware rarely has a serial cable attached, and a
+    // black screen is undiagnosable. The log so far stays above the report and both are
+    // drawn on the panic colour, so the context that led here is still readable. The
+    // outcome is reported on serial as well, because nothing outside the guest can see the
+    // screen: that line is what lets `cargo xtask test` cover this half of the path.
+    if display::paint_panic(info) {
         serial::print_args_unlocked(format_args!("[panic] panel painted red"));
     } else {
         serial::print_args_unlocked(format_args!("[panic] no framebuffer to paint"));

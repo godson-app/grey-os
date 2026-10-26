@@ -42,12 +42,9 @@ pub fn cell_size(scale: usize) -> (u32, u32) {
 ///
 /// Rounded down: a partial cell at the right or bottom edge is unusable for text, and
 /// claiming it would put the last column half off-screen.
-pub fn grid_size(width: u32, height: u32, scale: usize) -> (usize, usize) {
+pub fn grid_size(width: usize, height: usize, scale: usize) -> (usize, usize) {
     let (cell_width, cell_height) = cell_size(scale);
-    (
-        (width / cell_width) as usize,
-        (height / cell_height) as usize,
-    )
+    (width / cell_width as usize, height / cell_height as usize)
 }
 
 /// Draws one character with its top-left corner at `x`, `y`, in `color`.
@@ -58,34 +55,20 @@ pub fn grid_size(width: u32, height: u32, scale: usize) -> (usize, usize) {
 pub fn draw_char(canvas: &mut Canvas<'_>, x: i32, y: i32, ch: char, color: Color, scale: usize) {
     let scale = clamp_scale(scale);
     let rows = font::glyph_or_fallback(ch);
+    let (cell_width, cell_height) = cell_size(scale);
     let block = scale as u32;
-
-    for (row, bits) in rows.iter().enumerate() {
-        let top = y.saturating_add((row * scale) as i32);
-        let mut column = 0;
-        while column < font::GLYPH_WIDTH {
-            if bits & (1 << column) == 0 {
-                column += 1;
-                continue;
-            }
-            // Coalesce a horizontal run of ink into one rectangle. A glyph row is
-            // usually two or three runs, and this keeps a full screen of text to a few
-            // thousand `fill_rect` calls instead of tens of thousands.
-            let start = column;
-            while column < font::GLYPH_WIDTH && bits & (1 << column) != 0 {
-                column += 1;
-            }
-            canvas.fill_rect(
-                Rect::new(
-                    x.saturating_add((start * scale) as i32),
-                    top,
-                    (column - start) as u32 * block,
-                    block,
-                ),
-                color,
-            );
-        }
-    }
+    // One call per glyph, with the bitmap scaled up as the mask is sampled: a rectangle per
+    // ink run was three times the code and tens of times the calls.
+    canvas.fill_where(
+        Rect::new(x, y, cell_width, cell_height),
+        color,
+        |column, row| {
+            let Some(bits) = rows.get((row / block) as usize) else {
+                return false;
+            };
+            bits & (1 << (column / block)) != 0
+        },
+    );
 }
 
 /// Draws `text` from `x`, `y` rightwards, returning the pen position after the last
