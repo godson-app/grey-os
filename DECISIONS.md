@@ -344,6 +344,102 @@ only job is to make a test honest. Until this lands the panic path stays _manual
 verified (message, source location, red screen, exit 35) and is not described
 anywhere as tested.
 
-**Consequences.** The tool behaves the same from any cwd. This closes the trap for
-the image path only: the OVMF cache path (`target/ovmf`) is still relative and can be
-absolutised the same way if it ever causes trouble.
+## ADR-020: The framebuffer adapter validates the layout once
+
+**Status:** accepted, M1.
+
+**Context.** M0 drew with a `fill` that re-checked firmware numbers per pixel
+(`checked_mul` on stride, pixel size and offset, then `get_mut`), carried a `Color`
+type of its own, and switched on `PixelFormat` for every pixel it wrote. All of that
+was needed only because nothing had yet proved the layout was sane. With `Canvas` in
+place, the checks belong where they run once rather than once per pixel.
+
+**Decision.** `framebuffer::describe` maps the firmware's `PixelFormat` to a
+`ChannelOrder` and its numbers to a `Geometry`; `Canvas::new` then rejects the geometry
+unless it fits the buffer, and every draw after that is in bounds by construction. The
+palette format `U8`, and any format this renderer does not recognise, is refused rather
+than guessed at: `fill` returns `false` and the kernel logs a FATAL and exits, because
+painting noise over the panel is worse than refusing to boot. `install` now takes
+`&'static mut FrameBuffer`, so the pointer the panic handler reads is justified by a
+type instead of by a comment.
+
+**Consequences.** One `Color`, one `fill`, and one place that decides byte order.
+`write_pixel` and its per-pixel `match` are gone, along with the U8 luminance path. The
+cost is that a palette framebuffer cannot boot at all; no GOP implementation in
+practice reports one, and the failure is loud and specific rather than a corrupted
+image. The channel order itself is verified once by eye (`cargo xtask run` must be teal,
+not orange-brown) and afterwards by the unit test that encodes one colour both ways,
+since `xtask test` runs with `-display none` and cannot see the screen.
+
+## ADR-021: The kernel writes its own bump allocator
+
+**Status:** accepted, M1. Qualifies ADR-017.
+
+**Context.** ADR-017 assumed the bootloader would supply the heap. Checked against the
+vendored source, `bootloader_api` 0.11.17 contains no allocator code and does not
+mention one: the heap is ours to build from `boot_info.memory_regions`. M1's allocation
+pattern is append-only - one back buffer at whatever resolution firmware picked, then a
+glyph cache that only grows - which is the one pattern a bump allocator serves exactly.
+
+**Decision.** A `GlobalAlloc` handing out memory from a single region chosen by
+`memory::pick_heap_region`, with `dealloc` as a no-op and counters (allocations, bytes
+in use, high-water mark) logged at boot. Roughly thirty auditable lines rather than a
+dependency, following ADR-002's precedent: an allocator bug is silent memory
+corruption, the worst kind of risk to take on something unread. The region search takes
+the framebuffer's physical span and refuses any overlap, because firmware may report
+that RAM as usable: it is ordinary RAM that happens to be on screen.
+
+**Amended, M1.** That guard is inert on this bootloader. `bootloader_api` 0.11 publishes
+the framebuffer only as a virtual address the bootloader chose, never the physical frames
+behind it, so the boot sequence passes `None` and the log says so out loud. Subtracting
+an unrelated offset to invent a span would be worse than having none: a made-up range
+reserves the wrong pages and looks like protection. The guard stays because it is tested
+and because the real span arrives with a page-table walk (M3). ADR-022 records the
+mapping that makes the heap reachable at all.
+
+**Consequences.** Frees are not honoured, so any code that allocates and drops in a
+loop leaks until the region is exhausted. This ADR reopens at the first `dealloc` that
+matters, or the first per-frame allocation, whichever comes first; the fallback is
+`linked_list_allocator` or a size-class allocator, and the counters are what will say
+which is needed. Until then nothing may allocate in a render loop, which M1 does not.
+Because a heap that is only *logged* proves nothing, the boot sequence allocates one
+4 KiB `Box`, fills it with a position-dependent pattern and reads it back; a wrong
+offset faults there instead of inside a driver later.
+
+## ADR-022: The kernel asks the bootloader for a window onto physical memory
+
+**Status:** accepted, M1. Amends ADR-021.
+
+**Context.** `BootInfo::memory_regions` reports _physical_ ranges, and the heap has to be
+handed addresses it can dereference. `Mappings::new_default` leaves
+`physical_memory` as `None` - its own doc comment says "Defaults to `None`, i.e. no
+mapping of the physical memory" - and the bare `entry_point!(kernel_main)` in use was
+therefore equivalent to that default. The first boot with the allocator wired up ended
+at `FATAL: boot info carries no physical memory offset, so the heap cannot be reached`.
+Before this, the only addresses the kernel could touch were the three the bootloader had
+chosen for it: the kernel image, the boot info struct and the framebuffer.
+
+**Decision.** `kernel/src/main.rs` declares its own `BOOTLOADER_CONFIG` and passes it to
+`entry_point!(kernel_main, config = &BOOTLOADER_CONFIG)`, setting
+`config.mappings.physical_memory = Some(Mapping::Dynamic)`. `Dynamic` rather than a
+`FixedAddress`: the bootloader already tracks used level-4 entries, so it picks a free
+2 MiB-aligned window, marks it used, and publishes the address in
+`BootInfo::physical_memory_offset`. No address is hardcoded, and a collision with the
+kernel's own mapping is impossible by construction. The offset is read in exactly one
+place - the heap setup - and each physical span is converted through it there, so the
+allocator never sees a physical address (ADR-021).
+
+**Consequences.** The kernel can now touch any physical frame. That is what a frame
+allocator and a page-table walk will need, and it also means a wrong pointer no longer
+reliably faults: `unsafe` around memory became load-bearing rather than ornamental. The
+mapping covers all reported memory or 4 GiB, whichever is larger, in 2 MiB pages, so the
+bootloader builds a few thousand page-table entries before the kernel starts. Under QEMU
+it picks 0x280_0000_0000 (2.5 TiB), which the boot log shows as
+`heap ready 0x28001780000..0x2801bb6c000`. A mapping that merely appears in `BootInfo`
+proves nothing, so the boot sequence writes a 4 KiB page through the allocator and reads
+it back before drawing anything.
+
+**Not covered.** The framebuffer keeps its own virtual address, so its physical frames
+are still unknown and ADR-021's overlap guard still has no span to enforce. Closing that
+needs the page-table walk, which is M3's job, not M1's.
+

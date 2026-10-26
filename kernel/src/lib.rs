@@ -4,14 +4,16 @@
 //! target keeps only what has to be the entry point: `entry_point!`, the boot
 //! sequence, the panic handler and the `println!` macro those use.
 //!
-//! `canvas` is free of port I/O, of `bootloader_api` and of allocation, so
-//! `cargo test --package kernel --lib` can run it on the host. The other modules
+//! `canvas`, `memory` and `heap` are free of port I/O and of `bootloader_api`, so
+//! `cargo test --package kernel --lib` can run them on the host. The other modules
 //! are `x86_64`-only and are compiled out there, because inline `asm!` and port
 //! I/O do not exist on the machine running the tests.
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod canvas;
+pub mod heap;
+pub mod memory;
 
 #[cfg(target_arch = "x86_64")]
 pub mod framebuffer;

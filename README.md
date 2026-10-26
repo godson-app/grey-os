@@ -2,7 +2,7 @@
 
 A hobby operating system written in Rust for x86_64, booting via UEFI.
 
-> **Status: early development.** The kernel boots in QEMU and paints the screen. Nothing else works yet. Do not run this on hardware you care about.
+> **Status: early development.** The kernel boots in QEMU, paints the screen and has a working bump allocator. Nothing else works yet. Do not run this on hardware you care about.
 
 ## Goals
 
@@ -16,9 +16,10 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 - [x] Boots in QEMU through UEFI firmware
 - [x] Framebuffer fill (pixel-format aware)
 - [x] Serial logging on COM1 and a panic handler that reports to serial and screen
+- [x] Heap allocation: a bump allocator over a region picked from the memory map, proved by a boot-time write/read-back (ADR-021, ADR-022)
 - [ ] Framebuffer text console and `println!`
 - [ ] Interrupts and exception handling
-- [ ] Memory management (frame allocator, paging, heap)
+- [ ] Memory management (frame allocator, paging)
 - [ ] Scheduler and kernel threads
 - [ ] Userspace, system calls and ELF loading
 - [ ] Storage and filesystem
@@ -45,17 +46,30 @@ A healthy boot prints approximately:
 
 ```text
 grey-os: serial console online (COM1, 115200 8N1)
+grey-os: WARNING: framebuffer physical base unpublished, so the heap is not kept off it
+grey-os: memory 0x0000000000-0x0000087000     540 KiB usable
+grey-os: memory 0x0000087000-0x0000088000       4 KiB usable
+...                                    # one line per firmware region, elided here
+grey-os: memory usable total 512824 KiB
+grey-os: heap candidate 0x0001780000-0x001bb6c000 (430000 KiB)
+grey-os: heap ready 0x28001780000..0x2801bb6c000, 430000 KiB reserved
+grey-os: heap probe: 4 KiB written and read back, 1 allocations, 4096 bytes in use
 grey-os: framebuffer 1280x800, stride 1280, 4 bytes/pixel
 grey-os: display adapter online (direct-to-framebuffer, no back buffer yet)
 grey-os: boot ok
 ```
 
 The geometry comes from the firmware; the kernel reports what GOP actually gave it
-rather than assuming a resolution. Because the kernel exits through QEMU's
-`isa-debug-exit` device, the QEMU window closes as soon as boot finishes and
-`cargo run` exits with status 0. A panic prints its message and location to the
-terminal, paints the screen red when a framebuffer is available, and exits with
-status 1.
+rather than assuming a resolution. The heap is the largest usable region in that map,
+converted from its physical address through the offset the bootloader picked for the
+physical-memory window (`0x28001780000` here, 2.5 TiB above zero). The `WARNING` is
+expected for now: `bootloader_api` 0.11 does not publish the framebuffer's physical
+address, so the heap cannot yet be proved clear of it - see ADR-021 and ADR-022.
+
+Because the kernel exits through QEMU's `isa-debug-exit` device, the QEMU window closes
+as soon as boot finishes and `cargo run` exits with status 0. A panic prints its message
+and location to the terminal, paints the screen red when a framebuffer is available, and
+exits with status 1.
 
 ## `xtask`
 
@@ -84,9 +98,12 @@ Lint the two halves separately: the kernel is `x86_64`-only `no_std` code and do
 not compile for the host architecture (ADR-006 in `DECISIONS.md`).
 
 ```bash
+cargo test --package kernel --lib                           # host tests for the pure code
 cargo clippy --workspace --exclude kernel                   # host tools + xtask
 cargo clippy --package kernel --target x86_64-unknown-none   # the kernel
 ```
+
+`--lib` matters: the library compiles for the host, the binary does not.
 
 Milestone status and acceptance criteria are in `ROADMAP.md`; the reasoning behind
 the build, the drivers and the QEMU setup is in `DECISIONS.md`.
@@ -102,13 +119,20 @@ grey-os/
 ├── Cargo.toml            # workspace root + image builder package
 ├── build.rs              # builds the kernel and creates UEFI/BIOS disk images
 ├── rust-toolchain.toml   # pinned nightly toolchain
-├── .cargo/config.toml    # enables the unstable artifact-dependency feature
+├── .cargo/config.toml    # artifact-dependency feature and the `xtask` alias
 ├── src/bin/qemu-uefi.rs  # launches the UEFI image in QEMU
+├── xtask/                # build/run/test automation (`cargo xtask ...`)
 └── kernel/               # the OS kernel (no_std)
     ├── Cargo.toml
     └── src/
-        ├── main.rs       # entry point, halt loop, panic handler
-        └── framebuffer.rs
+        ├── main.rs        # entry point, boot sequence, panic handler
+        ├── lib.rs         # module list: what the host tests can reach
+        ├── canvas.rs      # geometry, one Colour, fill/blit/blend
+        ├── framebuffer.rs # boot-info framebuffer -> Canvas adapter
+        ├── memory.rs      # memory map, heap region selection
+        ├── heap.rs        # bump allocator behind `GlobalAlloc`
+        ├── qemu.rs        # exit codes through `isa-debug-exit`
+        └── serial.rs      # COM1 console
 ```
 
 ## Toolchain notes

@@ -11,13 +11,13 @@ milestone by milestone, so that this file never claims more than was agreed.
 
 ## Status
 
-| Milestone | Theme                                        | Status                                                                |
-| --------- | -------------------------------------------- | --------------------------------------------------------------------- |
-| M0        | Boot, serial diagnostics, diagnosable panics | **In progress - code complete, awaiting the panic-path gap to close** |
-| M1        | Display primitives, text, on-screen boot log | Not started                                                           |
-| M2        | Interrupts, exceptions, timers               | Not started                                                           |
-| M3        | Physical and virtual memory management       | Not started                                                           |
-| M4        | Heap allocation and kernel data structures   | Not started                                                           |
+| Milestone | Theme                                        | Status                                                              |
+| --------- | -------------------------------------------- | ------------------------------------------------------------------- |
+| M0        | Boot, serial diagnostics, diagnosable panics | **Code complete** - only the automated panic test is still open     |
+| M1        | Display primitives, text, on-screen boot log | **In progress** - canvas, framebuffer adapter and heap have landed  |
+| M2        | Interrupts, exceptions, timers               | Not started                                                         |
+| M3        | Physical and virtual memory management       | Not started                                                         |
+| M4        | Heap allocation and kernel data structures   | Not started (the heap itself moved into M1, see ADR-017)            |
 | M5        | Storage: disk driver and filesystem          | Not started                                                           |
 | M6        | Input: keyboard and pointer                  | Not started                                                           |
 | M7        | Compositor, windows, theme                   | Not started                                                           |
@@ -61,6 +61,25 @@ fails in a way that is visible on a machine with no serial cable attached.
 
 **Goal.** Replace the serial-only boot log with something on screen.
 
+**Landed so far.**
+
+- [x] `canvas.rs`: validated `Geometry`, one `Color`, `fill`, `blit`, alpha blending, and
+      12 host tests for the pure maths.
+- [x] `framebuffer.rs` adapter: the layout is validated once, palette/unknown formats are
+      refused (ADR-020).
+- [x] `memory.rs`: picks the heap region out of the firmware's memory map - largest usable
+      region that is not the framebuffer - with 10 host tests.
+- [x] `heap.rs`: bump allocator behind `GlobalAlloc`, counters in the boot log, 8 host tests
+      (ADR-021).
+- [x] The bootloader maps physical memory at a dynamic offset, and the boot sequence
+      converts the region through it before handing it to the allocator (ADR-022).
+- [x] A 4 KiB write/read-back through the allocator at boot, so the heap is proved mapped
+      rather than assumed.
+- [x] Kernel split into `lib.rs` + a thin `bin`, so the pure code is host-tested by
+      `cargo test -p kernel --lib`.
+
+**Open.**
+
 - GOP framebuffer wrapper owned by the kernel, not the raw boot info struct.
 - Double buffering: draw off-screen, present once per frame.
 - Rect fill, blit, and alpha blending, all `no_std` and allocation-free where practical.
@@ -68,8 +87,9 @@ fails in a way that is visible on a machine with no serial cable attached.
 - Open-licence fonts only - Selawik, Open Sans, Noto. Licence audit recorded in `DECISIONS.md`.
 - The M0 boot log rendered on screen through the new text path.
 - Kernel build script, closing the `GREY_OS_PANIC_TEST` gap above.
-- Host-side unit tests for blending and glyph-metric maths (kernel split into
-  `lib.rs` + thin `bin`), so pure functions are tested without booting.
+- Host-side unit tests for glyph-metric maths; the blending maths is already covered.
+- The framebuffer's physical span, so ADR-021's overlap guard stops being inert. Needs a
+  page-table walk, which is M3's machinery; today the boot log says the guard is unarmed.
 
 **Acceptance criteria.** The boot log is legible at the firmware-selected
 resolution; a panic paints the panel red with the message rendered in text; screen
@@ -100,11 +120,14 @@ no tool in this repository writes to a disk other than an image file under `targ
 
 ```bash
 cargo fmt --all                                              # formatting
+cargo test --package kernel --lib                            # host tests for the pure code
 cargo clippy --workspace --exclude kernel                     # host tools and xtask
 cargo clippy --package kernel --target x86_64-unknown-none    # the kernel itself
 cargo xtask test                                             # boots headless and asserts
 ```
 
-The third line is not optional and not interchangeable with the second: the kernel
-is `x86_64`-only `no_std` code, so linting it for the host architecture fails on
+The kernel lint line is not optional and not interchangeable with the host one: the
+kernel is `x86_64`-only `no_std` code, so linting it for the host architecture fails on
 inline-asm register names and on `bootloader_api::entry_point!`. See `DECISIONS.md`.
+The host tests use `--lib` for the same reason: the library also compiles for the host,
+the binary does not, so a bare `cargo test --package kernel` fails.

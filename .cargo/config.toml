@@ -1,8 +1,10 @@
 [unstable]
 bindeps = true
 
-# Optional shortcuts: lint/check the kernel for its real target,
-# since it can't be built for your Mac.
 [alias]
+# Build, run and test automation (README.md, xtask/src/main.rs).
+xtask = "run --package xtask --"
+# Shortcuts: lint/check the kernel for its real target, since it can't be
+# built for your Mac.
 kcheck = "check -p kernel --target x86_64-unknown-none"
 kclippy = "clippy -p kernel --target x86_64-unknown-none"
