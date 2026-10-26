@@ -13,8 +13,8 @@ milestone by milestone, so that this file never claims more than was agreed.
 
 | Milestone | Theme                                        | Status                                                              |
 | --------- | -------------------------------------------- | ------------------------------------------------------------------- |
-| M0        | Boot, serial diagnostics, diagnosable panics | **Done** - acceptance criteria automated; the BIOS image boots to the kernel's framebuffer check (ADR-009) |
-| M1        | Display primitives, text, on-screen boot log | **In progress** - log on screen and back-buffered; TrueType scope undecided |
+| M0        | Boot, serial diagnostics, diagnosable panics | **Done** - criteria automated; BIOS image boots (ADR-009)            |
+| M1        | Display primitives, text, on-screen boot log | **In progress** - back-buffered; TrueType scope undecided           |
 | M2        | Interrupts, exceptions, timers               | Not started                                                         |
 | M3        | Physical and virtual memory management       | Not started                                                         |
 | M4        | Heap allocation and kernel data structures   | Not started (the heap itself moved into M1, see ADR-017)            |

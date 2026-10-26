@@ -20,10 +20,10 @@ use crate::text;
 
 /// Panel pixels per font pixel.
 ///
-/// 2 turns the 8x8 glyphs into 16x16 cells: 80x50 characters on the 1280x800 surface OVMF
-/// picks, which the boot log fits inside with room to spare. The number is a compromise -
-/// 1 is too small to read from a normal viewing distance, 3 wraps the longer memory-map
-/// lines.
+/// 2 turns the 8x8 glyphs into 16x16 cells: 80x50 cells fit on the 1280x800 surface OVMF
+/// picks, of which the margins leave a 78x48 grid for the boot log. The number is a
+/// compromise - 1 is too small to read from a normal viewing distance, 3 wraps the longer
+/// memory-map lines.
 pub const SCALE: usize = 2;
 
 /// Pixels of panel left clear around the grid, so the log does not touch the edge.
