@@ -206,8 +206,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
     }
 
-    println!("grey-os: boot ok");
-    qemu::exit_qemu(qemu::QemuExitCode::Success);
+    // The M0 acceptance criterion "a forced panic prints `[panic] <message>` and its
+    // location" needs a kernel that can be told to fail. `kernel/build.rs` turns
+    // `GREY_OS_PANIC_TEST` into the cfg below, and `cargo xtask test` boots a second
+    // image with it set. Deliberately after `framebuffer::install`: the panel half of
+    // the panic path is only worth testing once there is a panel to paint.
+    //
+    // The two exits are mutually exclusive cfgs rather than a panic block followed by
+    // the success path: with the flag on, everything after a diverging block would be
+    // unreachable code, and `unreachable_code` would then fire on a boot that is
+    // working exactly as designed.
+    #[cfg(grey_os_panic_test)]
+    {
+        println!("grey-os: GREY_OS_PANIC_TEST is set, panicking on purpose");
+        panic!("injected panic for the panic-path test");
+    }
+
+    #[cfg(not(grey_os_panic_test))]
+    {
+        println!("grey-os: boot ok");
+        qemu::exit_qemu(qemu::QemuExitCode::Success);
+    }
 }
 
 /// Set once the panic path runs, so a panic inside it cannot recurse forever.
@@ -227,8 +246,12 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     }
 
     // Show the failure on the panel too: hardware rarely has a serial cable
-    // attached, and a black screen is undiagnosable.
-    if !framebuffer::with_screen(|screen| framebuffer::fill(screen, framebuffer::PANIC)) {
+    // attached, and a black screen is undiagnosable. The outcome is reported on
+    // serial as well, because nothing outside the guest can see the screen: that
+    // line is what lets `cargo xtask test` cover this half of the path at all.
+    if framebuffer::with_screen(|screen| framebuffer::fill(screen, framebuffer::PANIC)) {
+        serial::print_args_unlocked(format_args!("[panic] panel painted red"));
+    } else {
         serial::print_args_unlocked(format_args!("[panic] no framebuffer to paint"));
     }
 

@@ -13,7 +13,7 @@ milestone by milestone, so that this file never claims more than was agreed.
 
 | Milestone | Theme                                        | Status                                                              |
 | --------- | -------------------------------------------- | ------------------------------------------------------------------- |
-| M0        | Boot, serial diagnostics, diagnosable panics | **Code complete** - only the automated panic test is still open     |
+| M0        | Boot, serial diagnostics, diagnosable panics | **Done** - both acceptance criteria automated; the BIOS image stays unrun |
 | M1        | Display primitives, text, on-screen boot log | **In progress** - canvas, framebuffer adapter and heap have landed  |
 | M2        | Interrupts, exceptions, timers               | Not started                                                         |
 | M3        | Physical and virtual memory management       | Not started                                                         |
@@ -39,21 +39,22 @@ fails in a way that is visible on a machine with no serial cable attached.
 - [x] Panic handler reporting message and location to serial and painting the screen red.
 - [x] QEMU exit codes through `isa-debug-exit`: 33 clean, 35 reported failure.
 - [x] `cargo xtask build|run|test`, with `test` asserting the serial marker _and_ exit 33.
+- [x] Automated panic-path test: `GREY_OS_PANIC_TEST` becomes `cfg(grey_os_panic_test)`
+      in `kernel/build.rs`, and `cargo xtask test` rebuilds, boots and asserts
+      `[panic]`, the message, the location and the painted panel, then exit 35
+      (ADR-023).
 
 **Open.**
 
-- [ ] Automated panic-path test. Blocked on giving the kernel a way to be told to
-      fail: the plan is a `GREY_OS_PANIC_TEST` build-script flag with
-      `cargo::rerun-if-env-changed`, which needs the kernel to own a build script.
-      Natural to land in M1. Until then the panic path is verified by hand.
 - [ ] BIOS image boots. Built and wired to `cargo xtask run --bios` but never run.
 
 **Acceptance criteria.**
 
 1. `cargo xtask test` exits 0 having seen `grey-os: boot ok` and QEMU status 33.
 2. A forced panic prints `[panic] <message>` and its location, paints the screen
-   0xb01b2f, and produces QEMU status 35. Verified manually until the item above
-   closes.
+   0xb01b2f, and produces QEMU status 35. Automated by `cargo xtask test`; the paint is
+   asserted through the kernel's own `[panic] panel painted red` line, because nothing
+   outside the guest can read the screen.
 3. A missing framebuffer produces `FATAL: boot info carries no framebuffer` rather
    than a silent hang or a black screen.
 
@@ -77,6 +78,9 @@ fails in a way that is visible on a machine with no serial cable attached.
       rather than assumed.
 - [x] Kernel split into `lib.rs` + a thin `bin`, so the pure code is host-tested by
       `cargo test -p kernel --lib`.
+- [x] `kernel/build.rs`, turning `GREY_OS_PANIC_TEST` into `cfg(grey_os_panic_test)`
+      with `cargo::rerun-if-env-changed`, which is what closes M0's panic-path item
+      (ADR-023).
 
 **Open.**
 
@@ -86,7 +90,6 @@ fails in a way that is visible on a machine with no serial cable attached.
 - TrueType rasterisation in `no_std` with a glyph cache.
 - Open-licence fonts only - Selawik, Open Sans, Noto. Licence audit recorded in `DECISIONS.md`.
 - The M0 boot log rendered on screen through the new text path.
-- Kernel build script, closing the `GREY_OS_PANIC_TEST` gap above.
 - Host-side unit tests for glyph-metric maths; the blending maths is already covered.
 - The framebuffer's physical span, so ADR-021's overlap guard stops being inert. Needs a
   page-table walk, which is M3's machinery; today the boot log says the guard is unarmed.
@@ -123,7 +126,7 @@ cargo fmt --all                                              # formatting
 cargo test --package kernel --lib                            # host tests for the pure code
 cargo clippy --workspace --exclude kernel                     # host tools and xtask
 cargo clippy --package kernel --target x86_64-unknown-none    # the kernel itself
-cargo xtask test                                             # boots headless and asserts
+cargo xtask test                                             # boots twice: clean, then panic
 ```
 
 The kernel lint line is not optional and not interchangeable with the host one: the
@@ -131,3 +134,7 @@ kernel is `x86_64`-only `no_std` code, so linting it for the host architecture f
 inline-asm register names and on `bootloader_api::entry_point!`. See `DECISIONS.md`.
 The host tests use `--lib` for the same reason: the library also compiles for the host,
 the binary does not, so a bare `cargo test --package kernel` fails.
+
+`cargo xtask test` builds three times on purpose: once for the clean boot, once with
+`GREY_OS_PANIC_TEST` set so the panic path runs, and once more without it, so `target/`
+is left holding the image every other command boots.

@@ -443,3 +443,41 @@ it back before drawing anything.
 are still unknown and ADR-021's overlap guard still has no span to enforce. Closing that
 needs the page-table walk, which is M3's job, not M1's.
 
+
+## ADR-023: The panic path is tested through a build-script cfg
+
+**Status:** accepted, M0 (landed during M1).
+
+**Context.** M0's second acceptance criterion - a forced panic prints `[panic] <message>`
+and its location, paints the screen, and reports status 35 - was verified by hand, which
+means it was verified once. Automating it needs a kernel that can be told to fail, and a
+`no_std` kernel has no argv, no environment and no test harness: whether it panics has to
+be decided when the image is built, not when it boots.
+
+A cargo feature (`panic-test`) is the idiomatic Rust answer and cargo fingerprints it
+properly. It loses here for two reasons. The kernel is reached only as an artifact
+dependency (ADR-001), so turning a feature on from `xtask` means either editing the root
+manifest for the run or passing `--features` to the whole build - machinery to reach a
+dependency's feature. And features are additive: `--all-features`, a plausible thing for a
+CI config to do, would then produce a kernel that panics on every boot.
+
+**Decision.** `kernel/build.rs` maps a non-empty, non-`0` `GREY_OS_PANIC_TEST` to
+`cargo::rustc-cfg=grey_os_panic_test`, declares the cfg with `rustc-check-cfg`, and
+re-runs when the variable changes. `kernel/src/main.rs` gates one injected `panic!` on
+that cfg, placed after `framebuffer::install` so the panel half of the path runs, and
+gates the success exit on the other side of the cfg so neither build contains unreachable
+code. `cargo xtask test` then builds with the flag, boots, and asserts `[panic]`, the
+location, the message, `[panic] panel painted red` and status 35 - and rebuilds without
+the flag so `target/` keeps the image every other command boots.
+
+**Consequences.** The panic path is covered by the command this project treats as truth,
+and the red panel is verified from outside the guest through the kernel's own report line,
+which is the only way: nothing here can read the framebuffer. The three builds in
+`cargo xtask test` cost a couple of seconds each and `--no-build` is refused for `test`,
+because the flag has to be compiled in. The injected message is duplicated as a string in
+`xtask`, so editing it in `main.rs` fails the test loudly instead of passing silently. The
+kernel is also no longer a package without a build script: `rerun-if-env-changed` and
+`rustc-check-cfg` have to stay correct, or the flag silently does nothing and the test
+passes against a stale artifact - which is why `test` also fails when a panicking build
+still reports `boot ok`.
+

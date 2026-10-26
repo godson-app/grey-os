@@ -78,12 +78,26 @@ The same boot, automated:
 ```bash
 cargo xtask build   # stage both images in target/grey-os/
 cargo xtask run     # build, then boot the UEFI image with a window
-cargo xtask test    # build, then boot headless; assert `grey-os: boot ok` and exit 33
+cargo xtask test    # build, boot clean, then boot a kernel built to panic
 ```
 
-`test` checks the serial marker _and_ the exit status, and fails on a hang rather
-than waiting forever. `--no-build` skips the nested `cargo build`, `--bios` boots the
-BIOS image instead (built, never verified - see `ROADMAP.md`).
+`test` checks the serial markers _and_ the exit status, and fails on a hang rather
+than waiting forever. It boots twice: first the normal image, which must print
+`grey-os: boot ok` and exit 33, then an image rebuilt with `GREY_OS_PANIC_TEST=1`, which
+must print `[panic]`, its message, its location and `[panic] panel painted red`, and
+exit 35. The last line is how the painted screen is verified from outside a guest that
+cannot be looked into. `--no-build` skips the nested `cargo build` for `build` and
+`run`; `test` refuses it, since the flag has to be compiled in. `--bios` boots the BIOS
+image instead (built, never verified - see `ROADMAP.md`).
+
+To watch the panic path yourself, including the red panel:
+
+```bash
+GREY_OS_PANIC_TEST=1 cargo xtask run
+```
+
+The image then stays in that state, because the flag is compiled in: the next plain
+`cargo xtask build` (or `cargo xtask test`, which restores it on the way out) undoes it.
 
 These commands need the alias in `.cargo/config.toml`:
 
@@ -124,6 +138,7 @@ grey-os/
 ├── xtask/                # build/run/test automation (`cargo xtask ...`)
 └── kernel/               # the OS kernel (no_std)
     ├── Cargo.toml
+    ├── build.rs          # `GREY_OS_PANIC_TEST` -> `cfg(grey_os_panic_test)` (ADR-023)
     └── src/
         ├── main.rs        # entry point, boot sequence, panic handler
         ├── lib.rs         # module list: what the host tests can reach

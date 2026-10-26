@@ -5,7 +5,7 @@
 //! ```text
 //! cargo xtask build   # stage both images in target/grey-os/
 //! cargo xtask run     # build, then boot the UEFI image in QEMU
-//! cargo xtask test    # build, then boot headless and assert a clean exit
+//! cargo xtask test    # build, boot clean, then boot a kernel built to panic
 //! ```
 //!
 //! The QEMU command line lives here as well as in `src/bin/qemu-uefi.rs`: the
@@ -29,8 +29,22 @@ const USAGE: &str = "usage: cargo xtask <build|run|test> [--no-build] [--bios]";
 
 /// QEMU's `isa-debug-exit` reports `(value << 1) | 1`; the kernel sends 0x10.
 const EXIT_CLEAN: i32 = (0x10 << 1) | 1;
+/// The same encoding for `QemuExitCode::Failed` (0x11), which the panic path sends.
+const EXIT_FAILURE: i32 = (0x11 << 1) | 1;
 /// Printed by the kernel once the M0 boot sequence has finished.
 const BOOT_OK: &str = "grey-os: boot ok";
+/// Variable that makes `kernel/build.rs` compile the injected panic in (ADR-023).
+const PANIC_TEST_ENV: &str = "GREY_OS_PANIC_TEST";
+/// Printed by the panic handler ahead of the message and its location.
+const PANIC_MARKER: &str = "[panic]";
+/// The file the report has to name. Line numbers move whenever the file is edited, so
+/// only the path is asserted: the criterion is that a location is reported at all.
+const PANIC_LOCATION: &str = "panicked at kernel/src/main.rs";
+/// The message the injected panic carries; must match the one in `kernel/src/main.rs`.
+const PANIC_MESSAGE: &str = "injected panic for the panic-path test";
+/// Proof that the panic path reached the framebuffer. Nothing outside the guest can
+/// see the screen, so the kernel reports the paint on serial and this asserts it.
+const PANIC_PAINTED: &str = "[panic] panel painted red";
 /// Upper bound on a `test` run, so a hung boot fails instead of hanging CI.
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -59,9 +73,18 @@ fn main() -> Result<ExitCode> {
     if !matches!(command.as_str(), "build" | "run" | "test") {
         bail!("unknown command `{command}`\n{USAGE}");
     }
+    // `test` flips `PANIC_TEST_ENV` and therefore has to build twice more; agreeing to
+    // `--no-build` and then building anyway would be a lie, and skipping the panic
+    // phase would quietly weaken the test.
+    if command == "test" && !options.build {
+        bail!(
+            "`cargo xtask test` has to build: it boots the image twice, the second time \
+             with {PANIC_TEST_ENV} set\n{USAGE}"
+        );
+    }
 
     if options.build {
-        build()?;
+        build(&[])?;
     }
 
     match command.as_str() {
@@ -76,16 +99,25 @@ fn main() -> Result<ExitCode> {
 
 /// Runs the image builder, whose `build.rs` stages both images into `IMAGE_DIR`.
 ///
+/// `environment` is handed to cargo and reaches `kernel/build.rs`, which reads
+/// `GREY_OS_PANIC_TEST`. That script's `rerun-if-env-changed` is what makes a flipped
+/// flag produce a new kernel instead of reusing the cached one - cargo cannot see the
+/// variable on its own, and a stale artifact here would make the panic test pass
+/// against a kernel that never panics.
+///
 /// Spawning `cargo` from an xtask is safe because cargo releases its build lock
 /// before executing the binary. `--no-build` is the escape hatch in case that
 /// ever stops being true.
-fn build() -> Result<()> {
+fn build(environment: &[(&str, &str)]) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let status = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    command
         .args(["build", "--package", "grey-os"])
-        .current_dir(workspace_root())
-        .status()
-        .context("failed to run cargo build")?;
+        .current_dir(workspace_root());
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let status = command.status().context("failed to run cargo build")?;
     if !status.success() {
         bail!("cargo build failed; the images were not staged");
     }
@@ -111,11 +143,60 @@ fn run(options: &Options) -> Result<ExitCode> {
     interpret(status)
 }
 
-/// Boots headless and asserts both the serial marker and the exit status.
+/// Boots headless twice and asserts both halves of the M0 acceptance criteria.
 ///
-/// Both are checked on purpose: QEMU exiting cleanly having printed nothing, and
-/// a kernel that prints `boot ok` and then dies, are both failures.
+/// The first boot is the normal image: it must print `grey-os: boot ok` and exit 33.
+/// The second is a kernel rebuilt with [`PANIC_TEST_ENV`] set: it must report
+/// `[panic]`, its location, its message and the painted panel, then exit 35. Asserting
+/// both is the point - a flag that does not take effect would pass a test that only
+/// checked the clean boot, and a kernel that always panics would fail the first phase.
 fn test(options: &Options) -> Result<ExitCode> {
+    let (log, code) = boot_headless(options)?;
+    expect(&log, code, &[BOOT_OK], EXIT_CLEAN)?;
+    println!("pass: `{BOOT_OK}` seen on serial and qemu exited {EXIT_CLEAN}");
+
+    let panic_phase = panic_path(options);
+    // Restore the image the other commands boot whether the phase passed or not:
+    // leaving `target/` holding a kernel that panics on every boot would make the next
+    // `cargo xtask run` baffling to debug.
+    let restored = build(&[]);
+    panic_phase?;
+    restored?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Builds a kernel whose only job is to panic, boots it, and asserts the report.
+fn panic_path(options: &Options) -> Result<()> {
+    println!("--- panic path: rebuilding the kernel with {PANIC_TEST_ENV}=1");
+    build(&[(PANIC_TEST_ENV, "1")])?;
+    let (log, code) = boot_headless(options)?;
+    expect(
+        &log,
+        code,
+        &[PANIC_MARKER, PANIC_LOCATION, PANIC_MESSAGE, PANIC_PAINTED],
+        EXIT_FAILURE,
+    )?;
+    // A cached artifact is the one way this phase can pass without testing anything,
+    // so say which failure it is rather than leaving a bare mismatch.
+    if log.contains(BOOT_OK) {
+        bail!(
+            "the kernel reported `{BOOT_OK}` as well, so the injected panic did not \
+             take effect; is the kernel artifact stale?\n--- serial ---\n{log}"
+        );
+    }
+    println!(
+        "pass: `{PANIC_MARKER}` with its location, the message and the painted panel \
+         seen on serial, qemu exited {EXIT_FAILURE}"
+    );
+    Ok(())
+}
+
+/// Boots headless, returning the combined serial log and QEMU's exit code.
+///
+/// The timeout is not decoration: a kernel that hangs has to fail the test instead of
+/// hanging whatever runs it, and a QEMU that never exits is exactly what a broken exit
+/// path looks like from here.
+fn boot_headless(options: &Options) -> Result<(String, Option<i32>)> {
     let mut command = boot_command(options, true)?;
     println!("boot command: {command:?}");
     let mut child = command
@@ -143,18 +224,24 @@ fn test(options: &Options) -> Result<ExitCode> {
         .context("failed to collect qemu output")?;
     let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
     log.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok((log, output.status.code()))
+}
 
-    if !log.contains(BOOT_OK) {
-        bail!("serial log never reported `{BOOT_OK}`\n--- serial ---\n{log}");
+/// Asserts that every entry in `needles` appears in the serial log and that QEMU
+/// exited with `expected`.
+///
+/// Both are checked on purpose: QEMU exiting cleanly having printed nothing, and a
+/// kernel that prints its marker and then dies, are both failures.
+fn expect(log: &str, code: Option<i32>, needles: &[&str], expected: i32) -> Result<()> {
+    for needle in needles {
+        if !log.contains(needle) {
+            bail!("serial log never reported `{needle}`\n--- serial ---\n{log}");
+        }
     }
-    if output.status.code() != Some(EXIT_CLEAN) {
-        bail!(
-            "qemu exited with {:?}, expected {EXIT_CLEAN} for a clean boot\n--- serial ---\n{log}",
-            output.status.code()
-        );
+    if code != Some(expected) {
+        bail!("qemu exited {code:?}, expected {expected}\n--- serial ---\n{log}");
     }
-    println!("pass: `{BOOT_OK}` seen on serial and qemu exited {EXIT_CLEAN}");
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 /// Maps QEMU's exit status onto ours.
