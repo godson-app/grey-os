@@ -5,7 +5,7 @@
 //! ```text
 //! cargo xtask build   # stage both images in target/grey-os/
 //! cargo xtask run     # build, then boot the UEFI image in QEMU
-//! cargo xtask test    # build, boot clean, then boot a kernel built to panic
+//! cargo xtask test    # build, boot clean, then boot a kernel per injected failure
 //! ```
 //!
 //! The QEMU command line lives here as well as in `src/bin/qemu-uefi.rs`: the
@@ -45,6 +45,44 @@ const PANIC_MESSAGE: &str = "injected panic for the panic-path test";
 /// Proof that the panic path reached the framebuffer. Nothing outside the guest can
 /// see the screen, so the kernel reports the paint on serial and this asserts it.
 const PANIC_PAINTED: &str = "[panic] panel painted red";
+/// Variable that picks one injected CPU fault for `kernel/build.rs` to compile in (ADR-028).
+const EXCEPTION_TEST_ENV: &str = "GREY_OS_EXCEPTION_TEST";
+/// One injected fault: what the variable is set to, the line the kernel prints before the
+/// faulting instruction, and the report the handler has to produce.
+struct Fault {
+    /// `gp`, `pf`, `ud` or `df` - the values `kernel/build.rs` accepts.
+    value: &'static str,
+    /// Printed by `kernel/src/main.rs` ahead of the fault. Asserted because it is the only
+    /// proof the flag reached the kernel rather than a stale image being booted.
+    announcement: &'static str,
+    /// The handler's report, up to the point where the values differ from run to run.
+    report: &'static str,
+}
+/// Every fault `test` injects, one image each. The report text is matched, not the faulting
+/// address: where the instruction lands depends on the build, and the criterion is that the
+/// handler names the vector, its error code and where execution was.
+const FAULTS: [Fault; 4] = [
+    Fault {
+        value: "gp",
+        announcement: "GREY_OS_EXCEPTION_TEST=gp, loading a selector that is not in the gdt",
+        report: "[exception] #GP general protection fault: error 0x28",
+    },
+    Fault {
+        value: "pf",
+        announcement: "GREY_OS_EXCEPTION_TEST=pf, reading an address nothing maps",
+        report: "[exception] #PF page fault: error 0x0 on a read to a not-present page",
+    },
+    Fault {
+        value: "ud",
+        announcement: "GREY_OS_EXCEPTION_TEST=ud, executing an undefined instruction",
+        report: "[exception] #UD invalid opcode: no error code",
+    },
+    Fault {
+        value: "df",
+        announcement: "GREY_OS_EXCEPTION_TEST=df, faulting while a fault is delivered",
+        report: "[exception] #DF double fault: error 0x0",
+    },
+];
 /// Upper bound on a `test` run, so a hung boot fails instead of hanging CI.
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -73,13 +111,13 @@ fn main() -> Result<ExitCode> {
     if !matches!(command.as_str(), "build" | "run" | "test") {
         bail!("unknown command `{command}`\n{USAGE}");
     }
-    // `test` flips `PANIC_TEST_ENV` and therefore has to build twice more; agreeing to
-    // `--no-build` and then building anyway would be a lie, and skipping the panic
-    // phase would quietly weaken the test.
+    // `test` flips `PANIC_TEST_ENV` and `EXCEPTION_TEST_ENV` and therefore has to rebuild for
+    // every phase; agreeing to `--no-build` and then building anyway would be a lie, and
+    // skipping a phase would quietly weaken the test.
     if command == "test" && !options.build {
         bail!(
-            "`cargo xtask test` has to build: it boots the image twice, the second time \
-             with {PANIC_TEST_ENV} set\n{USAGE}"
+            "`cargo xtask test` has to build: it boots the image once per failure, rebuilding \
+             with {PANIC_TEST_ENV} and then {EXCEPTION_TEST_ENV} set\n{USAGE}"
         );
     }
 
@@ -143,24 +181,24 @@ fn run(options: &Options) -> Result<ExitCode> {
     interpret(status)
 }
 
-/// Boots headless twice and asserts both halves of the M0 acceptance criteria.
+/// Boots headless once per M0/M2 failure path and asserts every one of them.
 ///
 /// The first boot is the normal image: it must print `grey-os: boot ok` and exit 33.
-/// The second is a kernel rebuilt with [`PANIC_TEST_ENV`] set: it must report
-/// `[panic]`, its location, its message and the painted panel, then exit 35. Asserting
-/// both is the point - a flag that does not take effect would pass a test that only
-/// checked the clean boot, and a kernel that always panics would fail the first phase.
+/// Then one image per injected failure - a panic, and each fault in [`FAULTS`] - each of
+/// which must report itself and exit 35. Asserting both halves is the point: a flag that
+/// does not take effect would pass a test that only checked the clean boot, and a kernel
+/// that always panics would fail the first phase.
 fn test(options: &Options) -> Result<ExitCode> {
     let (log, code) = boot_headless(options)?;
     expect(&log, code, &[BOOT_OK], EXIT_CLEAN)?;
     println!("pass: `{BOOT_OK}` seen on serial and qemu exited {EXIT_CLEAN}");
 
-    let panic_phase = panic_path(options);
-    // Restore the image the other commands boot whether the phase passed or not:
-    // leaving `target/` holding a kernel that panics on every boot would make the next
+    let phases = panic_path(options).and_then(|()| exception_paths(options));
+    // Restore the image the other commands boot whether the phases passed or not:
+    // leaving `target/` holding a kernel that faults on every boot would make the next
     // `cargo xtask run` baffling to debug.
     let restored = build(&[]);
-    panic_phase?;
+    phases?;
     restored?;
     Ok(ExitCode::SUCCESS)
 }
@@ -188,6 +226,34 @@ fn panic_path(options: &Options) -> Result<()> {
         "pass: `{PANIC_MARKER}` with its location, the message and the painted panel \
          seen on serial, qemu exited {EXIT_FAILURE}"
     );
+    Ok(())
+}
+
+/// Boots one image per injected fault, asserting the report each handler has to produce.
+///
+/// Each iteration rebuilds the kernel with [`EXCEPTION_TEST_ENV`] set to a different value, so
+/// what is booted is a kernel whose only job is that fault. The announcement line is asserted
+/// alongside the report: it is what rules out a cached image from the previous phase passing
+/// this one.
+fn exception_paths(options: &Options) -> Result<()> {
+    for fault in FAULTS {
+        println!(
+            "--- exception path: rebuilding the kernel with {EXCEPTION_TEST_ENV}={}",
+            fault.value
+        );
+        build(&[(EXCEPTION_TEST_ENV, fault.value)])?;
+        let (log, code) = boot_headless(options)?;
+        expect(
+            &log,
+            code,
+            &[fault.announcement, fault.report, PANIC_PAINTED],
+            EXIT_FAILURE,
+        )?;
+        println!(
+            "pass: `{}` seen on serial, qemu exited {EXIT_FAILURE}",
+            fault.report
+        );
+    }
     Ok(())
 }
 

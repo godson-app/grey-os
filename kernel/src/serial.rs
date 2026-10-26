@@ -107,6 +107,14 @@ fn acquire() -> Guard {
     Guard { owns_lock: true }
 }
 
+/// Takes the lock only if it is free, without waiting.
+fn try_acquire() -> Option<Guard> {
+    LOCKED
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+        .then_some(Guard { owns_lock: true })
+}
+
 fn write_line(mut guard: Guard, args: fmt::Arguments<'_>) {
     let _ = guard.write_fmt(args);
     let _ = guard.write_fmt(format_args!("\n"));
@@ -119,14 +127,22 @@ pub fn print_args(args: fmt::Arguments<'_>) {
 
 /// Prints one line, or returns `false` if another writer holds the console.
 pub fn try_print_args(args: fmt::Arguments<'_>) -> bool {
-    if LOCKED
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    let Some(guard) = try_acquire() else {
         return false;
-    }
-    write_line(Guard { owns_lock: true }, args);
+    };
+    write_line(guard, args);
     true
+}
+
+/// Prints one line, taking the lock if it is free and writing anyway if it is not.
+///
+/// For the reporting paths - a panic, a CPU exception - where the alternative to an
+/// interleaved line is a missing one. A writer that already holds the console is exactly the
+/// situation the exception path cannot rule out: the fault may have happened inside
+/// `print_args`, and waiting for that lock would hang the only channel that can say so.
+pub fn print_args_forced(args: fmt::Arguments<'_>) {
+    let guard = try_acquire().unwrap_or(Guard { owns_lock: false });
+    write_line(guard, args);
 }
 
 /// Prints one line without taking the lock.

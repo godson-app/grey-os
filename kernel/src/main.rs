@@ -10,7 +10,54 @@ use bootloader_api::info::MemoryRegionKind;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
-use grey_os::{display, framebuffer, halt_loop, heap, memory, qemu, serial};
+use grey_os::{display, framebuffer, gdt, halt_loop, heap, idt, memory, pic, qemu, serial, timer};
+
+/// The rate the PIT is programmed at. 100 Hz is the usual compromise: fine enough for a
+/// scheduler tick later, coarse enough that the handler's cost does not matter yet.
+const TIMER_HZ: u32 = 100;
+
+/// Ticks the boot log waits for. Ten at [`TIMER_HZ`] is a tenth of a second, which proves the
+/// counter moves without making every boot feel slow under emulation.
+const OBSERVED_TICKS: u64 = 10;
+
+/// An address nothing maps, for the `#PF` injection below.
+///
+/// Canonical (below the 47-bit sign extension, so the CPU raises `#PF` and not `#GP`), and in
+/// a top-level table slot the bootloader has no reason to have filled: the kernel sits in the
+/// low canonical range and the physical memory window is mapped high.
+#[cfg(grey_os_fault_pf)]
+const UNMAPPED_PROBE: usize = 0x0000_7000_0000_0000;
+
+// Faults twice on purpose, for the `df` phase: it moves `RSP` to an address nothing maps and
+// then pushes, so the `#PF` the push raises cannot push its own frame either and the CPU
+// escalates to `#DF` - which the TSS routes onto its own stack.
+//
+// Defined as an assembly stub because Rust cannot hand the compiler a stack pointer it does not
+// own, and only for the phase that uses it: an unused global symbol has no business in the
+// image.
+//
+// A software `int 8` would reach the same vector but not the same frame: an `int n` pushes no
+// error code even for a vector whose hardware fault does, so the handler installed for `#DF`
+// would read the instruction pointer as its error code.
+#[cfg(grey_os_fault_df)]
+core::arch::global_asm!(
+    ".pushsection .text,\"ax\",@progbits",
+    ".global grey_os_double_fault_probe",
+    ".type grey_os_double_fault_probe, @function",
+    "grey_os_double_fault_probe:",
+    // Canonical, and nothing maps it - the same shape as `UNMAPPED_PROBE`.
+    "movabs rsp, 0x700000000000",
+    "push rax",
+    ".size grey_os_double_fault_probe, . - grey_os_double_fault_probe",
+    ".popsection",
+);
+
+#[cfg(grey_os_fault_df)]
+extern "C" {
+    // Does not return, though nothing here says so: a diverging signature would make every
+    // line after the call unreachable, and the compiler is right to warn about that.
+    fn grey_os_double_fault_probe();
+}
 
 /// Prints one line to the serial console and, once `display::init` has run, to the panel.
 ///
@@ -53,6 +100,14 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::init();
     println!("grey-os: serial console online (COM1, 115200 8N1)");
+
+    // The CPU tables come before anything that can fault on them. From here a bad pointer is
+    // a report instead of a triple fault; until here the bootloader's tables still apply, so
+    // the window where a fault is undiagnosable is as small as this boot can make it. Their
+    // log lines are deferred to the reported section below, like every other discovery
+    // (ADR-028).
+    gdt::init();
+    idt::init();
 
     // Where the framebuffer physically lives. It is ordinary RAM that firmware
     // happens to display from, so the map below may well offer its pages as usable;
@@ -231,6 +286,103 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             ),
             None => println!("grey-os: console draws straight to the panel, no back buffer"),
         }
+    }
+
+    // Interrupts last, and in this order: the PIC is remapped before any line is unmasked,
+    // the timer claims IRQ0 and installs its handler, and only then is `IF` set. Enabling
+    // earlier would leave a window where a tick arrives on a vector with no handler behind it
+    // (ADR-028).
+    pic::init();
+    let Some(actual_hz) = timer::init(TIMER_HZ) else {
+        println!(
+            "grey-os: FATAL: {} Hz is outside what the pit can divide",
+            TIMER_HZ
+        );
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    };
+    if !pic::is_unmasked(pic::TIMER) {
+        println!(
+            "grey-os: FATAL: irq{} is still masked after the pic setup",
+            pic::TIMER
+        );
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    idt::enable();
+    // Waiting is the test: a counter that does not move means the gate, the remap or the
+    // masking is wrong, and the boot log would otherwise claim a timer it does not have.
+    timer::wait_ticks(OBSERVED_TICKS);
+
+    println!(
+        "grey-os: gdt loaded: code {:#04x}, data {:#04x}, tss {:#04x}, {} KiB double-fault stack",
+        gdt::KERNEL_CODE,
+        gdt::KERNEL_DATA,
+        gdt::TSS,
+        gdt::STACK_BYTES / 1024
+    );
+    println!(
+        "grey-os: idt loaded: {} gates of 256 ({} exceptions, 16 irqs)",
+        idt::gates(),
+        idt::EXCEPTIONS.len()
+    );
+    println!(
+        "grey-os: pic remapped to {:#04x}..={:#04x}, only irq{} unmasked",
+        pic::VECTOR_BASE,
+        pic::VECTOR_BASE + 15,
+        pic::TIMER
+    );
+    println!(
+        "grey-os: timer {} Hz, {} ticks observed, interrupts enabled, {} unexpected irqs",
+        actual_hz,
+        timer::ticks(),
+        idt::unexpected_irqs()
+    );
+
+    // M2's fault paths are tested the way M0's panic path is: a cfg compiled in from an
+    // environment variable, one image per fault, and `cargo xtask test` booting each and
+    // asserting the report (ADR-023, ADR-028). Each block is a real instruction the CPU
+    // refuses, so the handler is reached the way it will be in the wild rather than by being
+    // called from Rust, which would prove only that a function prints.
+    #[cfg(grey_os_fault_gp)]
+    {
+        println!("grey-os: GREY_OS_EXCEPTION_TEST=gp, loading a selector that is not in the gdt");
+        // SAFETY: deliberately loads selector 0x28, which is past the end of the five-entry
+        // table loaded at boot. The #GP it raises is the point of the run: the handler
+        // reports it and exits.
+        unsafe {
+            core::arch::asm!("mov ax, 0x28", "mov ds, ax", out("ax") _);
+        }
+    }
+
+    #[cfg(grey_os_fault_pf)]
+    {
+        println!("grey-os: GREY_OS_EXCEPTION_TEST=pf, reading an address nothing maps");
+        // SAFETY: reads an address no page table maps, which raises #PF - the point of the
+        // run. `volatile` keeps the read from being optimised away.
+        let _ = unsafe { core::ptr::read_volatile(UNMAPPED_PROBE as *const u8) };
+    }
+
+    #[cfg(grey_os_fault_ud)]
+    {
+        println!("grey-os: GREY_OS_EXCEPTION_TEST=ud, executing an undefined instruction");
+        // SAFETY: `ud2` is defined by the architecture as raising #UD, which is the point.
+        unsafe { core::arch::asm!("ud2") };
+    }
+
+    #[cfg(grey_os_fault_df)]
+    {
+        println!("grey-os: GREY_OS_EXCEPTION_TEST=df, faulting while a fault is delivered");
+        // Interrupts off first: a timer tick landing after the stack pointer moves would fault
+        // on the same bad stack and make the report's instruction pointer a coin toss.
+        idt::disable();
+        // SAFETY: `grey_os_double_fault_probe` moves `RSP` to an address nothing maps and then
+        // pushes, so the `#PF` the push raises cannot push its own frame either, and the CPU
+        // escalates to `#DF`. Reaching the handler is the test: with the TSS stack or its gate
+        // wrong this triple-faults and QEMU exits without printing a line (ADR-028).
+        //
+        // `int 8` would reach the same vector but not the same frame: a software `int n` pushes
+        // no error code, even for a vector whose hardware fault does, so the handler would read
+        // the instruction pointer as its error code.
+        unsafe { grey_os_double_fault_probe() };
     }
 
     // The M0 acceptance criterion "a forced panic prints `[panic] <message>` and its

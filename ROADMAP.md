@@ -14,8 +14,8 @@ milestone by milestone, so that this file never claims more than was agreed.
 | Milestone | Theme                                        | Status                                                              |
 | --------- | -------------------------------------------- | ------------------------------------------------------------------- |
 | M0        | Boot, serial diagnostics, diagnosable panics | **Done** - criteria automated; BIOS image boots (ADR-009)            |
-| M1        | Display primitives, text, on-screen boot log | **In progress** - back-buffered; TrueType scope undecided           |
-| M2        | Interrupts, exceptions, timers               | Not started                                                         |
+| M1        | Display primitives, text, on-screen boot log | **Done** - criteria met; TrueType moved to M7 (ADR-027)               |
+| M2        | Interrupts, exceptions, timers               | **Criteria met** - awaiting acceptance (ADR-028)                     |
 | M3        | Physical and virtual memory management       | Not started                                                         |
 | M4        | Heap allocation and kernel data structures   | Not started (the heap itself moved into M1, see ADR-017)            |
 | M5        | Storage: disk driver and filesystem          | Not started                                                           |
@@ -100,15 +100,10 @@ fails in a way that is visible on a machine with no serial cable attached.
       into panel memory, and the whole grid after a scroll because every row moved. A failed
       allocation falls back to the ADR-025 path and the boot log says which one is live.
 
-**Open.**
+**Carried forward.** M1 is accepted with two items open; neither blocks the criteria below, and
+each names where it gets fixed. TrueType rasterisation and the face it needs left M1 for M7
+(ADR-027), so the text stack stays on ADR-024's public-domain bitmaps at integer scale.
 
-- TrueType rasterisation in `no_std` with a glyph cache. Recommended out of M1 and into its
-  own milestone: an sfnt parser, Bézier flattening, a scanline fill and a cache is four
-  pieces of machinery, the cache would fight a bump allocator that never frees, and the face
-  brings a licence question (ADR-024's bitmaps are public domain and settled). Awaiting the
-  scope decision, so M1 is not declared done on a recommendation alone.
-- An open-licence TrueType face (Selawik, Open Sans, Noto) when that item lands; the
-  bitmap font shipping now is public domain, recorded in ADR-024.
 - The framebuffer's physical span, so ADR-021's overlap guard stops being inert. Needs a
   page-table walk, which is M3's machinery; today the boot log says the guard is unarmed.
 - Rendering under BIOS/VBE: the legacy image boots but is handed a 24-bit surface this
@@ -129,11 +124,87 @@ repaint is presented in one band copy rather than watched glyph by glyph. Measur
 boot: 3.49 s, of which about 2 s is firmware - unchanged from before the buffer, because the
 time is in QEMU's firmware and in the ~110 memory-map lines, not in the presenting.
 
-## M2 onward - provisional themes
+## M2 - Interrupts, exceptions and timers
+
+**Goal.** Stop borrowing the bootloader's CPU tables. A CPU fault has to name itself and reach
+the panic path instead of triple-faulting the machine, and time has to pass so that a scheduler
+and a timeout have something to hang off.
+
+**Agreed order** (ADR-028): GDT with a TSS and a `#DF` stack, then the IDT with a handler per
+exception vector, then the 8259 PIC remapped off the exception range, then the PIT.
+
+**Landed so far.**
+
+- [x] `gdt.rs`: 64-bit code and data descriptors, a TSS carrying an IST stack for `#DF`, loaded
+      with `lgdt`/`ltr` and a reload of every segment register.
+- [x] `idt.rs`: 256 entries, a gate per exception vector, error-code vectors handled as such,
+      and a report line naming the vector, its error code and the faulting instruction.
+- [x] `pic.rs`: both 8259s remapped to 0x20..=0x2F and masked except the vectors in use.
+- [x] `timer.rs`: PIT channel 0 in rate-generator mode, a tick counter the boot log samples.
+- [x] Injected `#GP`/`#PF`/`#UD`/`#DF` as test phases in `cargo xtask test`, each asserted
+      through the serial report and QEMU's exit status.
+
+**Open.**
+
+- Printing from an interrupt handler: not allowed while the console and the heap assume a
+  single thread (ADR-028). A handler that wants to log needs a lock or a queue first.
+- `#MC`, `#XM` and the rest of the rare vectors are reported like any other fault, but nothing
+  recovers from them and nothing pretends to.
+- The 8259 is a stopgap: an APIC replaces it when SMP or per-CPU interrupts arrive (M10).
+
+**Acceptance criteria.**
+
+1. A deliberate `#GP`, `#PF` and `#UD` each reach the panic path naming the vector, the error
+   code where the vector has one, and the faulting instruction, and QEMU exits 35.
+2. A `#DF` runs on the TSS stack and is reported rather than triple-faulting.
+3. The boot log shows the image's own GDT, an IDT with every exception vector filled, the PIC
+   remapped, and a timer counter that advances while the kernel waits for it.
+
+**Status against them.** All three are met, in QEMU, on the boots `cargo xtask test` performs. The
+boot log reports `gdt loaded: code 0x08, data 0x10, tss 0x18, 16 KiB double-fault stack`,
+`idt loaded: 38 gates of 256 (22 exceptions, 16 irqs)`, `pic remapped to 0x20..=0x2f, only irq0
+unmasked` and `timer 100 Hz, 13 ticks observed, interrupts enabled, 0 unexpected irqs`. The tick
+count is read only after the boot path has waited for ten of them, so a counter that did not move
+would fail at the wait rather than print a number that looked like progress.
+
+The fault phases are four further images, each built with `GREY_OS_EXCEPTION_TEST` set to one of
+`gp`, `pf`, `ud` or `df`, each booted and each asserted on its report and on QEMU's exit 35:
+
+```text
+[exception] #GP general protection fault: error 0x28, rip 0x1000000aad8
+[exception] #PF page fault: error 0x0 on a read to a not-present page, rip 0x1000000ac51, cr2 0x700000000000
+[exception] #UD invalid opcode: no error code, rip 0x1000000aac4
+[exception] #DF double fault: error 0x0, rip 0x1000000845e
+```
+
+Each phase faults with a real instruction the CPU refuses - a segment load of a selector past the
+end of the image's own GDT, a read of an unmapped address, `ud2`, and a push onto an unmapped
+stack - rather than by calling a handler from Rust, which would prove only that a function prints.
+The `#DF` line is criterion 2: it exists because the TSS routed the fault onto its own stack. The
+injected stub moves `RSP` to an address nothing maps and then pushes, so the `#PF` the push raises
+cannot push a frame either and the CPU escalates; the `rip` reported is the stub's `push`, and the
+error code is 0.
+
+Two details the phases caught, both of which a plausible-looking version had wrong. A handler has
+to take `InterruptFrame` **by value**: the ABI reads its arguments out of the interrupted stack, so
+the frame sits at `RSP + 8` and a `&InterruptFrame` parameter makes the handler dereference the
+saved `RIP` as if it were a pointer to the frame. And `int 8` cannot stand in for a `#DF`: a
+software interrupt pushes no error code even on a vector whose hardware fault does, so the handler
+would read a return address as its error code. Hence the assembly stub.
+
+**Carried forward.** The `#DF` stack is 16 KiB, which is enough to print a report and no more; a
+handler that ever needed to do work on it would want a larger one. The PIC's mask is fixed at
+`irq0`, so the vector range above it is claimed but silent until a driver unmasks one.
+
+## M3 onward - provisional themes
 
 The ordering above is dependency-driven and each theme is a milestone of its own.
 Detailed scope, acceptance criteria and verification are added when the milestone
 is approved, per the brief's one-at-a-time rule.
+
+Two items already have a home when their milestone opens: TrueType rasterisation, with the face
+question it drags along, belongs to M7 (ADR-027); and the framebuffer's physical span, which
+would make ADR-021's heap guard bite, belongs to M3's page-table work.
 
 ## Hardware compatibility
 
@@ -157,7 +228,7 @@ cargo fmt --all                                              # formatting
 cargo test --package kernel --lib                            # host tests for the pure code
 cargo clippy --workspace --exclude kernel                     # host tools and xtask
 cargo clippy --package kernel --target x86_64-unknown-none    # the kernel itself
-cargo xtask test                                             # boots twice: clean, then panic
+cargo xtask test                                             # clean boot, then one per injected failure
 ```
 
 The kernel lint line is not optional and not interchangeable with the host one: the

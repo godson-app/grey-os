@@ -86,16 +86,19 @@ The same boot, automated:
 ```bash
 cargo xtask build   # stage both images in target/grey-os/
 cargo xtask run     # build, then boot the UEFI image with a window
-cargo xtask test    # build, boot clean, then boot a kernel built to panic
+cargo xtask test    # build, boot clean, then boot one kernel per injected failure
 ```
 
 `test` checks the serial markers _and_ the exit status, and fails on a hang rather
-than waiting forever. It boots twice: first the normal image, which must print
-`grey-os: boot ok` and exit 33, then an image rebuilt with `GREY_OS_PANIC_TEST=1`, which
+than waiting forever. It boots once per failure path: first the normal image, which must print
+`grey-os: boot ok` and exit 33, then a kernel rebuilt with `GREY_OS_PANIC_TEST=1`, which
 must print `[panic]`, its message, its location and `[panic] panel painted red`, and
 exit 35. The last line is how the painted screen is verified from outside a guest that
-cannot be looked into. `--no-build` skips the nested `cargo build` for `build` and
-`run`; `test` refuses it, since the flag has to be compiled in. `--bios` boots the BIOS
+cannot be looked into. Four more images follow, each rebuilt with
+`GREY_OS_EXCEPTION_TEST=gp`, `pf`, `ud` or `df`: each has to print its own `[exception]`
+report - the vector, its error code where the vector has one, and the faulting
+instruction - and exit 35. `--no-build` skips the nested `cargo build` for `build` and
+`run`; `test` refuses it, since the flags have to be compiled in. `--bios` boots the BIOS
 image instead (built, never verified - see `ROADMAP.md`).
 
 To watch the panic path yourself, including the red panel:
@@ -104,7 +107,13 @@ To watch the panic path yourself, including the red panel:
 GREY_OS_PANIC_TEST=1 cargo xtask run
 ```
 
-The image then stays in that state, because the flag is compiled in: the next plain
+For a CPU fault instead, pick one of `gp`, `pf`, `ud` or `df`:
+
+```bash
+GREY_OS_EXCEPTION_TEST=pf cargo xtask run
+```
+
+Either way the image then stays in that state, because the flag is compiled in: the next plain
 `cargo xtask build` (or `cargo xtask test`, which restores it on the way out) undoes it.
 
 These commands need the alias in `.cargo/config.toml`:

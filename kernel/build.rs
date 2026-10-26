@@ -1,4 +1,5 @@
-//! Turns `GREY_OS_PANIC_TEST` into `cfg(grey_os_panic_test)`.
+//! Turns `GREY_OS_PANIC_TEST` into `cfg(grey_os_panic_test)`, and `GREY_OS_EXCEPTION_TEST`
+//! into one of four fault cfgs.
 //!
 //! The panic path has to be exercised without a human watching, and the kernel needs
 //! to be told to fail for that: `main.rs` gates a single injected `panic!` on this
@@ -9,18 +10,37 @@
 //!
 //! ```text
 //! GREY_OS_PANIC_TEST=1 cargo xtask run
+//! GREY_OS_EXCEPTION_TEST=gp cargo xtask run
 //! ```
 //!
-//! The value is read at compile time, so cargo cannot fingerprint it on its own:
+//! The second variable exists for the same reason (ADR-028): each of its four values
+//! compiles in a different instruction the CPU refuses, so the exception path is reached the
+//! way it will be in the wild. One cfg per fault rather than one cfg carrying a string keeps
+//! the test blocks in `main.rs` mutually exclusive at compile time, which is what makes
+//! "unreachable after a diverging block" impossible to write by accident.
+//!
+//! The values are read at compile time, so cargo cannot fingerprint them on its own:
 //! `rerun-if-env-changed` is what makes a flipped flag produce a new kernel instead of
 //! silently booting the cached one.
 
+/// The faults `GREY_OS_EXCEPTION_TEST` accepts: the value, and the cfg it sets.
+const FAULTS: [(&str, &str); 4] = [
+    ("gp", "grey_os_fault_gp"),
+    ("pf", "grey_os_fault_pf"),
+    ("ud", "grey_os_fault_ud"),
+    ("df", "grey_os_fault_df"),
+];
+
 fn main() {
-    // Set, unset and changed all have to rebuild, because the flag lives in the output.
+    // Set, unset and changed all have to rebuild, because both flags live in the output.
     println!("cargo::rerun-if-env-changed=GREY_OS_PANIC_TEST");
-    // Declares the cfg so `--check-cfg` accepts it rather than warning about a cfg
+    println!("cargo::rerun-if-env-changed=GREY_OS_EXCEPTION_TEST");
+    // Declares the cfgs so `--check-cfg` accepts them rather than warning about a cfg
     // nothing in this workspace is expected to set.
     println!("cargo::rustc-check-cfg=cfg(grey_os_panic_test)");
+    for (_, cfg) in FAULTS {
+        println!("cargo::rustc-check-cfg=cfg({cfg})");
+    }
 
     // Empty or `0` counts as off. `=1` is the documented spelling, but rejecting
     // `=yes` from a shell would only annoy the person typing it.
@@ -30,5 +50,19 @@ fn main() {
     };
     if enabled {
         println!("cargo::rustc-cfg=grey_os_panic_test");
+    }
+
+    // A misspelt fault name has to be an error: silently building a normal kernel would make
+    // the fault-path test pass by measuring nothing.
+    let Some(fault) = std::env::var_os("GREY_OS_EXCEPTION_TEST") else {
+        return;
+    };
+    let fault = fault.to_string_lossy();
+    if fault.is_empty() || fault == "0" {
+        return;
+    }
+    match FAULTS.iter().find(|(value, _)| *value == fault.as_ref()) {
+        Some((_, cfg)) => println!("cargo::rustc-cfg={cfg}"),
+        None => panic!("GREY_OS_EXCEPTION_TEST={fault} is not one of gp, pf, ud or df"),
     }
 }

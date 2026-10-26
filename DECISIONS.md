@@ -481,8 +481,8 @@ the flag so `target/` keeps the image every other command boots.
 
 **Consequences.** The panic path is covered by the command this project treats as truth,
 and the red panel is verified from outside the guest through the kernel's own report line,
-which is the only way: nothing here can read the framebuffer. The three builds in
-`cargo xtask test` cost a couple of seconds each and `--no-build` is refused for `test`,
+which is the only way: nothing here can read the framebuffer. The builds in `cargo xtask test`
+cost a couple of seconds each and `--no-build` is refused for `test`,
 because the flag has to be compiled in. The injected message is duplicated as a string in
 `xtask`, so editing it in `main.rs` fails the test loudly instead of passing silently. The
 kernel is also no longer a package without a build script: `rerun-if-env-changed` and
@@ -598,4 +598,75 @@ teal, because `paint` had always used `BACKGROUND` and only the margins were red
 ADR-025's "paints the screen 0xb01b2f" was true only around the text, and now it is true of the
 whole panel.
 
+## ADR-027: M1 closes without TrueType, and the item moves to M7
+
+**Status:** accepted, M1 scope.
+
+**Context.** ROADMAP.md listed TrueType rasterisation under M1, next to the bitmap font, and
+M1's three acceptance criteria were then met without it: the log is legible at the resolution
+firmware picks, a panic paints the panel and renders the report in text, and a line is
+presented as one band copy. What TrueType actually costs is four pieces that only pay off
+together - an sfnt parser, quadratic/cubic flattening, a scanline fill, and a glyph cache -
+and the cache is the problem: ADR-021's bump allocator never reclaims, so a cache of rasterised
+glyphs grows for the whole run and its size is set by the text a program happens to draw. It
+also reopens ADR-018's face question, because a scalable face has to be vendored with its
+licence text before it can be parsed, tested or shipped. Deferring an item because a milestone
+can be accepted without it is a scope decision, not a silent drop, so it is recorded here
+rather than left in a list.
+
+**Decision.** M1 is accepted as it stands, on the 8x8 public-domain bitmap font of ADR-024 at
+integer scale. TrueType moves out of M1 and into M7 (compositor, windows, theme), which is the
+first milestone whose acceptance needs type at more than one size. ADR-018's choice of Selawik
+as the primary face stands and is the starting point there, unchanged.
+
+**Consequences.** M1 is done and M2 may start; the console keeps a fixed 16x16 cell on
+1280x800 and cannot render non-ASCII or anything the bitmap table lacks. A UI milestone cannot
+substitute integer scaling for it: 2x of an 8x8 is the whole fidelity there is, and 3x wraps
+the memory map. The item reopens early if a milestone before M7 needs text the bitmap font
+cannot express - the answer then is a second font table, not half a rasteriser.
+
+## ADR-028: M2 starts with the CPU's own structures, and handlers touch no state
+
+**Status:** accepted, M2. Restates the invariant ADR-021 relied on.
+
+**Context.** Until now the kernel ran on the bootloader's GDT and IDT. Any CPU exception
+therefore went to the bootloader's idea of a handler - in practice a triple fault and a reboot
+loop, or a stop that says nothing - so a `#PF` in a driver would have been undebuggable, and
+the M0 panic path could only report panics the kernel raised itself. Two questions decide the
+design. First, how much state a handler has to save: the exception handlers here diverge into
+the panic path, but a timer handler has to return to whatever it interrupted. Second, and more
+sharply, reentrancy: `console.rs`, `display.rs`, `framebuffer.rs` and `heap.rs` all hand out
+`&mut` on the argument that the kernel is single-threaded and nothing re-enters - an interrupt
+handler breaks that argument the moment it prints or allocates, and `heap.rs`'s `unsafe impl
+Sync` says so in as many words.
+
+**Decision.** M2 runs in dependency order: GDT with a TSS and an IST stack for `#DF`, then the
+IDT with handlers for every exception vector, then the 8259 PIC remapped to 0x20..=0x2F, then
+the PIT. Handlers are written with `extern "x86-interrupt"` and the `abi_x86_interrupt` feature
+rather than hand-rolled naked stubs: the compiler generates the stub, which is where the
+error-code-pushing vectors, `iretq` and register preservation are easy to get subtly wrong,
+and the toolchain is pinned (ADR-001) so the feature cannot vanish unnoticed. That feature gate
+is the one place M2 takes an unstable dependency, and it buys more safety than it costs.
+Exceptions report one line on serial - vector name, error code, faulting instruction - using
+`try_print_args` with an unlocked fallback, then panic into the M0/M1 path so the report also
+reaches the panel. Interrupt handlers do exactly two things: bump an `AtomicU64` and send EOI.
+
+**Consequences.** `heap.rs` keeps its `unsafe impl Sync` only because handlers do not allocate;
+that is now an invariant with a name, and the first handler that wants to allocate has to bring
+a lock or a queue with it. Nothing prints from an interrupt handler, so the timer is proved by
+the boot path sampling the counter after waiting for it, never by a heartbeat written from the
+handler. An exception raised *inside* a console write still leaves the grid torn - the report is
+already on serial by then, and the panel repaint is best-effort - which is why the console is
+repaired by repainting rather than trusted. `#DF` gets its own 16 KiB stack through the TSS, so
+a fault inside a fault handler reports instead of triple-faulting. The 8259 stays until an
+APIC is needed, and everything it learns about masking is relearned there.
+
+The ABI has two traps worth naming, both of which the fault tests found. A handler takes its
+frame **by value**: `extern "x86-interrupt"` reads its arguments off the interrupted stack, so
+the frame lands at `RSP + 8` and a `&InterruptFrame` parameter makes the handler dereference the
+saved `RIP` as if it were a pointer to the frame. And `int n` pushes no error code even for a
+vector whose hardware fault does, so `#DF` cannot be reached with `int 8`: the handler would read
+a return address as its error code. That fault is injected by a real double fault instead - an
+assembly stub that moves `RSP` to an address nothing maps and pushes - which also makes the
+phase a test of the TSS stack rather than of a software interrupt.
 

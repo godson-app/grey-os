@@ -42,8 +42,10 @@ pub struct BumpAllocator {
 }
 
 // SAFETY: the kernel is single-threaded and no interrupt handler allocates, so this
-// cell is never entered twice at once. That assumption is the whole argument, and it
-// has to be revisited the moment either of those stops being true.
+// cell is never entered twice at once. From M2 on the second half of that is a rule with a
+// reason: exception and timer handlers may not allocate or print, because either would enter
+// this cell (or the console) while the interrupted code still holds it (ADR-028). The
+// argument breaks the moment a handler does, or a second thread exists.
 unsafe impl Sync for BumpAllocator {}
 
 impl BumpAllocator {

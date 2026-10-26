@@ -8,8 +8,15 @@
 //! `bootloader_api`, so `cargo test --package kernel --lib` can run them on the host. The
 //! other modules are `x86_64`-only and are compiled out there, because inline `asm!` and
 //! port I/O do not exist on the machine running the tests.
+//!
+//! `gdt`, `idt`, `pic` and `timer` are written the same way: the data structures and the
+//! arithmetic are plain Rust and are tested on the host, while the half that executes
+//! instructions gets the same `cfg` treatment as the rest of the machine-specific code.
 
 #![cfg_attr(not(test), no_std)]
+// The `extern "x86-interrupt"` calling convention, which the IDT's handlers are written
+// with. Gated by target so a host build on another architecture can still be tested.
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
 // The kernel has no `std`, and the host tests get `alloc` through it, so declaring the
 // crate here lets the console's `Vec` and `String` be written once for both builds.
@@ -18,9 +25,13 @@ extern crate alloc;
 pub mod canvas;
 pub mod console;
 pub mod font;
+pub mod gdt;
 pub mod heap;
+pub mod idt;
 pub mod memory;
+pub mod pic;
 pub mod text;
+pub mod timer;
 
 #[cfg(target_arch = "x86_64")]
 pub mod display;
