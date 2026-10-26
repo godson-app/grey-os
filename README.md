@@ -17,6 +17,7 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 - [x] Framebuffer fill (pixel-format aware)
 - [x] Serial logging on COM1 and a panic handler that reports to serial and screen
 - [x] Heap allocation: a bump allocator over a region picked from the memory map, proved by a boot-time write/read-back (ADR-021, ADR-022)
+- [x] Glyph rendering: a public-domain 8x8 bitmap font and an integer-scaled text renderer, host-tested (ADR-024)
 - [ ] Framebuffer text console and `println!`
 - [ ] Interrupts and exception handling
 - [ ] Memory management (frame allocator, paging)
@@ -142,7 +143,9 @@ grey-os/
     └── src/
         ├── main.rs        # entry point, boot sequence, panic handler
         ├── lib.rs         # module list: what the host tests can reach
-        ├── canvas.rs      # geometry, one Colour, fill/blit/blend
+        ├── canvas.rs      # geometry, one Colour, fill/fill_rect/blend_rect
+        ├── font.rs        # public-domain 8x8 bitmaps, printable ASCII (ADR-024)
+        ├── text.rs        # glyph drawing at an integer scale, metrics
         ├── framebuffer.rs # boot-info framebuffer -> Canvas adapter
         ├── memory.rs      # memory map, heap region selection
         ├── heap.rs        # bump allocator behind `GlobalAlloc`

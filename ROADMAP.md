@@ -67,7 +67,8 @@ fails in a way that is visible on a machine with no serial cable attached.
 - [x] `canvas.rs`: validated `Geometry`, one `Color`, `fill`, `blit`, alpha blending, and
       12 host tests for the pure maths.
 - [x] `framebuffer.rs` adapter: the layout is validated once, palette/unknown formats are
-      refused (ADR-020).
+      refused (ADR-020), and the kernel owns the surface behind `install`/`with_screen`, so
+      the panic handler can paint a screen it was never handed.
 - [x] `memory.rs`: picks the heap region out of the firmware's memory map - largest usable
       region that is not the framebuffer - with 10 host tests.
 - [x] `heap.rs`: bump allocator behind `GlobalAlloc`, counters in the boot log, 8 host tests
@@ -81,16 +82,20 @@ fails in a way that is visible on a machine with no serial cable attached.
 - [x] `kernel/build.rs`, turning `GREY_OS_PANIC_TEST` into `cfg(grey_os_panic_test)`
       with `cargo::rerun-if-env-changed`, which is what closes M0's panic-path item
       (ADR-023).
+- [x] `font.rs`: public-domain 8x8 bitmaps for printable ASCII, provenance and upstream
+      checksum in the header (ADR-024).
+- [x] `text.rs`: glyph drawing with integer scaling, ink runs coalesced into one rect per
+      run, clipping delegated to `fill_rect`, and 16 host tests covering bit order,
+      scaling, clipping, pen advance and metrics.
 
 **Open.**
 
-- GOP framebuffer wrapper owned by the kernel, not the raw boot info struct.
-- Double buffering: draw off-screen, present once per frame.
-- Rect fill, blit, and alpha blending, all `no_std` and allocation-free where practical.
+- Double buffering: draw off-screen, present once per frame. Needs `Canvas::blit`, which
+  is the one primitives item still missing - `fill`, `fill_rect` and `blend_rect` are in.
 - TrueType rasterisation in `no_std` with a glyph cache.
-- Open-licence fonts only - Selawik, Open Sans, Noto. Licence audit recorded in `DECISIONS.md`.
+- An open-licence TrueType face (Selawik, Open Sans, Noto) when that item lands; the
+  bitmap font shipping now is public domain, recorded in ADR-024.
 - The M0 boot log rendered on screen through the new text path.
-- Host-side unit tests for glyph-metric maths; the blending maths is already covered.
 - The framebuffer's physical span, so ADR-021's overlap guard stops being inert. Needs a
   page-table walk, which is M3's machinery; today the boot log says the guard is unarmed.
 

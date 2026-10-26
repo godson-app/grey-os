@@ -481,3 +481,37 @@ kernel is also no longer a package without a build script: `rerun-if-env-changed
 passes against a stale artifact - which is why `test` also fails when a panicking build
 still reports `boot ok`.
 
+## ADR-024: Public-domain 8x8 bitmaps for the first console font
+
+**Status:** accepted, M1.
+
+**Context.** Text on a panel needs glyphs, and there were three ways to get them. A font
+crate would add a dependency whose licence and API have to be audited for the most basic
+thing the kernel does, and the diagnostic path has to work before anything that could help
+debug a dependency. A TrueType stack is a milestone item of its own: it needs an
+allocator-backed glyph cache, `cmap`/`glyf`/`loca` parsing and a licence decision for a
+real typeface. Neither is needed to put a boot log on the screen.
+
+**Decision.** Embed the printable ASCII subset of `font8x8_basic.h` - Daniel Hepper's
+public-domain 8x8 bitmaps, themselves derived from Marcel Sondaar's public-domain IBM VGA
+fonts - as a `static` table in `kernel/src/font.rs`, with provenance, fetch date and the
+upstream sha256 in the header, and draw it at an integer scale (`text.rs`). The scale is
+data rather than a constant: 2 gives a 16x16 cell, which is readable on a 1280x800 panel,
+and 1 or 3 need no new code.
+
+An Apache-2.0 8x16 face (the Verilog-encoded IBM VGA font) was considered for the better
+proportions and rejected: shipping it means shipping a licence notice beside a data blob
+in a repository that carries no licence text at all, for a gain of eight rows of pixels
+that the scale factor covers adequately.
+
+**Consequences.** Public domain means no licence file, no attribution obligation and no
+audit to repeat when the table is regenerated; the source is credited anyway. The cost is
+that 8x8 at 2x is chunkier than the 8x16 face DOS actually used, and that only ASCII is
+covered - anything else draws a visible box rather than a silent gap, which is honest and
+greppable. Swapping in a 8x16 table or a TTF rasteriser later touches `font.rs` and
+nothing else, because layout code only knows the cell size. Bit order is the source's
+(bit 0 leftmost) rather than a convention chosen here, so the table stays diffable against
+upstream; `F`'s first row is the test that pins it down, since mirrored `A` or `O` look
+perfectly plausible.
+
+
