@@ -670,3 +670,84 @@ a return address as its error code. That fault is injected by a real double faul
 assembly stub that moves `RSP` to an address nothing maps and pushes - which also makes the
 phase a test of the TSS stack rather than of a software interrupt.
 
+## ADR-029: A bitmap for frames, the bootloader's layout, and a guard page that needs a split
+
+**Status:** accepted, M3. Records the four choices M3's scope left open.
+
+**Context.** M3 owns the address space, and four questions decide how. First, how a free frame
+is found: a bitmap, a free list, or a stack of free frames. Second, whether the kernel keeps the
+address space the bootloader built or moves itself to a higher half in the same milestone. Third,
+how much of the address space the tables describe and in what granule - the bootloader maps the
+whole of physical memory, and it does so with 2 MiB pages. Fourth, what policy decides which
+pages may execute, given that the framebuffer is ordinary RAM the kernel writes to and the heap
+is ordinary RAM the kernel allocates from.
+
+**Decision.** A bitmap, one bit per 4 KiB frame, set when the frame is in use. It covers the
+physical address space up to the highest frame that could be handed out or must be kept out of
+circulation - usable RAM, the framebuffer, the kernel image - so a frame number is its address
+divided by 4096 and `alloc` returns addresses rather than indices. It starts with every frame
+marked used, and a frame becomes allocatable only when the boot sequence marks its span free:
+the allocator is pessimistic by construction, so a range nobody remembered to hand over is
+wasted rather than shared. The bitmap lives on the bump heap and is leaked, because the heap is
+already an allocator that works and the bitmap is one long-lived allocation. The cost of that
+choice is ordering: the frame allocator cannot run before `HEAP.init`, because nothing can hold
+its bitmap before then, and the bitmap occupies heap memory that will never be handed back.
+
+A free list was rejected for two reasons. Its header would have to live inside the frame it
+describes, which means writing to memory the kernel has not yet decided it owns, and a corrupted
+header is a wild pointer that only shows up at the next allocation. And the question this M3
+actually asks most often - "is this frame free?" - is one bit read in a bitmap and a walk down a
+list otherwise.
+
+The kernel keeps the bootloader's address layout for M3. It deep-copies the whole tree through
+`physical_memory_offset` into frames from the new allocator and loads the copy with `mov cr3`, so
+every mapping the bootloader made - kernel, stack, boot info, physical window, framebuffer -
+survives unchanged and only the ownership moves. A higher half is deferred: moving the kernel
+would also change where the heap, the stack and every pointer the boot info hands over live, and
+that is a milestone of its own rather than a step inside this one.
+
+The consequence is worth stating with numbers, because it is the copy's real price: the
+bootloader maps a 1 TiB window onto physical memory with 2 MiB pages, which is 1029 page
+directories, so owning the tree costs about 1044 frames - roughly 4 MiB of tables. That is
+faithful rather than necessary, and a tree built from scratch that maps only what the kernel uses
+is the follow-up. Frames behind the inherited tables are not reclaimed either: the memory map
+calls them bootloader memory, so the bitmap never offers them, and nothing here pretends to know
+their extent.
+
+The walker understands 1 GiB and 2 MiB leaves as well as 4 KiB ones, because the window it has to
+translate is made of them, and the copy preserves them rather than expanding them - expanding 1
+TiB into 4 KiB entries would cost a quarter of a million tables. The heap's guard page then needs
+the opposite: a single 4 KiB hole inside a 2 MiB page, which the tables cannot express until that
+page is replaced by a table of 4 KiB entries. `unmap_4k` does exactly that with one allocated
+frame, and the split is the reason the guard page exists at all rather than being blocked on the
+bootloader's choice of granule.
+
+W^X is inherited rather than decided in M3. The bootloader marks the physical window no-execute,
+so the heap and the framebuffer image are already non-executable in the copied tree, and the
+kernel text keeps the flags the ELF asked for. Making the kernel's own text read-only and its data
+no-execute is blocked on `bootloader_api` 0.11: it publishes the kernel image as one
+`kernel_addr`/`kernel_len` range, not per-segment bounds, so the tables cannot name the text
+range. Carried forward.
+
+**Consequences.** The boot log reports the frame totals from the memory map, the probe that
+allocated eight frames and gave them back, the inherited and the new `CR3` root, the framebuffer's
+resolved physical span and the armed guard page; `cargo xtask test` asserts all of them on the
+clean boot and adds `GREY_OS_EXCEPTION_TEST=guard` as a fifth fault phase, whose only job is to
+write one byte past the heap. That write now faults with error 0x2 - a write to a page that is not
+present - and `cr2` equal to the heap's end, which is the first check this kernel has ever had
+that its allocator arithmetic is right rather than merely self-consistent. Frame zero is never
+handed out either: firmware calls the real-mode low memory usable, and a frame at address 0 is
+also what a null pointer reaches through the window.
+
+The walk is checked, not believed. The framebuffer's pointer comes from the bootloader and its
+frame from our arithmetic, and nothing else ties them together, so the boot writes a byte through
+the virtual pointer and reads it back through the window at the resolved frame; the log line that
+follows says it matched. The rest of `paging` is as unsafe as it reads - every entry is a raw
+pointer through the window - which is why the host tests cover the entry layout, the index
+arithmetic and the walk with a table built by hand, and only the instructions (`mov cr3`,
+`invlpg`) are left to QEMU.
+
+What M3 does not reach: nothing frees a frame in anger, so the free path is exercised only by the
+probe, and the heap is still the bump allocator it was, so a frame given back cannot be reused by
+anything above it. Both belong to M4, where a real allocator gives `dealloc` something to mean.
+
