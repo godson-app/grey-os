@@ -10,7 +10,10 @@ use bootloader_api::info::MemoryRegionKind;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
-use grey_os::{display, framebuffer, gdt, halt_loop, heap, idt, memory, pic, qemu, serial, timer};
+use grey_os::{
+    display, frame, framebuffer, gdt, halt_loop, heap, idt, memory, paging, pic, qemu, serial,
+    timer,
+};
 
 /// The rate the PIT is programmed at. 100 Hz is the usual compromise: fine enough for a
 /// scheduler tick later, coarse enough that the handler's cost does not matter yet.
@@ -19,6 +22,10 @@ const TIMER_HZ: u32 = 100;
 /// Ticks the boot log waits for. Ten at [`TIMER_HZ`] is a tenth of a second, which proves the
 /// counter moves without making every boot feel slow under emulation.
 const OBSERVED_TICKS: u64 = 10;
+
+/// How many frames the boot probe takes at once: enough for a bitmap that hands the same frame
+/// out twice to show it, small enough to stay out of the way.
+const PROBE_FRAMES: usize = 8;
 
 /// An address nothing maps, for the `#PF` injection below.
 ///
@@ -109,17 +116,51 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     gdt::init();
     idt::init();
 
-    // Where the framebuffer physically lives. It is ordinary RAM that firmware
-    // happens to display from, so the map below may well offer its pages as usable;
-    // a heap that took them would paint over the screen at some later moment.
+    // The window onto all of physical memory (ADR-022). Read here rather than where it is
+    // first used, because two things need it before the heap exists: the page-table walk
+    // below, and the conversion of the heap's physical span to a virtual one.
+    let offset = match boot_info.physical_memory_offset.as_mut() {
+        Some(offset) => *offset,
+        None => {
+            println!(
+                "grey-os: FATAL: boot info carries no physical memory offset, so nothing outside the kernel is reachable"
+            );
+            qemu::exit_qemu(qemu::QemuExitCode::Failed);
+        }
+    };
+
+    // Where the framebuffer physically lives. It is ordinary RAM that firmware happens to
+    // display from, so the map below may well offer its pages as usable; a heap that took them
+    // would paint over the screen at some later moment.
     //
-    // `bootloader_api` 0.11 publishes the framebuffer only as a *virtual* address the
-    // bootloader picked; it never says which physical frames back it. Subtracting
-    // `physical_memory_offset` from that pointer would therefore produce a number that
-    // is not an address at all, which is worse than no number. Until the kernel can
-    // walk its own page tables (ROADMAP M3), the guard in `pick_heap_region` has no
-    // span to enforce, and this says so rather than reserving a made-up range.
-    let framebuffer_span: Option<memory::Span> = None;
+    // `bootloader_api` 0.11 publishes only the virtual address the bootloader picked, never
+    // the frames behind it, so the address has to be translated by walking the tables `CR3`
+    // names - M3's first job for `paging`, and the one that needs no allocator (ADR-029).
+    let Some(screen) = boot_info.framebuffer.as_mut() else {
+        // Failing loudly beats booting into a black screen nobody can diagnose.
+        println!("grey-os: FATAL: boot info carries no framebuffer; GOP is required");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    };
+    let screen_info = screen.info();
+    let inherited_root = paging::root();
+    let screen_start = screen.buffer().as_ptr() as u64;
+    // SAFETY: `inherited_root` is the tree `CR3` names, and `offset` is the window the
+    // bootloader mapped all of physical memory at, so every table in it is readable.
+    let found = unsafe {
+        paging::span(
+            inherited_root,
+            offset,
+            screen_start,
+            screen_info.byte_len as u64,
+        )
+    };
+    let Some(framebuffer_span) = found else {
+        println!(
+            "grey-os: FATAL: {} bytes of framebuffer at {screen_start:#x} are not contiguous physical memory",
+            screen_info.byte_len
+        );
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    };
 
     // Discovery runs before reporting: the console lives on the heap and draws into the
     // framebuffer, so neither exists yet. Deferring the first log line about the map is
@@ -141,40 +182,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 end: region.end,
                 usable: region.kind == MemoryRegionKind::Usable,
             }),
-        framebuffer_span,
+        Some(framebuffer_span),
     );
     let Some(span) = heap_span else {
         println!("grey-os: FATAL: no usable memory region to draw a heap from");
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
     };
+    // The region's last whole page becomes the guard page: the heap ends there, and the
+    // tables leave that one page unmapped, so a write past the end faults instead of landing
+    // in whatever follows (ADR-029).
+    let (heap, guard_page) = memory::split_guard_page(span);
 
     // The span picked above is physical memory that firmware happens to map somewhere of
     // its choosing. Convert it through `physical_memory_offset` before the allocator sees
     // it: handing `GlobalAlloc` a physical address writes to whatever is mapped at that
     // virtual address, which is silent corruption rather than a failed boot.
-    //
-    // The window enabled by `BOOTLOADER_CONFIG` above. Read here rather than at the top of
-    // the function: this is the only place that needs it.
-    let offset = boot_info
-        .physical_memory_offset
-        .as_mut()
-        .map(|offset| *offset);
-    let range = offset.and_then(|offset| {
-        let start = offset.checked_add(span.start)?;
-        let end = offset.checked_add(span.end)?;
-        Some((usize::try_from(start).ok()?, usize::try_from(end).ok()?))
-    });
+    let range = {
+        let start = offset.checked_add(heap.start);
+        let end = offset.checked_add(heap.end);
+        start.zip(end).and_then(|(start, end)| {
+            Some((usize::try_from(start).ok()?, usize::try_from(end).ok()?))
+        })
+    };
     let Some((start, end)) = range else {
-        // Two ways to get here, and they need different fixes, so say which.
-        match offset {
-            Some(offset) => println!(
-                "grey-os: FATAL: heap {:#x}..{:#x} does not fit past the {offset:#x} mapping",
-                span.start, span.end
-            ),
-            None => println!(
-                "grey-os: FATAL: boot info carries no physical memory offset, so the heap cannot be reached"
-            ),
-        }
+        println!(
+            "grey-os: FATAL: heap {:#x}..{:#x} does not fit past the {offset:#x} mapping",
+            heap.start, heap.end
+        );
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
     };
     // SAFETY: `start..end` is a region the firmware reports as usable, nothing else writes
@@ -188,8 +222,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // A heap is only worth anything if the memory behind it is really mapped at the
     // virtual address the allocator returns. Write a whole page through a `Box` and read
     // it back: a wrong `physical_memory_offset` faults here, at boot, instead of in a
-    // driver later. This is the kernel's only allocation until a driver needs one, and it
-    // is why the log line below is a claim and not a hope.
+    // driver later. Every later allocation - the console's grid, its back buffer, the frame
+    // allocator's bitmap - rides on this one having worked.
     let mut page = alloc::boxed::Box::new([0u8; 4096]);
     for (index, byte) in page.iter_mut().enumerate() {
         *byte = index as u8;
@@ -204,13 +238,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
     let probed = HEAP.stats();
     // UEFI has no VGA text mode, so we draw to the framebuffer instead. This is the only
-    // display path: GOP from boot information, no GPU drivers.
-    let Some(screen) = boot_info.framebuffer.as_mut() else {
-        // Failing loudly beats booting into a black screen nobody can diagnose.
-        println!("grey-os: FATAL: boot info carries no framebuffer; GOP is required");
-        qemu::exit_qemu(qemu::QemuExitCode::Failed);
-    };
-    let info = screen.info();
+    // display path: GOP from boot information, no GPU drivers. `screen` was taken above,
+    // where its physical span had to be walked; the layout is what gets checked here.
+    let info = screen_info;
     if !framebuffer::fill(screen, framebuffer::BACKGROUND) {
         // Say what the firmware offered: under BIOS a VBE mode can be 24-bit or palettised,
         // and "unsupported" alone leaves the next person guessing which.
@@ -221,6 +251,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
     }
+    // The walk's claim, checked rather than believed: write one byte through the framebuffer's
+    // virtual pointer, then read the same offset through the physical window at the frame the
+    // walk named. Nothing else ties those two addresses to the same memory - one came from the
+    // bootloader, the other from our arithmetic - so this is what makes the span a fact. The
+    // byte sits in the middle of the surface, where a wrong frame is far more likely to differ
+    // than to coincide; the console paints over it a few lines later.
+    let probe_byte = info.byte_len / 2;
+    let probe_value = 0x5a;
+    screen.buffer_mut()[probe_byte] = probe_value;
+    // SAFETY: `framebuffer_span` came from the walk, `offset` maps all of physical memory, and
+    // `probe_byte` is inside the span's length by construction.
+    let through_frame = unsafe {
+        core::ptr::read_volatile((offset + framebuffer_span.start + probe_byte as u64) as *const u8)
+    };
+    if through_frame != probe_value {
+        println!(
+            "grey-os: FATAL: the framebuffer's virtual and physical views disagree at byte {probe_byte}"
+        );
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+
     framebuffer::install(screen);
     // The console needs the heap above for its grid and the framebuffer for its pixels.
     if !display::init() {
@@ -230,9 +281,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // From here every line goes to serial and to the panel. Serial first in each macro
     // call, because it is the channel that survives a screen going dark later.
-    if framebuffer_span.is_none() {
-        println!("grey-os: WARNING: framebuffer physical base unknown, heap guard unarmed");
-    }
     for region in boot_info.memory_regions.iter() {
         let span = memory::Span::new(region.start, region.end);
         let kind = match region.kind {
@@ -251,12 +299,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
     println!("grey-os: memory usable total {} KiB", usable_bytes / 1024);
-    println!(
-        "grey-os: heap candidate {:#012x}-{:#012x} ({} KiB)",
-        span.start,
-        span.end,
-        span.len() / 1024
-    );
+    match guard_page {
+        Some(guard) => println!(
+            "grey-os: heap candidate {:#012x}-{:#012x} ({} KiB, guard page at {:#x})",
+            heap.start,
+            heap.end,
+            heap.len() / 1024,
+            guard.start
+        ),
+        None => println!(
+            "grey-os: heap candidate {:#012x}-{:#012x} ({} KiB, no room for a guard page)",
+            heap.start,
+            heap.end,
+            heap.len() / 1024
+        ),
+    }
     let stats = HEAP.stats();
     println!(
         "grey-os: heap ready {:#x}..{:#x}, {} KiB reserved",
@@ -285,6 +342,146 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 bytes / 1024
             ),
             None => println!("grey-os: console draws straight to the panel, no back buffer"),
+        }
+    }
+
+    // The frame allocator (ADR-029). Its bitmap lives on the heap, which is why this runs
+    // after `HEAP.init`, and it is never freed: every later allocation asks this bitmap
+    // first. The index covers the physical address space up to the highest frame that could
+    // be handed out or must be kept out of circulation - usable RAM, the framebuffer and the
+    // kernel image - so a frame number is just an address divided by the page size, and the
+    // reserved MMIO ranges above that are simply not described.
+    let highest = boot_info
+        .memory_regions
+        .iter()
+        .filter(|region| region.kind == MemoryRegionKind::Usable)
+        .map(|region| region.end)
+        .chain([
+            framebuffer_span.end,
+            boot_info.kernel_addr.saturating_add(boot_info.kernel_len),
+        ])
+        .max()
+        .unwrap_or(0);
+    let frames = highest.div_ceil(memory::PAGE_BYTES) as usize;
+    let words = frames.div_ceil(usize::BITS as usize);
+    // Leaked on purpose: the bitmap is the allocator's index and has to outlive every frame
+    // it hands out, which is the rest of the kernel's life.
+    let bitmap: &'static mut [u64] =
+        alloc::boxed::Box::leak(alloc::vec![0u64; words].into_boxed_slice());
+    // SAFETY: `bitmap` is a live slice on the heap that nothing else writes, `frames` fits in
+    // it, and this is the only call to `init`.
+    if !unsafe { frame::FRAMES.init(bitmap.as_mut_ptr(), bitmap.len(), frames) } {
+        println!("grey-os: FATAL: the frame allocator refused its bitmap");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+
+    // Only frames firmware calls usable may be handed out, and the kernel's own memory comes
+    // back out of them first. The bootloader already marks what it allocated as not usable,
+    // which is what keeps the boot info and the inherited tables out of reach; what it does
+    // not promise is the kernel image, the heap and the framebuffer, so each is reserved by
+    // span here.
+    for region in boot_info.memory_regions.iter() {
+        if region.kind == MemoryRegionKind::Usable {
+            frame::FRAMES.mark_free(memory::Span::new(region.start, region.end));
+        }
+    }
+    frame::FRAMES.mark_used(memory::Span::new(
+        boot_info.kernel_addr,
+        boot_info.kernel_addr.saturating_add(boot_info.kernel_len),
+    ));
+    // Frame zero is never handed out. The map may call the real-mode low memory usable - it is
+    // history, not free space - and a frame at address 0 is also what a null pointer would
+    // reach through the physical window.
+    frame::FRAMES.mark_used(memory::Span::new(0, memory::PAGE_BYTES));
+    // The whole region, not just the heap: the guard page at its end must never be handed out
+    // either, or the next allocation would map it and the fault test would stop faulting.
+    frame::FRAMES.mark_used(span);
+    frame::FRAMES.mark_used(framebuffer_span);
+
+    let frame_stats = frame::FRAMES
+        .stats()
+        .expect("the frame allocator was just initialised");
+    println!(
+        "grey-os: frames: {} total, {} free, {} KiB bitmap",
+        frame_stats.frames,
+        frame_stats.free,
+        frame_stats.bitmap_bytes / 1024
+    );
+
+    // The frame allocator's half of the heap's 4 KiB probe: frames it hands out have to be
+    // distinct, writable through the window, and read back what was written.
+    let Some(probe) = probe_frames(offset) else {
+        println!("grey-os: FATAL: the frame probe did not read back what it wrote");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    };
+    println!(
+        "grey-os: frame probe ok: {PROBE_FRAMES} frames from {probe:#x} written and read back"
+    );
+
+    // The kernel's own tables: a deep copy of the tree `CR3` currently names, so every mapping
+    // the bootloader made survives untouched - the kernel, its stack, the boot info, the
+    // physical window, the framebuffer - while the frames behind it come from the allocator.
+    // From the `mov cr3` on, the kernel owns the address space and can edit it (ADR-029).
+    let mut table_frames = 0usize;
+    // SAFETY: `inherited_root` is the live tree, and the closure hands out only frames the
+    // bitmap says are free.
+    let own_root = unsafe {
+        paging::clone_root(inherited_root, offset, || {
+            let frame = frame::FRAMES.alloc()?;
+            table_frames += 1;
+            Some(frame)
+        })
+    };
+    let Some(own_root) = own_root else {
+        println!("grey-os: FATAL: the page-table copy ran out of frames");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    };
+    if own_root == inherited_root {
+        // A copy at the same address would mean the clone did nothing, and the kernel would be
+        // editing tables it does not own while believing it does.
+        println!("grey-os: FATAL: the page-table copy came back with the inherited root");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    println!(
+        "grey-os: framebuffer physical {:#012x}-{:#012x} ({} KiB, resolved by page walk)",
+        framebuffer_span.start,
+        framebuffer_span.end,
+        framebuffer_span.len() / 1024
+    );
+    println!("grey-os: framebuffer byte {probe_byte} reads the same through both mappings");
+    println!(
+        "grey-os: page tables: inherited root {inherited_root:#x}, own root {own_root:#x}, \
+         {table_frames} frames"
+    );
+    // SAFETY: `own_root` is a complete copy of the tree the CPU is already using, so the code
+    // making this call, its stack and everything reachable stays mapped.
+    unsafe { paging::load_root(own_root) };
+
+    // The guard page: the one page at the end of the heap region, unmapped in the tables just
+    // loaded. Splitting the 2 MiB page that covers it is what makes a 4 KiB hole expressible
+    // inside the physical window at all.
+    match guard_page {
+        Some(guard) => {
+            let address = offset + guard.start;
+            // SAFETY: `own_root` is the tree just loaded, `address` is inside the physical
+            // window the copy maps, and the closure hands out the one frame a split needs.
+            let unmapped =
+                unsafe { paging::unmap_4k(own_root, offset, address, || frame::FRAMES.alloc()) };
+            match unmapped {
+                // One byte past the end of the heap now faults, which is the point: the
+                // allocator's arithmetic is checked by hardware rather than trusted.
+                Ok(()) => println!(
+                    "grey-os: heap guard armed at {address:#x} (physical {:#x}), one page unmapped",
+                    guard.start
+                ),
+                Err(error) => {
+                    println!("grey-os: FATAL: heap guard could not be armed: {error:?}");
+                    qemu::exit_qemu(qemu::QemuExitCode::Failed);
+                }
+            }
+        }
+        None => {
+            println!("grey-os: WARNING: the heap region has no page to spare, heap guard unarmed");
         }
     }
 
@@ -385,6 +582,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         unsafe { grey_os_double_fault_probe() };
     }
 
+    // M3's fault path: a write one byte past the end of the heap has to reach the `#PF`
+    // handler instead of landing in whatever follows. The guard page is the last page of the
+    // heap region, which the tables leave unmapped, and `HEAP.stats().end` is its first byte.
+    #[cfg(grey_os_fault_guard)]
+    {
+        let end = HEAP.stats().end;
+        println!(
+            "grey-os: GREY_OS_EXCEPTION_TEST=guard, writing one byte past the heap at {end:#x}"
+        );
+        // SAFETY: `end` is the guard page, which `unmap_4k` deliberately took away, so this
+        // write raises #PF - the point of the run.
+        unsafe { core::ptr::write_volatile(end as *mut u8, 0xa5) };
+    }
+
     // The M0 acceptance criterion "a forced panic prints `[panic] <message>` and its
     // location" needs a kernel that can be told to fail. `kernel/build.rs` turns
     // `GREY_OS_PANIC_TEST` into the cfg below, and `cargo xtask test` boots a second
@@ -408,9 +619,45 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 }
 
+/// Allocates [`PROBE_FRAMES`], writes a distinct value into each frame through the physical
+/// window, reads them back and returns them.
+///
+/// This is the frame allocator's half of the heap's 4 KiB probe: a bitmap that hands out
+/// frames over memory the kernel does not own, or hands the same frame out twice, fails here at
+/// boot instead of in a driver later with a corrupted structure.
+fn probe_frames(offset: u64) -> Option<u64> {
+    let mut frames = [0u64; PROBE_FRAMES];
+    for slot in frames.iter_mut() {
+        *slot = frame::FRAMES.alloc()?;
+    }
+    // The allocator's whole job is to hand out each frame once.
+    for (index, address) in frames.iter().enumerate() {
+        if frames[..index].contains(address) {
+            return None;
+        }
+    }
+    let pattern = |index: usize| 0xfeed_0000_0000_0000 | index as u64;
+    for (index, address) in frames.iter().enumerate() {
+        // SAFETY: the frame came from the allocator, so nothing else uses it, and the
+        // bootloader maps all of physical memory writable at `offset` (ADR-022).
+        unsafe { core::ptr::write_volatile((offset + address) as *mut u64, pattern(index)) };
+    }
+    for (index, address) in frames.iter().enumerate() {
+        // SAFETY: the write above put the value at this address, and the frame is still ours.
+        let value = unsafe { core::ptr::read_volatile((offset + address) as *const u64) };
+        if value != pattern(index) {
+            return None;
+        }
+    }
+    let first = frames[0];
+    for address in frames {
+        frame::FRAMES.free(address);
+    }
+    Some(first)
+}
+
 /// Set once the panic path runs, so a panic inside it cannot recurse forever.
 static PANICKING: AtomicBool = AtomicBool::new(false);
-
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     if PANICKING.swap(true, Ordering::SeqCst) {

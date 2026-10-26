@@ -5,25 +5,25 @@ acceptance criteria are demonstrated by output, not by code existing: the proof 
 a `xtask test` run or a QEMU session whose serial log is pasted into the commit
 message. No milestone is started before the previous one is accepted.
 
-Scope for M0 and M1 is agreed. M2 onward is stated as themes in dependency order:
-the authoritative wording comes from the engineering brief and is transcribed here
-milestone by milestone, so that this file never claims more than was agreed.
+Scope for M0, M1, M2 and M3 is agreed. M4 onward is stated as themes in dependency order: the
+authoritative wording comes from the engineering brief and is transcribed here milestone by
+milestone, so that this file never claims more than was agreed.
 
 ## Status
 
-| Milestone | Theme                                        | Status                                                              |
-| --------- | -------------------------------------------- | ------------------------------------------------------------------- |
-| M0        | Boot, serial diagnostics, diagnosable panics | **Done** - criteria automated; BIOS image boots (ADR-009)            |
-| M1        | Display primitives, text, on-screen boot log | **Done** - criteria met; TrueType moved to M7 (ADR-027)               |
-| M2        | Interrupts, exceptions, timers               | **Criteria met** - awaiting acceptance (ADR-028)                     |
-| M3        | Physical and virtual memory management       | Not started                                                         |
-| M4        | Heap allocation and kernel data structures   | Not started (the heap itself moved into M1, see ADR-017)            |
-| M5        | Storage: disk driver and filesystem          | Not started                                                           |
-| M6        | Input: keyboard and pointer                  | Not started                                                           |
-| M7        | Compositor, windows, theme                   | Not started                                                           |
-| M8        | Shell and process model                      | Not started                                                           |
-| M9        | Applications                                 | Not started                                                           |
-| M10       | SMP, ports, polish                           | Not started                                                           |
+| Milestone | Theme                                        | Status                                                     |
+| --------- | -------------------------------------------- | ---------------------------------------------------------- |
+| M0        | Boot, serial diagnostics, diagnosable panics | **Done** - criteria automated; BIOS image boots (ADR-009)  |
+| M1        | Display primitives, text, on-screen boot log | **Done** - criteria met; TrueType moved to M7 (ADR-027)    |
+| M2        | Interrupts, exceptions, timers               | **Done** - criteria met; PIC stays until an APIC (ADR-028) |
+| M3        | Physical and virtual memory management       | **Done** - criteria met; guard page armed (ADR-029)        |
+| M4        | Heap allocation and kernel data structures   | Not started (the heap itself moved into M1, see ADR-017)   |
+| M5        | Storage: disk driver and filesystem          | Not started                                                |
+| M6        | Input: keyboard and pointer                  | Not started                                                |
+| M7        | Compositor, windows, theme                   | Not started                                                |
+| M8        | Shell and process model                      | Not started                                                |
+| M9        | Applications                                 | Not started                                                |
+| M10       | SMP, ports, polish                           | Not started                                                |
 
 ## M0 - Boot, serial diagnostics, diagnosable panics
 
@@ -104,8 +104,8 @@ fails in a way that is visible on a machine with no serial cable attached.
 each names where it gets fixed. TrueType rasterisation and the face it needs left M1 for M7
 (ADR-027), so the text stack stays on ADR-024's public-domain bitmaps at integer scale.
 
-- The framebuffer's physical span, so ADR-021's overlap guard stops being inert. Needs a
-  page-table walk, which is M3's machinery; today the boot log says the guard is unarmed.
+- The framebuffer's physical span, so ADR-021's overlap guard stops being inert: M3 resolved it
+  with a page-table walk, and the boot log now says the guard is armed (ADR-029).
 - Rendering under BIOS/VBE: the legacy image boots but is handed a 24-bit surface this
   renderer refuses (ADR-009). Either a 24-bit path in `canvas.rs` or a 32-bit VBE mode; not
   needed while UEFI is the target.
@@ -192,19 +192,122 @@ saved `RIP` as if it were a pointer to the frame. And `int 8` cannot stand in fo
 software interrupt pushes no error code even on a vector whose hardware fault does, so the handler
 would read a return address as its error code. Hence the assembly stub.
 
-**Carried forward.** The `#DF` stack is 16 KiB, which is enough to print a report and no more; a
-handler that ever needed to do work on it would want a larger one. The PIC's mask is fixed at
-`irq0`, so the vector range above it is claimed but silent until a driver unmasks one.
+**Carried forward.** M2 is accepted with the three items above open; none of them blocks M3,
+which needs page tables rather than a PIC. Two notes on what landed rather than on what is
+missing: the `#DF` stack is 16 KiB, enough to print a report and no more, and the PIC's mask is
+fixed at `irq0`, so the rest of `0x20..=0x2f` is claimed but silent until a driver unmasks a
+line.
 
-## M3 onward - provisional themes
+## M3 - Physical and virtual memory management
+
+**Goal.** Own the address space. Before M3 the kernel borrowed the bootloader's page tables, so it
+could not map a page it wanted, unmap one it should not have had, or say where a buffer it was
+handed physically lived - which is why ADR-021's heap guard was inert and why a `#PF` named an
+address the kernel could do nothing about.
+
+**Agreed order** (ADR-029): the page-table types and a walker, which can read the bootloader's
+tables without allocating anything; then a frame allocator that reserves what the kernel is using,
+the framebuffer included; then the kernel's own tables loaded into `CR3`; then the heap guard armed
+from the framebuffer's span; then a guard page the `#PF` handler can be shown to catch. That is
+also the order it landed in.
+
+**Landed.**
+
+- [x] `paging.rs`: PML4/PDPT/PD/PT entries with the flags this kernel uses (present, writable,
+      no-execute), the index arithmetic, and a walker that translates a virtual address by reading
+      the tables - the piece that turns the framebuffer's virtual pointer into a frame range, and
+      the first thing M3 could prove, since it needs no allocator.
+- [x] `frame.rs`: a 4 KiB frame allocator over `BootInfo::memory_regions`, reserving the kernel
+      image, frame zero, the heap and, once the walk has resolved it, the framebuffer. The boot log
+      reports total and free frames, and a probe allocates eight frames and gives them back.
+- [x] The kernel's own tables, built through `physical_memory_offset` (ADR-022) and loaded with
+      `mov cr3`, keeping the kernel mapping, the physical window and the framebuffer mapped. The
+      log names the inherited root and the new one.
+- [x] `main.rs`'s `framebuffer_span` comes from a table walk, so `pick_heap_region` enforces
+      something and the `WARNING: framebuffer physical base unknown, heap guard unarmed` line is
+      gone. The walk is cross-checked byte for byte through both mappings.
+- [x] A guard page at the end of the heap, and `GREY_OS_EXCEPTION_TEST=guard` as a fifth `xtask`
+      phase: write one byte past the guard and assert that the `#PF` report names a write to a
+      not-present page.
+
+**Open.**
+
+- The heap stays a bump allocator: replacing it is M4's work, not this milestone (ADR-017 moved
+  the heap itself into M1).
+- Nothing frees memory yet, so the allocator's free path is exercised only by its own probe.
+- The tables are a faithful copy of the bootloader's, including its 1 TiB 2 MiB-page window, which
+  is about 1044 frames of tables for one boot. A tree that maps only what the kernel uses is the
+  follow-up (ADR-029).
+- Kernel text is still writable and its data still executable: `bootloader_api` 0.11 publishes the
+  kernel image as one range rather than per-segment bounds, so W^X for the kernel's own pages waits
+  for a bootloader that reports more. The heap and the framebuffer are already no-execute.
+- User-mode mappings, copy-on-write, swapping and a page cache are out of scope.
+
+**Acceptance criteria.**
+
+1. The boot log reports the frame allocator's totals derived from the memory map, and a probe that
+   allocated a run of frames and gave them back.
+2. The kernel runs on tables it built itself: the log names the new `CR3` root, it differs from the
+   inherited one, and the boot still reaches `grey-os: boot ok` with the console, the back buffer
+   and the heap working.
+3. The framebuffer's physical span is resolved by the walk, and the walk is checked rather than
+   believed: the same byte read through the framebuffer's virtual pointer and through
+   `physical_memory_offset` at the resolved frame agree, the span is printed, and the
+   "unarmed" warning is gone from the log.
+4. A write past the heap's guard page reaches the `#PF` handler, is reported as a write to a
+   not-present page with a `cr2` inside the guard, and QEMU exits 35 - asserted by
+   `cargo xtask test` next to the M2 phases.
+
+**Status against them.** All four are met, in QEMU, on the boots `cargo xtask test` performs. The
+clean boot now prints, after the heap lines:
+
+```text
+grey-os: frames: 525288 total, 20547 free, 64 KiB bitmap
+grey-os: frame probe ok: 8 frames from 0x1000 written and read back
+grey-os: framebuffer physical 0x0080000000-0x00803e8000 (4000 KiB, resolved by page walk)
+grey-os: framebuffer byte 2048000 reads the same through both mappings
+grey-os: page tables: inherited root 0x101000, own root 0x1000, 1044 frames
+grey-os: heap guard armed at 0x2801bb6b000 (physical 0x1bb6b000), one page unmapped
+```
+
+Criterion 1 is the first two lines. Criterion 3 is the framebuffer pair: 0x8000_0000 is where the
+bootloader said the panel is, and the byte at offset 2048000 read back through the window at
+`0x28000000000 + 0x8000_0000 + 2048000` is the same byte, which is what ties the bootloader's
+pointer to our arithmetic rather than leaving it a plausible number. Criterion 2 is the fifth line:
+the copy costs 1044 frames because the bootloader maps a 1 TiB window with 2 MiB pages, and the
+kernel refuses to continue if the new root came back equal to the inherited one. Criterion 4 is the
+fifth fault phase `xtask` boots:
+
+```text
+grey-os: GREY_OS_EXCEPTION_TEST=guard, writing one byte past the heap at 0x2801bb6b000
+[exception] #PF page fault: error 0x2 on a write to a not-present page, rip 0x100000110d6, cr2 0x2801bb6b000
+```
+
+Error 0x2 is a write to a page with no mapping, and `cr2` is the first byte past the heap: the guard
+page is the last whole page of the heap's region, the tables leave it absent, and the write is the
+allocator's own size arithmetic being checked by hardware instead of by itself. Making that page
+absent needed one thing the copied tables could not express: a single 4 KiB hole inside a 2 MiB page
+is a split, so `unmap_4k` allocates one frame, writes a table of 4 KiB entries covering the same
+2 MiB, and repoints the parent entry. The pages on either side of the guard kept their frames and
+their flags, which the console and the heap still working are the evidence for.
+
+**Carried forward.** M3 is accepted with the five items above open. Two of them shape M4: the bump
+heap cannot give a frame back to anything, and the free path in `frame.rs` has only ever been run by
+its own probe. The table copy is where the milestone's cost is visible - 4 MiB of frames to own an
+address space whose interesting part is a few megabytes - and the fix is a tree built from scratch,
+not a smaller bitmap. Tests: 119 on the host, covering the entry layout, the index arithmetic, the
+walk (2 MiB and 1 GiB leaves included), the bitmap, and the heap/guard split; everything that
+executes an instruction is left to the QEMU boots.
+
+## M4 onward - provisional themes
 
 The ordering above is dependency-driven and each theme is a milestone of its own.
 Detailed scope, acceptance criteria and verification are added when the milestone
 is approved, per the brief's one-at-a-time rule.
 
 Two items already have a home when their milestone opens: TrueType rasterisation, with the face
-question it drags along, belongs to M7 (ADR-027); and the framebuffer's physical span, which
-would make ADR-021's heap guard bite, belongs to M3's page-table work.
+question it drags along, belongs to M7 (ADR-027); and the framebuffer's physical span, which would
+make ADR-021's heap guard bite, is now part of M3 above.
 
 ## Hardware compatibility
 
@@ -237,6 +340,6 @@ inline-asm register names and on `bootloader_api::entry_point!`. See `DECISIONS.
 The host tests use `--lib` for the same reason: the library also compiles for the host,
 the binary does not, so a bare `cargo test --package kernel` fails.
 
-`cargo xtask test` builds three times on purpose: once for the clean boot, once with
-`GREY_OS_PANIC_TEST` set so the panic path runs, and once more without it, so `target/`
-is left holding the image every other command boots.
+`cargo xtask test` builds once per failure path on purpose: the clean boot, then one image each
+for `GREY_OS_PANIC_TEST` and for `GREY_OS_EXCEPTION_TEST=gp|pf|ud|df`, and finally one more with
+neither variable set, so `target/` is left holding the image every other command boots.

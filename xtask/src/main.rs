@@ -47,10 +47,19 @@ const PANIC_MESSAGE: &str = "injected panic for the panic-path test";
 const PANIC_PAINTED: &str = "[panic] panel painted red";
 /// Variable that picks one injected CPU fault for `kernel/build.rs` to compile in (ADR-028).
 const EXCEPTION_TEST_ENV: &str = "GREY_OS_EXCEPTION_TEST";
+/// Printed once the frame allocator has counted the frames the memory map offers (M3).
+const FRAME_TOTALS: &str = "grey-os: frames:";
+/// Printed once the kernel has switched to tables it built itself, naming both roots (M3).
+/// The kernel refuses to continue if the two are equal, so naming them is the whole claim.
+const PAGE_TABLES: &str = "grey-os: page tables: inherited root";
+/// Printed once the page walk has resolved the framebuffer's frames (M3).
+const FRAMEBUFFER_PHYSICAL: &str = "grey-os: framebuffer physical";
+/// Printed once the heap's last page is left unmapped (M3).
+const HEAP_GUARD: &str = "grey-os: heap guard armed";
 /// One injected fault: what the variable is set to, the line the kernel prints before the
 /// faulting instruction, and the report the handler has to produce.
 struct Fault {
-    /// `gp`, `pf`, `ud` or `df` - the values `kernel/build.rs` accepts.
+    /// `gp`, `pf`, `ud`, `df` or `guard` - the values `kernel/build.rs` accepts.
     value: &'static str,
     /// Printed by `kernel/src/main.rs` ahead of the fault. Asserted because it is the only
     /// proof the flag reached the kernel rather than a stale image being booted.
@@ -61,7 +70,7 @@ struct Fault {
 /// Every fault `test` injects, one image each. The report text is matched, not the faulting
 /// address: where the instruction lands depends on the build, and the criterion is that the
 /// handler names the vector, its error code and where execution was.
-const FAULTS: [Fault; 4] = [
+const FAULTS: [Fault; 5] = [
     Fault {
         value: "gp",
         announcement: "GREY_OS_EXCEPTION_TEST=gp, loading a selector that is not in the gdt",
@@ -81,6 +90,13 @@ const FAULTS: [Fault; 4] = [
         value: "df",
         announcement: "GREY_OS_EXCEPTION_TEST=df, faulting while a fault is delivered",
         report: "[exception] #DF double fault: error 0x0",
+    },
+    Fault {
+        value: "guard",
+        announcement: "GREY_OS_EXCEPTION_TEST=guard, writing one byte past the heap",
+        // Error 0x2: a write (bit 1) to a page with no mapping (bit 0 clear). The heap's guard
+        // page is the only page in the kernel's own tables that is deliberately absent.
+        report: "[exception] #PF page fault: error 0x2 on a write to a not-present page",
     },
 ];
 /// Upper bound on a `test` run, so a hung boot fails instead of hanging CI.
@@ -181,17 +197,32 @@ fn run(options: &Options) -> Result<ExitCode> {
     interpret(status)
 }
 
-/// Boots headless once per M0/M2 failure path and asserts every one of them.
+/// Boots headless once per M0/M2/M3 failure path and asserts every one of them.
 ///
-/// The first boot is the normal image: it must print `grey-os: boot ok` and exit 33.
-/// Then one image per injected failure - a panic, and each fault in [`FAULTS`] - each of
-/// which must report itself and exit 35. Asserting both halves is the point: a flag that
-/// does not take effect would pass a test that only checked the clean boot, and a kernel
-/// that always panics would fail the first phase.
+/// The first boot is the normal image: it must print `grey-os: boot ok` and exit 33. That run
+/// also carries M3's claims - frame totals, the framebuffer's resolved span, the kernel's own
+/// page-table root and the armed heap guard - because they are all lines a successful boot
+/// prints and a broken one does not. Then one image per injected failure - a panic, and each
+/// fault in [`FAULTS`] - each of which must report itself and exit 35. Asserting both halves is
+/// the point: a flag that does not take effect would pass a test that only checked the clean
+/// boot, and a kernel that always panics would fail the first phase.
 fn test(options: &Options) -> Result<ExitCode> {
     let (log, code) = boot_headless(options)?;
-    expect(&log, code, &[BOOT_OK], EXIT_CLEAN)?;
-    println!("pass: `{BOOT_OK}` seen on serial and qemu exited {EXIT_CLEAN}");
+    expect(
+        &log,
+        code,
+        &[
+            BOOT_OK,
+            FRAME_TOTALS,
+            PAGE_TABLES,
+            FRAMEBUFFER_PHYSICAL,
+            HEAP_GUARD,
+        ],
+        EXIT_CLEAN,
+    )?;
+    println!(
+        "pass: `{BOOT_OK}` and the memory bring-up lines seen on serial, qemu exited {EXIT_CLEAN}"
+    );
 
     let phases = panic_path(options).and_then(|()| exception_paths(options));
     // Restore the image the other commands boot whether the phases passed or not:
