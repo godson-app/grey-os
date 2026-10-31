@@ -5,8 +5,8 @@ acceptance criteria are demonstrated by output, not by code existing: the proof 
 a `xtask test` run or a QEMU session whose serial log is pasted into the commit
 message. No milestone is started before the previous one is accepted.
 
-Scope for M0, M1, M2 and M3 is agreed. M4 onward is stated as themes in dependency order: the
-authoritative wording comes from the engineering brief and is transcribed here milestone by
+Scope for M0, M1, M2, M3 and M4 is agreed. M5 onward is stated as themes in dependency order:
+the authoritative wording comes from the engineering brief and is transcribed here milestone by
 milestone, so that this file never claims more than was agreed.
 
 ## Status
@@ -17,7 +17,7 @@ milestone, so that this file never claims more than was agreed.
 | M1        | Display primitives, text, on-screen boot log | **Done** - criteria met; TrueType moved to M7 (ADR-027)    |
 | M2        | Interrupts, exceptions, timers               | **Done** - criteria met; PIC stays until an APIC (ADR-028) |
 | M3        | Physical and virtual memory management       | **Done** - criteria met; guard page armed (ADR-029)        |
-| M4        | Heap allocation and kernel data structures   | Not started (the heap itself moved into M1, see ADR-017)   |
+| M4        | Heap allocation and kernel data structures   | **In progress** - mapper landed; allocator next (ADR-030)  |
 | M5        | Storage: disk driver and filesystem          | Not started                                                |
 | M6        | Input: keyboard and pointer                  | Not started                                                |
 | M7        | Compositor, windows, theme                   | Not started                                                |
@@ -299,7 +299,73 @@ not a smaller bitmap. Tests: 119 on the host, covering the entry layout, the ind
 walk (2 MiB and 1 GiB leaves included), the bitmap, and the heap/guard split; everything that
 executes an instruction is left to the QEMU boots.
 
-## M4 onward - provisional themes
+## M4 - Heap allocation and kernel data structures
+
+**Goal.** Make memory reusable. M1's heap is a bump allocator: it never gives a byte back, so
+everything the kernel has ever asked for stays asked for, and M3's frame free path has only ever
+run inside its own probe. M4 replaces the allocator, grows the heap from frames instead of
+guessing one region at boot, and puts the containers the next milestones need - `Vec`, `String`,
+an intrusive list - on top of it.
+
+**Agreed order** (ADR-030): `paging::map_4k`, because growth means giving a frame an address and M3
+could only take a mapping away; then a heap that grows in pages, with the guard page moving above
+the grown heap; then a free-list allocator per size class, which is the first real caller of
+`frame::Allocator::free`; then `Vec`, `String` and a list on top of `GlobalAlloc`; then, if it still
+matters by then, the tree built from scratch that ADR-029 leaves open.
+
+**Landed.**
+
+- [x] `paging::map_4k`: 4 KiB mappings built level by level, with the arithmetic in `paging::map`
+      over a `Tables` trait so the host tests drive it with tables in an array. A fresh tree costs
+      three tables, a neighbour in the same 2 MiB page costs none, and a duplicate address, a
+      misaligned address or frame, a huge page and a dry allocator are each refused with the reason
+      named; the levels it creates keep their flags out of the leaf's way, so a leaf decides its own
+      writability and executability. Proved at boot: one frame mapped at `0x6000_0000_0000` - an
+      address the walk says nothing maps - a byte written through the mapping, read back through the
+      window at the frame, the mapping taken away and the frame returned to the bitmap.
+
+**Open.** The allocator, which is the rest of the milestone:
+
+- The bump heap still never gives a byte back, so `dealloc` is a no-op and nothing above the frame
+  allocator can reuse memory (M3's debt 1).
+- `frame::Allocator::free` has still only ever run from its own probes (M3's debt 2). It needs a
+  caller that means it, which is a heap that shrinks.
+- The heap does not grow yet, so the guard page still sits at the end of the region
+  `pick_heap_region` chose rather than above the heap's current top.
+- The tables a mapping creates are never given back, and `unmap_4k` still does not return the frame
+  it unmaps (ADR-030): which frame a mapping owns is a question the allocator has to answer first.
+- The copy of the bootloader's tree still costs 1044 frames (M3's debt 3). A tree built from scratch
+  is the stretch item at the end of M4, because it needs a table free path of its own - walking up
+  from a leaf to release the tables a removal made empty.
+
+**Acceptance criteria.**
+
+1. The boot log reports the heap's growth in pages and the frames it took to grow, and those
+   frames are the ones `frame::FRAMES.stats()` says are no longer free.
+2. A churn probe allocates and frees a mixed run of sizes, returns `bytes_in_use` to the value it
+   started at, and prints how many allocations, frees and frames it took to do it.
+3. A double free and a free of an address that was never allocated are refused and counted, and the
+   log reports the count: the free list stays intact rather than being quietly corrupted.
+4. The guard page still catches a write past the heap after the heap has grown:
+   `GREY_OS_EXCEPTION_TEST=guard` stays a phase `cargo xtask test` asserts, and its `cr2` is the
+   grown heap's end rather than the end of the region the boot picked.
+5. Host tests cover the class bookkeeping, block splitting and coalescing, alignment for every
+   class, a `realloc` that keeps the bytes, and the refusal path for a size that does not match its
+   block.
+6. Stretch, not gating: the page tables the boot owns fall from 1044 frames to double digits.
+
+**Status against them.** None of them yet - M4 is one piece in, and it is the piece the rest is
+built on. What the clean boot prints today, after M3's lines:
+
+```text
+grey-os: mapping probe ok: frame mapped at 0x600000000000, written through the mapping and read back by frame
+```
+
+Tests: 126 on the host, seven of them new, covering the level creation, the shared 2 MiB page, the
+four refusals and the flags on the way down; the write through a real mapping and the `invlpg` after
+it are left to the QEMU boot, as `mov cr3` was in M3.
+
+## M5 onward - provisional themes
 
 The ordering above is dependency-driven and each theme is a milestone of its own.
 Detailed scope, acceptance criteria and verification are added when the milestone

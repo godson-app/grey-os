@@ -751,3 +751,66 @@ What M3 does not reach: nothing frees a frame in anger, so the free path is exer
 probe, and the heap is still the bump allocator it was, so a frame given back cannot be reused by
 anything above it. Both belong to M4, where a real allocator gives `dealloc` something to mean.
 
+## ADR-030: A mapper first, a heap that grows in pages, and free lists per size class
+
+**Status:** accepted, M4. Records the four choices M4's scope leaves open.
+
+**Context.** M3 ends with a bump allocator over one fixed region and a frame allocator whose free
+path nothing but its own probe has ever run. M4 has to make memory reusable, and four questions
+decide how. First, what M4 needs from `paging` that `unmap_4k` did not provide. Second, where the
+heap's memory comes from: the one region `pick_heap_region` chose, or frames as they are needed.
+Third, how a freed block is found again: free lists per size class, a buddy system, or slab caches.
+Fourth, what a bug in the allocator's caller looks like - a double free, a free of an address that
+was never allocated, an out-of-memory - because a kernel that trusts its callers never finds out.
+
+**Decision.** The mapper comes first. M4 adds `paging::map_4k` before it touches the heap, because
+growth means giving a frame an address and nothing could do that: M3's only table edit took a
+mapping away. It is written as `paging::map`, which asks a `Tables` implementation instead of
+reading memory, with `arch::map_4k` implementing that trait over the physical window - the same
+split as `translate` and `walk`, and for the same reason: creating three levels on the way down to
+a leaf is exactly the arithmetic worth testing on the host, where a table is an array. The levels it
+creates carry `PRESENT | WRITABLE` and nothing else: a write needs the writable bit at every level,
+so a parent without it would silently make a writable leaf read-only, and `NO_EXECUTE` on a parent
+applies to everything below it, so putting it there would deny execution to a leaf that asked for
+it. A huge page counts as already mapped rather than being split: splitting is `unmap_4k`'s job,
+and a mapping that quietly replaced a 2 MiB page would be a surprising amount of work behind a
+three-word call.
+
+The heap grows in pages taken from the frame allocator, rather than being one larger region chosen
+at boot. The first pages are still the region `pick_heap_region` picked, so nothing about the boot
+sequence changes; when the free lists cannot satisfy an allocation, the heap takes a frame, maps it
+at the page after its current top, and adds it to the class bookkeeping. A fixed-size heap was
+rejected because it turns out-of-memory into a budget someone has to guess in advance, and the guess
+would be made by whoever wrote the boot sequence rather than by the workload. The guard page moves
+up with the heap: after growth the page above the new top is unmapped, so a write past the end of
+the heap still faults, and `GREY_OS_EXCEPTION_TEST=guard` still has something to hit.
+
+Free lists per size class, with the free list threaded through the free blocks themselves. Classes
+are powers of two from 16 bytes to 4 KiB, so a block's class is the size of its page's slot rather
+than something stored beside it; a request that no free list can satisfy splits a larger block, and
+a `dealloc` returns the block to its class. This is the smallest mechanism that makes `dealloc`
+mean something, and it is bounded: the search is over a fixed set of classes, and the split is at
+most one halving per class. Buddy allocation was rejected as the wrong granularity - a buddy system
+here would be a page allocator, and `frame.rs` already is one - and slab caches are the right answer
+when one type dominates allocation, which is a measurement this milestone cannot make yet. A page's
+class is recorded outside the page, in a descriptor the heap owns, so a block's size is known from
+its address and a mismatched free is a bug the allocator can name.
+
+Free is checked, not trusted. A double free, a free of an address that was never handed out, and a
+free with a size that does not match the block's class are all refused, counted, and reported in
+the boot log rather than corrupting the free list quietly; out-of-memory returns null to
+`GlobalAlloc` instead of spinning or panicking, and the boot's probes treat a null as a failure of
+the milestone rather than of the machine. The counters exist because the alternative - trusting the
+caller - is what makes allocator bugs invisible until a driver corrupts memory in a way nobody can
+attribute.
+
+**Consequences.** `paging` gains its first mapping path and `frame::Allocator::free` gains its first
+real caller, so the two functions M3 could only demonstrate with a probe are now load-bearing. The
+boot log reports the heap's growth in pages, the churn probe's allocations and frees, and the frames
+returned to the frame allocator, and `cargo xtask test` asserts them next to M3's lines. The tables
+a growth creates are not freed when the heap shrinks, and `unmap_4k` still does not hand back the
+frame it unmaps: a mapping taken out of the bootloader's window has no owner to hand it to, and
+frame ownership - who may free the frame behind a mapping - is a question the allocator has to
+answer first. The tree built from scratch that ADR-029 leaves open stays a stretch item at the end
+of M4, after the allocator closes the loop, because it needs table bookkeeping of its own: walking
+up from a leaf to free the tables that a removal made empty.

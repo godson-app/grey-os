@@ -56,6 +56,9 @@ const PAGE_TABLES: &str = "grey-os: page tables: inherited root";
 const FRAMEBUFFER_PHYSICAL: &str = "grey-os: framebuffer physical";
 /// Printed once the heap's last page is left unmapped (M3).
 const HEAP_GUARD: &str = "grey-os: heap guard armed";
+/// Printed once M4's mapper has given a frame an address nothing mapped, written through that
+/// address and read the frame back through the window, then taken the mapping away again (M4).
+const MAPPING_PROBE: &str = "grey-os: mapping probe ok";
 /// One injected fault: what the variable is set to, the line the kernel prints before the
 /// faulting instruction, and the report the handler has to produce.
 struct Fault {
@@ -200,12 +203,12 @@ fn run(options: &Options) -> Result<ExitCode> {
 /// Boots headless once per M0/M2/M3 failure path and asserts every one of them.
 ///
 /// The first boot is the normal image: it must print `grey-os: boot ok` and exit 33. That run
-/// also carries M3's claims - frame totals, the framebuffer's resolved span, the kernel's own
-/// page-table root and the armed heap guard - because they are all lines a successful boot
-/// prints and a broken one does not. Then one image per injected failure - a panic, and each
-/// fault in [`FAULTS`] - each of which must report itself and exit 35. Asserting both halves is
-/// the point: a flag that does not take effect would pass a test that only checked the clean
-/// boot, and a kernel that always panics would fail the first phase.
+/// also carries the memory claims - frame totals, the framebuffer's resolved span, the kernel's
+/// own page-table root, the armed heap guard and the mapping round trip - because they are all
+/// lines a successful boot prints and a broken one does not. Then one image per injected failure -
+/// a panic, and each fault in [`FAULTS`] - each of which must report itself and exit 35. Asserting
+/// both halves is the point: a flag that does not take effect would pass a test that only checked
+/// the clean boot, and a kernel that always panics would fail the first phase.
 fn test(options: &Options) -> Result<ExitCode> {
     let (log, code) = boot_headless(options)?;
     expect(
@@ -217,6 +220,7 @@ fn test(options: &Options) -> Result<ExitCode> {
             PAGE_TABLES,
             FRAMEBUFFER_PHYSICAL,
             HEAP_GUARD,
+            MAPPING_PROBE,
         ],
         EXIT_CLEAN,
     )?;

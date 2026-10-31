@@ -210,9 +210,103 @@ where
     None
 }
 
+/// What a mapping needs from the tables, so the arithmetic can run without touching memory.
+///
+/// [`translate`] takes one closure because it does one thing. A mapping reads entries, writes
+/// them, zeroes a table it just took and asks the allocator for the next one, so it takes a
+/// trait: the host tests implement it over an array of tables and the kernel implements it over
+/// the physical window, which is the same trade the walk already makes.
+pub trait Tables {
+    /// Entry `index` of the 4 KiB table at physical `frame`.
+    fn read(&self, frame: u64, index: usize) -> Entry;
+
+    /// Replaces entry `index` of the table at `frame`.
+    fn write(&mut self, frame: u64, index: usize, entry: Entry);
+
+    /// Fills the frame at `frame` with zeroes, for a table about to be filled in.
+    fn zero(&mut self, frame: u64);
+
+    /// A frame nothing else uses, or `None` when the allocator has none left.
+    fn alloc(&mut self) -> Option<u64>;
+}
+
+/// Why [`map`] could not put a frame at an address.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MapError {
+    /// Something already reaches the address. A huge page counts: the address is mapped either
+    /// way, and taking a 2 MiB page apart to reach one 4 KiB entry inside it belongs to the
+    /// unmapping path, not to a mapping.
+    AlreadyMapped,
+    /// The address or the frame is not 4 KiB aligned, so the low bits of the entry would carry
+    /// part of an address into a field that is not an address.
+    Misaligned,
+    /// A level had to be created and the allocator had no frame left. Tables created before
+    /// the failure are kept rather than zeroed back out of the tree: they are empty and
+    /// unreachable, and the caller is by definition a caller that has no frames to spare.
+    NoFrame,
+}
+
+/// Maps `frame` at `address` in the tree rooted at `root`, creating the levels it needs.
+///
+/// The name is the bare verb for the same reason [`translate`] is: this half asks a [`Tables`]
+/// implementation instead of reading memory, and `arch::map_4k` is the one that writes through
+/// the physical window. A call site can tell the two apart by name alone.
+///
+/// `flags` are [`Entry`] bits for the leaf - [`Entry::WRITABLE`], [`Entry::NO_EXECUTE`],
+/// [`Entry::USER`] - and `PRESENT` is added here, because an entry the CPU treats as absent is
+/// not a mapping. The levels created on the way down carry `PRESENT | WRITABLE` and nothing
+/// else, which is deliberate twice over: a write needs the `WRITABLE` bit at every level, so
+/// leaving it off a parent would make a writable leaf read-only; and `NO_EXECUTE` on a parent
+/// applies to everything below it, so putting it there would silently deny a leaf that asked
+/// to be executable.
+pub fn map<T>(
+    tables: &mut T,
+    root: u64,
+    address: u64,
+    frame: u64,
+    flags: u64,
+) -> Result<(), MapError>
+where
+    T: Tables,
+{
+    if !address.is_multiple_of(PAGE_BYTES) || !frame.is_multiple_of(PAGE_BYTES) {
+        return Err(MapError::Misaligned);
+    }
+    let mut table = root;
+    for level in [Level::Pml4, Level::Pdpt, Level::Pd] {
+        let slot = index(address, level);
+        let entry = tables.read(table, slot);
+        if !entry.is_present() {
+            let fresh = tables.alloc().ok_or(MapError::NoFrame)?;
+            tables.zero(fresh);
+            tables.write(
+                table,
+                slot,
+                Entry::pointing_at(fresh, Entry::PRESENT | Entry::WRITABLE),
+            );
+            table = fresh;
+            continue;
+        }
+        if level.maps_huge_pages() && entry.is_huge() {
+            return Err(MapError::AlreadyMapped);
+        }
+        table = entry.address();
+    }
+    let leaf = index(address, Level::Pt);
+    if tables.read(table, leaf).is_present() {
+        return Err(MapError::AlreadyMapped);
+    }
+    tables.write(
+        table,
+        leaf,
+        Entry::pointing_at(frame, flags | Entry::PRESENT),
+    );
+    Ok(())
+}
+
 #[cfg(target_arch = "x86_64")]
 mod arch {
-    use super::{index, Entry, Level, Translation, ENTRIES};
+    use super::{index, Entry, Level, MapError, Translation, ENTRIES};
     use crate::memory::{Span, PAGE_BYTES};
     use core::arch::asm;
 
@@ -464,10 +558,87 @@ mod arch {
         }
         Ok(())
     }
+
+    /// The tables the CPU uses, reached through the physical window at `offset`.
+    ///
+    /// [`super::Tables`] over memory: every method is one of the `unsafe` helpers above, and
+    /// the promises those make are what [`map_4k`] extracts from its caller. Nothing outside
+    /// this module builds one, so a `Window` cannot outlive those promises.
+    struct Window<'a, A> {
+        offset: u64,
+        alloc: &'a mut A,
+    }
+
+    impl<A> super::Tables for Window<'_, A>
+    where
+        A: FnMut() -> Option<u64>,
+    {
+        fn read(&self, frame: u64, index: usize) -> Entry {
+            // SAFETY: `map_4k` promises a live tree behind the window, and every `frame` it
+            // passes came out of a present entry of that tree.
+            unsafe { read_entry(self.offset, frame, index) }
+        }
+
+        fn write(&mut self, frame: u64, index: usize, entry: Entry) {
+            // SAFETY: as `read`.
+            unsafe { write_entry(self.offset, frame, index, entry) }
+        }
+
+        fn zero(&mut self, frame: u64) {
+            // SAFETY: `frame` came from the allocator, which hands out each frame once.
+            unsafe { zero_frame(self.offset, frame) }
+        }
+
+        fn alloc(&mut self) -> Option<u64> {
+            (self.alloc)()
+        }
+    }
+
+    /// Gives `frame` the virtual address `address`, creating the levels above it.
+    ///
+    /// The mirror of [`unmap_4k`], and the half of this module M3 did not need: taking a mapping
+    /// away was enough to arm a guard page (ADR-029), while everything past that - a heap that
+    /// grows, a driver's buffer, a user page - has to be given an address first (ADR-030).
+    ///
+    /// # Safety
+    ///
+    /// `root` must name a live 4-level table, `offset` must be the physical window (ADR-022),
+    /// `frame` must be a frame nothing else uses, and `alloc` must hand out frames nothing else
+    /// uses. `address` must not be the address of anything this call is running on: a leaf
+    /// written over the code or the stack takes effect at the next translation, which is the
+    /// instruction after this one.
+    pub unsafe fn map_4k<A>(
+        root: u64,
+        offset: u64,
+        address: u64,
+        frame: u64,
+        flags: u64,
+        mut alloc: A,
+    ) -> Result<(), MapError>
+    where
+        A: FnMut() -> Option<u64>,
+    {
+        let mut window = Window {
+            offset,
+            alloc: &mut alloc,
+        };
+        // SAFETY: the caller promises the tree, the window, the frame and the allocator.
+        let outcome = super::map(&mut window, root, address, frame, flags);
+        if outcome.is_ok() {
+            // A translation cached before the entry was written would outlive the entry that
+            // now describes it - the address may have been mapped earlier in this boot - so it
+            // goes before anything reads through the new mapping.
+            // SAFETY: `invlpg` touches the TLB and nothing else, and cannot fault.
+            unsafe {
+                asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+            }
+        }
+        outcome
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use arch::{clone_root, load_root, root, span, unmap_4k, walk, UnmapError};
+pub use arch::{clone_root, load_root, map_4k, root, span, unmap_4k, walk, UnmapError};
 
 #[cfg(test)]
 mod tests {
@@ -660,5 +831,230 @@ mod tests {
         let found = fake.translate().expect("the 1 GiB page is mapped");
         assert_eq!(found.size, 1 << 30);
         assert_eq!(found.address, 0x1_0000_0000 + (VIRTUAL & 0x3fff_ffff));
+    }
+
+    /// Tables in a fixed array of frames, for the tests that map into a tree with no levels
+    /// below the root.
+    ///
+    /// [`Fake`] cannot serve here: a mapping *creates* levels, so the double has to hand out
+    /// frames and keep what is written into them. `N` is how many frames the pool holds, which
+    /// is how a test runs one dry.
+    struct Pool<const N: usize> {
+        frames: [[Entry; ENTRIES]; N],
+        next: usize,
+    }
+
+    impl<const N: usize> Pool<N> {
+        /// The pretend physical address of the pool's first frame, which is the root.
+        const BASE: u64 = 0x10_0000;
+
+        /// An empty root in frame zero. Frame zero is out of the allocator for the same reason
+        /// the real tree's root is: the tree has to exist before anything is handed out.
+        fn new() -> Self {
+            Self {
+                frames: [[Entry::empty(); ENTRIES]; N],
+                next: 1,
+            }
+        }
+
+        /// The address of the pool's `index`-th frame.
+        fn frame(index: usize) -> u64 {
+            Self::BASE + index as u64 * PAGE_BYTES
+        }
+
+        /// How many frames the pool has handed out, the root included.
+        fn used(&self) -> usize {
+            self.next
+        }
+
+        /// Which array `frame` names, if it is one of the pool's.
+        fn slot(&self, frame: u64) -> Option<usize> {
+            let index = frame.checked_sub(Self::BASE)? / PAGE_BYTES;
+            (index < N as u64).then_some(index as usize)
+        }
+    }
+
+    impl<const N: usize> Tables for Pool<N> {
+        fn read(&self, frame: u64, index: usize) -> Entry {
+            self.slot(frame)
+                .map_or_else(Entry::empty, |slot| self.frames[slot][index])
+        }
+
+        fn write(&mut self, frame: u64, index: usize, entry: Entry) {
+            if let Some(slot) = self.slot(frame) {
+                self.frames[slot][index] = entry;
+            }
+        }
+
+        fn zero(&mut self, frame: u64) {
+            if let Some(slot) = self.slot(frame) {
+                self.frames[slot] = [Entry::empty(); ENTRIES];
+            }
+        }
+
+        fn alloc(&mut self) -> Option<u64> {
+            if self.next == N {
+                return None;
+            }
+            let frame = Self::frame(self.next);
+            self.next += 1;
+            Some(frame)
+        }
+    }
+
+    /// A fresh virtual address for the mapping tests: nothing else in this file maps it, and
+    /// every one of its four indices is non-zero, so a mapping that mixed two levels up shows.
+    const FRESH: u64 = 0x0000_6000_0000_0000;
+
+    /// The frame the mapping tests hand out.
+    const FRAME: u64 = 0x9000;
+
+    #[test]
+    fn a_mapping_from_an_empty_root_creates_the_levels_it_needs() {
+        let mut pool = Pool::<8>::new();
+        let root = Pool::<8>::frame(0);
+        let mapped = map(
+            &mut pool,
+            root,
+            FRESH,
+            FRAME,
+            Entry::WRITABLE | Entry::NO_EXECUTE,
+        );
+        assert_eq!(mapped, Ok(()));
+        // The root, plus one table each for the three levels the address needed.
+        assert_eq!(pool.used(), 4);
+        let found = translate(root, FRESH, |frame, index| pool.read(frame, index))
+            .expect("the address is mapped now");
+        assert_eq!(found.address, FRAME);
+        assert_eq!(found.size, PAGE_BYTES);
+        // The leaf carries what the caller asked for and nothing else.
+        let leaf = pool.read(Pool::<8>::frame(3), index(FRESH, Level::Pt));
+        assert!(leaf.is_present() && leaf.is_writable() && !leaf.is_executable());
+        assert_eq!(leaf.address(), FRAME);
+    }
+
+    #[test]
+    fn a_second_address_in_the_same_two_mib_page_reuses_the_levels_above_it() {
+        let mut pool = Pool::<8>::new();
+        let root = Pool::<8>::frame(0);
+        map(&mut pool, root, FRESH, FRAME, Entry::WRITABLE).expect("the first page");
+        assert_eq!(pool.used(), 4);
+        // The neighbour is a different PT entry inside the same PT, so it costs no frame.
+        let next = map(
+            &mut pool,
+            root,
+            FRESH + PAGE_BYTES,
+            FRAME + PAGE_BYTES,
+            Entry::WRITABLE,
+        );
+        assert_eq!(next, Ok(()));
+        assert_eq!(pool.used(), 4);
+        // One 2 MiB page along is a different PD entry, so it needs a table of its own.
+        let two_mib = map(
+            &mut pool,
+            root,
+            FRESH + (1 << 21),
+            FRAME + PAGE_BYTES * 2,
+            Entry::WRITABLE,
+        );
+        assert_eq!(two_mib, Ok(()));
+        assert_eq!(pool.used(), 5);
+    }
+
+    #[test]
+    fn a_second_mapping_at_the_same_address_is_refused() {
+        let mut pool = Pool::<8>::new();
+        let root = Pool::<8>::frame(0);
+        map(&mut pool, root, FRESH, FRAME, Entry::WRITABLE).expect("the first mapping");
+        let used = pool.used();
+        let second = map(&mut pool, root, FRESH, FRAME + PAGE_BYTES, Entry::WRITABLE);
+        assert_eq!(second, Err(MapError::AlreadyMapped));
+        assert_eq!(pool.used(), used, "a refused mapping allocates nothing");
+        let found = translate(root, FRESH, |frame, index| pool.read(frame, index))
+            .expect("the first mapping is still there");
+        assert_eq!(found.address, FRAME);
+    }
+
+    #[test]
+    fn a_misaligned_address_or_frame_is_refused() {
+        let mut pool = Pool::<8>::new();
+        let root = Pool::<8>::frame(0);
+        let address = map(&mut pool, root, FRESH + 0x800, FRAME, Entry::WRITABLE);
+        assert_eq!(address, Err(MapError::Misaligned));
+        let frame = map(&mut pool, root, FRESH, FRAME + 0x1ff, Entry::WRITABLE);
+        assert_eq!(frame, Err(MapError::Misaligned));
+        assert_eq!(pool.used(), 1, "nothing was created for either attempt");
+    }
+
+    #[test]
+    fn a_huge_page_counts_as_already_mapped() {
+        for level in [Level::Pdpt, Level::Pd] {
+            let mut pool = Pool::<8>::new();
+            let root = Pool::<8>::frame(0);
+            // The levels above the huge entry have to exist before one can sit in them, which
+            // is the same walk a mapping does, stopping one level short.
+            let mut table = root;
+            for above in Level::ALL {
+                if above == level {
+                    break;
+                }
+                let next = pool.alloc().expect("a frame for the level above");
+                let entry = Entry::pointing_at(next, Entry::PRESENT | Entry::WRITABLE);
+                pool.write(table, index(FRESH, above), entry);
+                table = next;
+            }
+            let flags = Entry::PRESENT | Entry::WRITABLE | Entry::HUGE;
+            pool.write(
+                table,
+                index(FRESH, level),
+                Entry::pointing_at(0x4000_0000, flags),
+            );
+            let used = pool.used();
+            let mapped = map(&mut pool, root, FRESH, FRAME, Entry::WRITABLE);
+            assert_eq!(mapped, Err(MapError::AlreadyMapped), "{level:?}");
+            assert_eq!(pool.used(), used, "{level:?} needs no table of its own");
+        }
+    }
+
+    #[test]
+    fn a_mapping_that_runs_out_of_frames_leaves_no_leaf_behind() {
+        // Two frames: the root and one table, where the address needs three.
+        let mut pool = Pool::<2>::new();
+        let root = Pool::<2>::frame(0);
+        let mapped = map(&mut pool, root, FRESH, FRAME, Entry::WRITABLE);
+        assert_eq!(mapped, Err(MapError::NoFrame));
+        // The one table it did create stays behind, empty, and the address is still unmapped.
+        assert_eq!(pool.used(), 2);
+        let found = translate(root, FRESH, |frame, index| pool.read(frame, index));
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn the_levels_a_mapping_creates_leave_the_flags_to_the_leaf() {
+        let mut pool = Pool::<8>::new();
+        let root = Pool::<8>::frame(0);
+        map(
+            &mut pool,
+            root,
+            FRESH,
+            FRAME,
+            Entry::WRITABLE | Entry::NO_EXECUTE,
+        )
+        .expect("the mapping");
+        // The three entries on the way down, in the order the walk asked for them. Each is
+        // writable, because a write needs `WRITABLE` at every level, and executable, because
+        // `NO_EXECUTE` here would deny the leaf a permission it never gave away.
+        let chain = [
+            (root, Level::Pml4),
+            (Pool::<8>::frame(1), Level::Pdpt),
+            (Pool::<8>::frame(2), Level::Pd),
+        ];
+        for (table, level) in chain {
+            let entry = pool.read(table, index(FRESH, level));
+            assert!(entry.is_present(), "{level:?}");
+            assert!(entry.is_writable(), "{level:?}");
+            assert!(entry.is_executable(), "{level:?}");
+            assert!(!entry.is_huge(), "{level:?}");
+        }
     }
 }

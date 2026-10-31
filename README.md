@@ -22,6 +22,7 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 - [x] Back buffer and `Canvas::blit`: the console draws into a heap surface and the panel receives only the rows that changed (ADR-026)
 - [x] Interrupts and exception handling: GDT/TSS, IDT, PIC, PIT, injected faults (ADR-028)
 - [x] Memory management: page-table walker, frame allocator, own `CR3`, heap guard page (ADR-029)
+- [ ] A heap that gives memory back: the mapper landed, the allocator is next (ADR-030)
 - [ ] Scheduler and kernel threads
 - [ ] Userspace, system calls and ELF loading
 - [ ] Storage and filesystem
@@ -58,12 +59,13 @@ grey-os: heap probe ok: 4 KiB read back, 1 allocations, 4096 bytes in use
 grey-os: framebuffer 1280x800, stride 1280, 4 bytes/pixel
 grey-os: display adapter online, 78x48 cells at scale 2
 grey-os: console draws into a 4000 KiB back buffer
-grey-os: frames: 525288 total, 20547 free, 64 KiB bitmap
+grey-os: frames: 525288 total, 20541 free, 64 KiB bitmap
 grey-os: frame probe ok: 8 frames from 0x1000 written and read back
 grey-os: framebuffer physical 0x0080000000-0x00803e8000 (4000 KiB, resolved by page walk)
 grey-os: framebuffer byte 2048000 reads the same through both mappings
 grey-os: page tables: inherited root 0x101000, own root 0x1000, 1044 frames
 grey-os: heap guard armed at 0x2801bb6b000 (physical 0x1bb6b000), one page unmapped
+grey-os: mapping probe ok: frame mapped at 0x600000000000, written through the mapping and read back by frame
 grey-os: gdt loaded: code 0x08, data 0x10, tss 0x18, 16 KiB double-fault stack
 grey-os: idt loaded: 38 gates of 256 (22 exceptions, 16 irqs)
 grey-os: pic remapped to 0x20..=0x2f, only irq0 unmasked
@@ -84,6 +86,12 @@ one byte back through the physical window to prove the two views agree. The 1044
 page tables are the price of copying the bootloader's tree, which includes a 1 TiB physical
 window mapped with 2 MiB pages; the kernel then loads that copy into `CR3` and owns the
 address space. See ADR-029.
+
+Owning the address space means editing it, so M4 starts with the other direction: `map_4k`
+gives a frame an address, creating the tables it needs. The boot proves it the same way it
+proves the walk - a frame from the allocator mapped at `0x6000_0000_0000`, a byte written
+through the new mapping and read back through the window at the frame, then the mapping taken
+away and the frame handed back. See ADR-030.
 
 The same lines are drawn on the panel: the 8x8 font at scale 2, 78 columns by 48 rows on
 the 1280x800 surface, 16 pixels in from each edge. The firmware's memory map is longer

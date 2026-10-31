@@ -27,6 +27,15 @@ const OBSERVED_TICKS: u64 = 10;
 /// out twice to show it, small enough to stay out of the way.
 const PROBE_FRAMES: usize = 8;
 
+/// The address the mapping probe gives its frame: nothing maps it, and after the probe nothing
+/// will again.
+///
+/// Canonical, 96 TiB above zero - well clear of the physical window's 2.5 TiB and of everything
+/// the kernel lives in - and in a top-level slot (`index(0x6000_0000_0000, Pml4)` is 192) the
+/// bootloader has no reason to have filled. The probe walks it before mapping it, so a machine
+/// where that is wrong skips the probe instead of failing the boot.
+const MAPPING_PROBE: u64 = 0x0000_6000_0000_0000;
+
 /// An address nothing maps, for the `#PF` injection below.
 ///
 /// Canonical (below the 47-bit sign extension, so the CPU raises `#PF` and not `#GP`), and in
@@ -485,6 +494,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // The mapper, both ways: a frame the allocator handed out, an address nothing mapped, and the
+    // frame read back through it. M3 could only take a mapping away (ADR-029); this is the first
+    // time the kernel gives one out, and the shape of the check is the framebuffer's - two views
+    // of the same frame have to agree (ADR-030).
+    match probe_mapping(own_root, offset) {
+        MappingProbe::Ok(address) => println!(
+            "grey-os: mapping probe ok: frame mapped at {address:#x}, written through the \
+             mapping and read back by frame"
+        ),
+        MappingProbe::Skipped(reason) => {
+            println!("grey-os: WARNING: mapping probe skipped: {reason}");
+        }
+        MappingProbe::Refused(error) => {
+            println!("grey-os: FATAL: the mapper refused a free address: {error:?}");
+            qemu::exit_qemu(qemu::QemuExitCode::Failed);
+        }
+        MappingProbe::Disagreed => {
+            println!("grey-os: FATAL: the byte written through the new mapping did not arrive");
+            qemu::exit_qemu(qemu::QemuExitCode::Failed);
+        }
+        MappingProbe::LeftMapped(error) => {
+            println!("grey-os: FATAL: the mapping probe could not unmap its page: {error:?}");
+            qemu::exit_qemu(qemu::QemuExitCode::Failed);
+        }
+    }
+
     // Interrupts last, and in this order: the PIC is remapped before any line is unmasked,
     // the timer claims IRQ0 and installs its handler, and only then is `IF` set. Enabling
     // earlier would leave a window where a tick arrives on a vector with no handler behind it
@@ -654,6 +689,78 @@ fn probe_frames(offset: u64) -> Option<u64> {
         frame::FRAMES.free(address);
     }
     Some(first)
+}
+
+/// What the mapping round trip found.
+///
+/// The failures are separate because they mean different things: no free address or no frame left
+/// means the probe did not run and the boot can carry on, while a mapper that refuses a free
+/// address, writes to the wrong frame or leaves a page mapped is a bug worth stopping for.
+enum MappingProbe {
+    /// The address the probe mapped and then unmapped again.
+    Ok(u64),
+    /// The probe could not run, and this says why.
+    Skipped(&'static str),
+    /// `map_4k` refused an address and a frame it was told were free.
+    Refused(paging::MapError),
+    /// The write through the new mapping did not reach the frame behind it.
+    Disagreed,
+    /// `unmap_4k` failed, so the address is still mapped.
+    LeftMapped(paging::UnmapError),
+}
+
+/// Maps a frame at [`MAPPING_PROBE`], writes through the new mapping, reads the frame back through
+/// the window, then takes the mapping away and hands the frame back.
+///
+/// [`probe_frames`] proves the allocator over memory the bootloader mapped; this proves the
+/// mapper, over a page that exists only because this call asked for it. A wrong leaf, a wrong
+/// parent entry or a missing `invlpg` shows up as a fault or as a byte that never arrived.
+///
+/// The three tables the mapping creates are kept: a boot maps this address once, and taking tables
+/// away needs its own bookkeeping, which is the next thing the heap will need anyway.
+fn probe_mapping(root: u64, offset: u64) -> MappingProbe {
+    // SAFETY: `root` is the tree the CPU is using and `offset` is the window it maps.
+    if unsafe { paging::walk(root, offset, MAPPING_PROBE) }.is_some() {
+        // Mapping over an address something else owns would not prove anything, and it would
+        // overwrite it: the probe stands down rather than guessing an address of its own.
+        return MappingProbe::Skipped("the address the probe wanted is already mapped");
+    }
+    let Some(frame) = frame::FRAMES.alloc() else {
+        return MappingProbe::Skipped("no frame left to map");
+    };
+    let flags = paging::Entry::WRITABLE | paging::Entry::NO_EXECUTE;
+    // SAFETY: `root` is the live tree, `offset` the window, `frame` came from the allocator,
+    // `MAPPING_PROBE` was just walked and found unmapped, and the closure hands out only frames
+    // the bitmap says are free.
+    let mapped = unsafe {
+        paging::map_4k(root, offset, MAPPING_PROBE, frame, flags, || {
+            frame::FRAMES.alloc()
+        })
+    };
+    if let Err(error) = mapped {
+        // The frame never got an address, so it is free again.
+        frame::FRAMES.free(frame);
+        return MappingProbe::Refused(error);
+    }
+    // A byte nothing else in this boot writes, through the mapping and not the window: if the
+    // leaf or any level above it is wrong, the CPU says so here.
+    // SAFETY: the mapping just made is present, writable, 4 KiB and reaches this frame.
+    unsafe { core::ptr::write_volatile(MAPPING_PROBE as *mut u8, 0xa5) };
+    // SAFETY: the same frame, read the way [`probe_frames`] reads one.
+    let arrived = unsafe { core::ptr::read_volatile((offset + frame) as *const u8) };
+    // SAFETY: as above. The address is a 4 KiB entry, so this needs no split.
+    let unmapped =
+        unsafe { paging::unmap_4k(root, offset, MAPPING_PROBE, || frame::FRAMES.alloc()) };
+    // SAFETY: `root` is the live tree.
+    let gone = unsafe { paging::walk(root, offset, MAPPING_PROBE) }.is_none();
+    // Free again either way: the mapping that might still point here belongs to a boot that stops.
+    frame::FRAMES.free(frame);
+    match (arrived, unmapped, gone) {
+        (0xa5, Err(error), _) => MappingProbe::LeftMapped(error),
+        (0xa5, Ok(()), true) => MappingProbe::Ok(MAPPING_PROBE),
+        // A byte that did not arrive, or an entry that went empty while the walk still found it.
+        _ => MappingProbe::Disagreed,
+    }
 }
 
 /// Set once the panic path runs, so a panic inside it cannot recurse forever.
