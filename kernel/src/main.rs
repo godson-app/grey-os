@@ -13,8 +13,8 @@ use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 use grey_os::{
-    arena, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap, idt, keyboard, memory,
-    mouse, paging, pic, qemu, serial, timer,
+    arena, compositor, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap, idt, keyboard,
+    memory, mouse, paging, pic, qemu, serial, theme, timer, window,
 };
 // `Block` has to be in scope for `drive.sectors()`: the trait is the interface, and the
 // concrete `Pio` type only implements it.
@@ -789,7 +789,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // The first storage (M5): an ATA drive in PIO mode, and `greyfs` over it. This runs
     // before the interrupts because every transfer here polls a status register; the
     // filesystem needs the arena for its directory, which is why it cannot run earlier.
-    let _storage = storage();
+    let storage = storage();
 
     // Interrupts last, and in this order: the PIC is remapped before any line is unmasked,
     // the timer claims IRQ0 and installs its handler, and only then is `IF` set. Enabling
@@ -881,6 +881,115 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(grey_os_input_test)]
     input_test();
 
+    // M7: the compositor takes the panel over from the boot console. Everything above has
+    // been a log on a screen; from here the screen is a desktop, and later lines go to serial
+    // only - `display::set_quiet` is what stops a `println!` from painting over the windows.
+    let mut desktop = compositor::Compositor::new(panel.0 as u32, panel.1 as u32, theme::GREY);
+    let free_frames = frame::FRAMES.stats().map_or(0, |stats| stats.free);
+    let log_window = desktop.create(
+        "log",
+        alloc::vec![
+            alloc::format!("grey-os, {} ticks in", timer::ticks()),
+            alloc::format!(
+                "{} keys decoded, {} dropped",
+                keyboard::events(),
+                keyboard::dropped()
+            ),
+            alloc::format!("{} pointer packets", mouse::packets()),
+            alloc::format!("{} ticks since the timer start", timer::ticks()),
+        ],
+        520,
+        320,
+    );
+    let about = desktop.create(
+        "about",
+        alloc::vec![
+            alloc::string::String::from("grey os"),
+            alloc::string::String::from("a kernel with a desktop"),
+            alloc::string::String::from("built at boot, no installer"),
+        ],
+        440,
+        260,
+    );
+    let system = desktop.create(
+        "system",
+        alloc::vec![
+            alloc::format!("{free_frames} frames free"),
+            alloc::format!("{} KiB on the arena", HEAP.stats().bytes_in_use / 1024),
+            alloc::format!(
+                "greyfs: {} file(s)",
+                storage.as_ref().map_or(0, |filesystem| filesystem.count())
+            ),
+        ],
+        420,
+        240,
+    );
+    println!(
+        "grey-os: theme \"{}\": title {}px, border {}px, padding {}px, text scale {}",
+        theme::GREY.name,
+        theme::GREY.title_height,
+        theme::GREY.border_width,
+        theme::GREY.padding,
+        theme::GREY.text_scale
+    );
+    // Placed deliberately rather than left on the cascade: three windows that overlap is the
+    // interesting case, and three that are all in the top-left corner is not.
+    let _ = desktop.windows.move_to(log_window, 40, 40);
+    let _ = desktop.windows.move_to(about, 340, 250);
+    let _ = desktop.windows.move_to(system, 800, 430);
+    let mut drawn = 0usize;
+    framebuffer::with_screen(|screen| {
+        if let Some(mut canvas) = framebuffer::canvas(screen) {
+            drawn = desktop.draw_all(&mut canvas);
+        }
+    });
+    // Two changes, each repainted from the damage they produced: a raise, which changes two
+    // title bars because the focus moves, and a move, which changes where the window is and
+    // leaves the desktop behind it.
+    let _ = desktop.windows.raise(log_window);
+    let _ = desktop.windows.move_to(system, 760, 380);
+    let pending = desktop.windows.pending();
+    let mut damage = 0usize;
+    framebuffer::with_screen(|screen| {
+        if let Some(mut canvas) = framebuffer::canvas(screen) {
+            damage = desktop.draw_damage(&mut canvas).len();
+        }
+    });
+    let (pointer_x, pointer_y) = mouse::position();
+    framebuffer::with_screen(|screen| {
+        if let Some(mut canvas) = framebuffer::canvas(screen) {
+            desktop.draw_pointer(&mut canvas, pointer_x, pointer_y);
+        }
+    });
+    // From here the panel belongs to the desktop; the boot log continues on serial.
+    display::set_quiet(true);
+    let overlapping = desktop
+        .windows
+        .iter()
+        .enumerate()
+        .flat_map(|(index, window)| {
+            desktop
+                .windows
+                .iter()
+                .skip(index + 1)
+                .map(move |other| window::overlaps(window.rect, other.rect))
+        })
+        .filter(|overlap| *overlap)
+        .count();
+    println!(
+        "grey-os: desktop: 3 windows on {}x{}, {} overlapping pair(s), focused #{}, {} drawn in the first frame",
+        panel.0,
+        panel.1,
+        overlapping,
+        desktop.windows.focused().unwrap_or(0),
+        drawn
+    );
+    println!(
+        "grey-os: compositor ok: {pending} damage rects merged into {damage}, pointer drawn at {pointer_x},{pointer_y}, {} frame(s)",
+        desktop.frames
+    );
+    let _ = (about, system);
+
     // M2's fault paths are tested the way M0's panic path is: a cfg compiled in from an
     // environment variable, one image per fault, and `cargo xtask test` booting each and
     // asserting the report (ADR-023, ADR-028). Each block is a real instruction the CPU
@@ -962,6 +1071,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     #[cfg(not(grey_os_panic_test))]
     {
+        // The input run is the only one a harness looks at while it is still alive: it asks
+        // QEMU for a screenshot once it has seen the compositor's line, and a kernel that
+        // exited first would leave nothing to dump.
+        #[cfg(grey_os_input_test)]
+        timer::wait_ticks(50);
         println!("grey-os: boot ok");
         qemu::exit_qemu(qemu::QemuExitCode::Success);
     }

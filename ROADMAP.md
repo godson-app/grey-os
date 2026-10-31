@@ -20,7 +20,7 @@ milestone, so that this file never claims more than was agreed.
 | M4        | Heap allocation and kernel data structures   | **Done** - criteria 1-5 met; stretch tree open (ADR-031)   |
 | M5        | Storage: disk driver and filesystem          | **Done** - criteria 1-6 met; no free list yet (ADR-032)     |
 | M6        | Input: keyboard and pointer                  | **Done** - criteria 1-5 met; no repeat or keymaps (ADR-033) |
-| M7        | Compositor, windows, theme                   | Not started                                                |
+| M7        | Compositor, windows, theme                   | **Done** - criteria 1-5 met; TrueType still open (ADR-034) |
 | M8        | Shell and process model                      | Not started                                                |
 | M9        | Applications                                 | Not started                                                |
 | M10       | SMP, ports, polish                           | Not started                                                |
@@ -574,6 +574,75 @@ in `mouse`; 178 on the host in total. Criterion 4 is the four `key:` lines: each
 asserted by name, so a stuck scancode cannot pass as four presses. Criterion 5 is the `mouse:` line's
 `dx=+25 dy=+10`, which is the movement sent - `y` positive in the log because QMP's `-10` is up and
 the packet's `y` grows upwards while the screen's grows down.
+
+## M7 - Compositor, windows, theme
+
+**Goal.** Give the panel something that is not a log. Everything so far has been one console
+painting its own grid; M7 turns the screen into a desktop of windows, with a look that is a value
+rather than a set of constants inside a drawing function, and repaints that are proportional to what
+changed rather than to the size of the screen.
+
+**Agreed shape** (ADR-034): a `Theme` of colours and measurements, a `Windows` list whose order *is*
+the stacking order, and damage as a list of rects that are merged before they are painted.
+
+**Landed.**
+
+- [x] `theme.rs`: eleven colours and six measurements, with tests that the text is readable on every
+      background it is drawn on, that focus is two cues rather than one, that the chrome leaves room
+      for the text it exists for, and that a window smaller than its chrome reports no cells instead
+      of underflowing.
+- [x] `window.rs`: create (cascaded and clamped to the panel), raise, click, hit test from the front,
+      move with clamping, close with focus falling back, focus, push-line, and the damage list.
+- [x] `merge`: unions overlapping rects, drops ones another covers, clips to the panel and drops what
+      is not visible; tested for overlap, edge-touching, containment, partly-off-screen, empty and a
+      chain of three.
+- [x] `compositor.rs`: desktop, windows back to front (edge, title bar, title, body, body text) and
+      the pointer, all clipped to a damage rect when there is one, with text truncated at the clip
+      and at the window's own edge. Eight host tests read pixels back from a surface in memory.
+- [x] The panel handover: `display::set_quiet` stops the console painting after the desktop exists,
+      while the log keeps going to serial and into the console's grid, which is what the panic path
+      still shows.
+- [x] A screenshot proof: the input phase asks QEMU for a `screendump` the moment the compositor says
+      it is finished, and checks the PPM - desktop colour in the corners, at least four distinct
+      colours, the pointer's fill present - keeping the file at `target/grey-os/desktop.ppm`.
+
+**Open.** Nothing in a window can be typed into or clicked: the pointer is drawn, not wired (M8).
+TrueType is still not here, so ADR-027's face question stays open with the bitmap font scaled rather
+than replaced. No drag, resize, scrollbars or per-window clipping beyond text. Every window that
+intersects a damage rect is repainted in full rather than only its visible part.
+
+**Acceptance criteria.**
+
+1. A normal boot reports the theme's measurements, three windows with a panel size, and how many of
+   them overlap.
+2. The compositor's first frame paints every window, and a frame after a raise and a move paints
+   only the merged damage - with both numbers on the line.
+3. Host tests cover the theme's readability and measurements, the window list's ordering, hit
+   testing, focus, clamping, closing, the damage merge, and pixels: title bars, bodies, overlap,
+   damage that leaves another window alone, and the pointer.
+4. The panel, once the desktop exists, is a desktop: checked from outside the guest, from a
+   screenshot, not from what the kernel says about itself.
+5. The boot log keeps working after the handover, and the panic path still paints its own screen.
+
+**Status against them.** All five met. The clean boot prints, after the input lines:
+
+```text
+grey-os: theme "grey": title 30px, border 2px, padding 8px, text scale 2
+grey-os: desktop: 3 windows on 1280x800, 2 overlapping pair(s), focused #1, 3 drawn in the first frame
+grey-os: compositor ok: 4 damage rects merged into 2, pointer drawn at 640,400, 2 frame(s)
+```
+
+Criterion 2 is `4 damage rects merged into 2`: the raise damaged the window it raised and the one
+that lost focus, the move damaged the old and the new rect, and the merge left two rectangles because
+those two groups do not overlap. Criterion 4 is the harness's line, which is the screenshot talking:
+
+```text
+pass: 1280x800 screenshot, 10 distinct colours, 77 pointer pixels, saved to target/grey-os/desktop.ppm
+```
+
+Criterion 3 is 23 host tests, eight in `compositor`, nine in `window` and six in `theme`; 201 on the
+host in total. Criterion 5 is every later line of the boot log still arriving on serial with the
+desktop on the panel, and the panic phase still painting its red screen.
 
 ## M7 onward - provisional themes
 

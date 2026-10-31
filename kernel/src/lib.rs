@@ -24,6 +24,7 @@ extern crate alloc;
 
 pub mod arena;
 pub mod canvas;
+pub mod compositor;
 pub mod console;
 pub mod disk;
 pub mod font;
@@ -38,7 +39,9 @@ pub mod mouse;
 pub mod paging;
 pub mod pic;
 pub mod text;
+pub mod theme;
 pub mod timer;
+pub mod window;
 
 #[cfg(target_arch = "x86_64")]
 pub mod display;

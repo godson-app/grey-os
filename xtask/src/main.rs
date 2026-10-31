@@ -63,6 +63,18 @@ const INPUT_KEYS: [&str; 4] = ["g", "r", "e", "y"];
 /// (M6). The mouse's line follows it, but a machine without a pointer is allowed.
 const INPUT_READY: &str = "grey-os: input: keyboard on irq1";
 
+/// The theme's desktop colour, which the screenshot check looks for in the corners.
+const DESKTOP_COLOUR: [u8; 3] = [0x1f, 0x6f, 0x8b];
+/// The pointer's fill, which has to appear in a frame that drew one.
+const POINTER_COLOUR: [u8; 3] = [0xf5, 0xf8, 0xfa];
+/// Printed once the desktop has been composited. The harness takes its screenshot after it
+/// sees this line, which is the only moment the panel holds the finished desktop.
+const COMPOSITOR_OK: &str = "grey-os: compositor ok:";
+/// Printed by a normal boot once the theme and the three windows are up (M7).
+const THEME_READY: &str = "grey-os: theme";
+/// Printed by a normal boot with the window list's shape on it (M7).
+const DESKTOP_READY: &str = "grey-os: desktop:";
+
 const USAGE: &str = "usage: cargo xtask <build|run|test> [--no-build] [--bios]";
 
 /// QEMU's `isa-debug-exit` reports `(value << 1) | 1`; the kernel sends 0x10.
@@ -285,6 +297,9 @@ fn test(options: &Options) -> Result<ExitCode> {
             &format!("{STORAGE_OK} 1"),
             INPUT_READY,
             "grey-os: input ready:",
+            THEME_READY,
+            DESKTOP_READY,
+            COMPOSITOR_OK,
         ],
         EXIT_CLEAN,
     )?;
@@ -347,6 +362,7 @@ fn input_path(options: &Options) -> Result<()> {
     let started = Instant::now();
     let mut log = String::new();
     let mut typed = false;
+    let mut captured = false;
     loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
@@ -359,6 +375,15 @@ fn input_path(options: &Options) -> Result<()> {
                     );
                     inject(&socket)?;
                     typed = true;
+                }
+                // The desktop exists only while the kernel is alive to draw it, so the
+                // screenshot is taken the moment the compositor says it is finished.
+                if !captured && line.contains(COMPOSITOR_OK) {
+                    let path = image_path("desktop.ppm");
+                    screenshot(&socket, &path)?;
+                    check_screenshot(&path)?;
+                    println!("pass: `{}` and the panel holds a desktop", path.display());
+                    captured = true;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -418,34 +443,7 @@ fn input_path(options: &Options) -> Result<()> {
 /// commands in order, and a command whose reply is not consumed leaves the next reader off
 /// by one.
 fn inject(socket: &Path) -> Result<()> {
-    let mut connected = None;
-    // The socket file appears as the guest starts and can exist a moment before it accepts
-    // a connection, so the connect is retried rather than trusted to be immediate.
-    for _ in 0..50 {
-        match UnixStream::connect(socket) {
-            Ok(stream) => {
-                connected = Some(stream);
-                break;
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-    let mut stream =
-        connected.with_context(|| format!("failed to connect to {}", socket.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut reader = BufReader::new(stream.try_clone().context("failed to clone the socket")?);
-    let mut greeting = String::new();
-    reader
-        .read_line(&mut greeting)
-        .context("failed to read qemu's qmp greeting")?;
-    if !greeting.contains("QMP") {
-        bail!("unexpected greeting from qemu's monitor: {greeting}");
-    }
-    qmp(
-        &mut stream,
-        &mut reader,
-        r#"{"execute":"qmp_capabilities"}"#,
-    )?;
+    let (mut stream, mut reader) = monitor(socket)?;
     for key in INPUT_KEYS {
         // QMP has no `sendkey`: it lives in the human monitor, which QMP can relay. The
         // relay is still a keystroke through the machine's keyboard controller - the path a
@@ -471,7 +469,162 @@ fn inject(socket: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Sends one QMP command and checks that QEMU accepted it.
+/// Connects to QEMU's monitor and enables it, returning the connection and its reader.
+///
+/// QMP speaks one JSON object per line, and every command is answered with either a `return`
+/// or an `error` object. Reading each answer is not decoration: QEMU processes commands in
+/// order, and a command whose reply is not consumed leaves the next reader off by one.
+fn monitor(socket: &Path) -> Result<(UnixStream, BufReader<UnixStream>)> {
+    let mut connected = None;
+    // The socket file appears as the guest starts and can exist a moment before it accepts a
+    // connection, so the connect is retried rather than trusted to be immediate.
+    for _ in 0..50 {
+        match UnixStream::connect(socket) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let mut stream =
+        connected.with_context(|| format!("failed to connect to {}", socket.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone().context("failed to clone the socket")?);
+    let mut greeting = String::new();
+    reader
+        .read_line(&mut greeting)
+        .context("failed to read qemu's qmp greeting")?;
+    if !greeting.contains("QMP") {
+        bail!("unexpected greeting from qemu's monitor: {greeting}");
+    }
+    qmp(
+        &mut stream,
+        &mut reader,
+        r#"{"execute":"qmp_capabilities"}"#,
+    )?;
+    Ok((stream, reader))
+}
+
+/// Asks QEMU to write the guest's framebuffer to `path` as a PPM.
+fn screenshot(socket: &Path, path: &Path) -> Result<()> {
+    let _ = fs::remove_file(path);
+    let (mut stream, mut reader) = monitor(socket)?;
+    qmp(
+        &mut stream,
+        &mut reader,
+        &format!(
+            r#"{{"execute":"screendump","arguments":{{"filename":"{}"}}}}"#,
+            path.display()
+        ),
+    )?;
+    if !path.exists() {
+        bail!(
+            "qemu reported a screenshot but {} is not there",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Checks that the screenshot is a desktop rather than a blank panel.
+///
+/// Three claims, each of which a compositor that drew nothing or drew it wrong would fail:
+/// the corners are the theme's desktop colour, the frame holds several distinct colours (so
+/// windows were painted on it), and the pointer's fill appears somewhere. The file is kept
+/// under `target/` so a person can look at what the test measured.
+fn check_screenshot(path: &Path) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    // P6, then width, height, the maximum value, then raw RGB. QEMU writes exactly that, so
+    // the tokens are read rather than a general PPM parser written.
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    while tokens.len() < 4 {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if start == cursor {
+            bail!("{} ends inside its header", path.display());
+        }
+        tokens.push(String::from_utf8_lossy(&bytes[start..cursor]).into_owned());
+    }
+    // One whitespace byte separates the header from the pixels.
+    cursor += 1;
+    if tokens[0] != "P6" {
+        bail!("{} is not a raw PPM: {}", path.display(), tokens[0]);
+    }
+    let width: usize = tokens[1].parse().context("bad PPM width")?;
+    let height: usize = tokens[2].parse().context("bad PPM height")?;
+    if tokens[3] != "255" {
+        bail!(
+            "{} is not 8 bits per channel: {}",
+            path.display(),
+            tokens[3]
+        );
+    }
+    let pixels = &bytes[cursor..];
+    if pixels.len() < width * height * 3 {
+        bail!(
+            "{} holds {} bytes of pixels, not {} for {width}x{height}",
+            path.display(),
+            pixels.len(),
+            width * height * 3
+        );
+    }
+    let pixel = |x: usize, y: usize| -> [u8; 3] {
+        let index = (y * width + x) * 3;
+        [pixels[index], pixels[index + 1], pixels[index + 2]]
+    };
+
+    for (x, y, corner) in [
+        (0, 0, "top left"),
+        (width - 1, 0, "top right"),
+        (0, height - 1, "bottom left"),
+    ] {
+        let colour = pixel(x, y);
+        if colour != DESKTOP_COLOUR {
+            bail!(
+                "the {corner} corner of the panel is {colour:?}, not the desktop's {DESKTOP_COLOUR:?}"
+            );
+        }
+    }
+
+    // A desktop has at least the background, a window's body, a title bar and its edge, and
+    // the pointer is a handful of pixels. The whole frame is scanned rather than sampled: the
+    // pointer is small enough that every-seventh-pixel sampling misses it, and a check that
+    // can miss what it looks for is worse than no check.
+    let mut distinct = std::collections::HashSet::new();
+    let mut pointer_pixels = 0usize;
+    for y in 0..height {
+        for x in 0..width {
+            let colour = pixel(x, y);
+            if colour == POINTER_COLOUR {
+                pointer_pixels += 1;
+            }
+            distinct.insert(colour);
+        }
+    }
+    if distinct.len() < 4 {
+        bail!(
+            "the panel holds {} distinct colours, so nothing was composited onto it",
+            distinct.len()
+        );
+    }
+    if pointer_pixels == 0 {
+        bail!("the pointer is not on the panel: no pixel is {POINTER_COLOUR:?}");
+    }
+    println!(
+        "pass: {width}x{height} screenshot, {} distinct colours, {pointer_pixels} pointer pixels, saved to {}",
+        distinct.len(),
+        path.display()
+    );
+    Ok(())
+}
+
 fn qmp(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, command: &str) -> Result<()> {
     stream
         .write_all(command.as_bytes())

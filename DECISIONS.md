@@ -877,6 +877,70 @@ page-aligned top, both recorded as open. The arena's address is a constant, not 
 first user-space mapping is where that stops being a placeholder.
 
 
+## ADR-034: A theme is data, a window is a rect and some lines, and damage is a list
+
+**Status:** accepted, M7.
+
+**Context.** The panel has shown one thing since M1: a console that paints its own grid. The
+milestone is "compositor, windows, theme", which is three questions that do not have to be answered
+in the same place: what things look like, what is on the screen, and what has to be repainted.
+
+**Decision.** Each gets its own module.
+
+`theme::Theme` is a struct of colours and measurements, and everything the compositor draws asks the
+theme for it. There are no colours in the compositor and no drawing calls in the theme, which is why
+the theme can be checked without a screen - the tests assert that body text is at least a hundred
+levels of brightness away from a window's body, that the title bar has room for a line of text, and
+that focus is *two* cues (a different title bar and a different edge) rather than one.
+
+`window::Windows` is the list, and the list's order *is* the stacking order: last is front, last is
+focused. Raising moves a window to the end, so "what is on top here" is a walk from the back of the
+list and there is no z number to keep in step with anything. A window is a title, a rect and lines of
+text - enough for the log, the system panel and the shell that comes next, and small enough that
+"draw a window" stays one function.
+
+Damage is a list of rects rather than a dirty flag. [`Windows`] pushes the rect every change affected,
+[`window::merge`] unions overlapping rects and drops ones another covers or the panel cannot show, and
+the compositor repaints exactly those rectangles: background, then every window that reaches into
+them, then the pointer. The clipping is load-bearing rather than an optimisation - a compositor that
+painted outside the damage would have to paint everything to be correct.
+
+**What building it taught.** Three things, all found by tests rather than by looking at the screen:
+
+1. A full frame has to *clear* the damage list. `draw_all` painted everything and left the pending
+   rects in place, so the next `draw_damage` repainted what was already correct - caught by a test
+   that snapshots the pixel buffer and expects an empty frame to touch nothing.
+2. Focus changes damage two windows, not one. `raise` damaged the raised window and set the focus,
+   which left the previously focused window's title bar painted as if it were still in front. The
+   test raises the back window and then reads the front one's title bar; it failed until `refocus`
+   damaged the window that lost focus too.
+3. The first version of the `draw_damage` test moved a window 76 pixels and expected two rects. They
+   overlapped, so the merge produced one - which is the merge working, and the test being wrong. It
+   now moves far enough to produce two disjoint rects, and the boot's own demonstration reports both
+   numbers (`4 damage rects merged into 2`) so neither is invisible.
+
+**Proof, and why it is a picture.** Windows are the first thing this kernel has produced that cannot
+be checked by reading a log line: "the compositor ran" is not "the panel shows a desktop". So the
+input phase - which is already talking to QEMU's monitor - asks for a `screendump` the moment the
+compositor says it is finished, and checks the PPM it gets back: the corners are the theme's desktop
+colour, the frame holds at least four distinct colours, and the pointer's fill is somewhere on it.
+The file is kept at `target/grey-os/desktop.ppm` so a person can look at what the test measured. The
+kernel lingers fifty ticks after the desktop is up, because a kernel that exited first would leave
+QEMU nothing to dump.
+
+**Consequences.** `display` gains a quiet flag: printing after the desktop exists still goes to serial
+and still goes into the console's grid - which is what `paint_panic` shows - but no longer paints the
+panel. `Compositor::paint` repaints every window that intersects a damage rect rather than only the
+visible parts of them, so a full-screen damage repaints every window; at three windows that is
+cheaper than an occlusion pass, and the pass is the thing to add when it stops being.
+
+**Open.** Nothing in a window can be typed into or clicked yet: the pointer is drawn, not wired, and
+that is M8's. TrueType is still not here (ADR-027 put it in this milestone and it stays open: the
+bitmap font is scaled, not replaced). No drag or resize, no scrollbars, no window borders that can be
+grabbed, no per-window clipping beyond text, and no double buffering for the parts of a window that a
+damage rect only partly covers.
+
+
 ## ADR-033: The 8042 carries both inputs, and it answers its own commands
 
 **Status:** accepted, M6.

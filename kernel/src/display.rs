@@ -11,7 +11,7 @@ use alloc::boxed::Box;
 use core::fmt::{self, Write as _};
 use core::panic::PanicInfo;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::canvas::{Canvas, ChannelOrder, Color, Geometry, Rect};
 use crate::console::Console;
@@ -196,18 +196,39 @@ fn with_console<R>(draw: impl FnOnce(&mut Console) -> R) -> Option<R> {
     Some(draw(unsafe { &mut *pointer }))
 }
 
+/// Whether the console still paints the panel.
+///
+/// The compositor takes the panel over at the end of the boot: from then on a line of the
+/// boot log belongs on serial, not scribbled across a window. The flag is here rather than in
+/// the boot sequence so the panic path keeps its own way in - `paint_panic` ignores it.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Stops the console painting the panel. Printing still reaches serial.
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Release);
+}
+
+/// Whether the console is painting the panel.
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Acquire)
+}
+
 /// Prints one line to the console and repaints the rows it touched.
 ///
 /// A no-op before [`init`]: the boot sequence logs its first line before the heap the
 /// console sits on exists, and that one is serial-only by nature.
 pub fn print_args(args: fmt::Arguments<'_>) {
-    let scrolled = with_console(|console| {
+    // The log still goes into the console's grid while the desktop owns the panel: the grid is
+    // what `paint_panic` shows, so a failure after the compositor started still carries the
+    // lines that led to it.
+    let (scrolled, quiet) = with_console(|console| {
         // The newline is added here so callers keep writing lines rather than fragments.
         let _ = console.write_fmt(args);
         console.write("\n");
-        console.take_scrolled_rows()
-    });
-    if let Some(rows) = scrolled {
+        (console.take_scrolled_rows(), is_quiet())
+    })
+    .unzip();
+    if let (Some(rows), Some(false)) = (scrolled, quiet) {
         paint(true, rows, framebuffer::BACKGROUND);
     }
 }
