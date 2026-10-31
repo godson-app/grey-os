@@ -161,6 +161,19 @@ pub fn grid() -> Option<(usize, usize)> {
     with_console(|console| (console.columns(), console.rows()))
 }
 
+/// The panel's size in pixels, or `None` before [`init`].
+///
+/// The pointer is clamped to this: a mouse that reports movement past the edge of the
+/// framebuffer would otherwise move the pointer to a pixel nothing draws.
+pub fn size() -> Option<(usize, usize)> {
+    let mut size = None;
+    framebuffer::with_screen(|screen| {
+        let info = screen.info();
+        size = Some((info.width, info.height));
+    });
+    size
+}
+
 /// Hands the console to this module for the rest of the run.
 ///
 /// Same reasoning as `framebuffer::install`: storing the pointer consumes the only `&mut`,

@@ -569,10 +569,27 @@ mod arch {
         // delivery, which is exactly what the caller is asking for.
         unsafe { asm!("cli", options(nomem, nostack)) }
     }
+
+    /// Whether maskable interrupts are currently allowed through.
+    ///
+    /// A driver that has to touch state an interrupt handler also touches masks interrupts
+    /// for the length of that touch, and needs to know whether to put the flag back. This
+    /// reads `RFLAGS` rather than remembering a count, because the boot set the flag at one
+    /// point and there is nothing to count.
+    pub fn enabled() -> bool {
+        let flags: u64;
+        // SAFETY: `pushfq` puts the flags on the stack and `pop` takes them into a
+        // register, which the compiler has reserved: the two instructions leave the stack
+        // exactly as they found it and touch no memory the compiler knows about.
+        unsafe {
+            asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
+        }
+        flags & (1 << 9) != 0
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use arch::{disable, enable, gates, init, set_irq, unexpected_irqs};
+pub use arch::{disable, enable, enabled, gates, init, set_irq, unexpected_irqs};
 
 #[cfg(test)]
 mod tests {

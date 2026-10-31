@@ -40,11 +40,23 @@ fn main() {
     // Set, unset and changed all have to rebuild, because both flags live in the output.
     println!("cargo::rerun-if-env-changed=GREY_OS_PANIC_TEST");
     println!("cargo::rerun-if-env-changed=GREY_OS_EXCEPTION_TEST");
+    println!("cargo::rerun-if-env-changed=GREY_OS_INPUT_TEST");
     // Declares the cfgs so `--check-cfg` accepts them rather than warning about a cfg
     // nothing in this workspace is expected to set.
     println!("cargo::rustc-check-cfg=cfg(grey_os_panic_test)");
+    println!("cargo::rustc-check-cfg=cfg(grey_os_input_test)");
     for (_, cfg) in FAULTS {
         println!("cargo::rustc-check-cfg=cfg({cfg})");
+    }
+
+    // M6's acceptance run listens for keystrokes, so it has its own flag: a kernel with
+    // nobody at the keyboard must not wait for one.
+    let input = match std::env::var_os("GREY_OS_INPUT_TEST") {
+        Some(value) => !value.is_empty() && value != "0",
+        None => false,
+    };
+    if input {
+        println!("cargo::rustc-cfg=grey_os_input_test");
     }
 
     // Empty or `0` counts as off. `=1` is the documented spelling, but rejecting

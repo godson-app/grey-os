@@ -5,7 +5,7 @@ acceptance criteria are demonstrated by output, not by code existing: the proof 
 a `xtask test` run or a QEMU session whose serial log is pasted into the commit
 message. No milestone is started before the previous one is accepted.
 
-Scope for M0, M1, M2, M3, M4 and M5 is agreed. M6 onward is stated as themes in dependency order:
+Scope for M0 to M6 is agreed. M7 onward is stated as themes in dependency order:
 the authoritative wording comes from the engineering brief and is transcribed here milestone by
 milestone, so that this file never claims more than was agreed.
 
@@ -19,7 +19,7 @@ milestone, so that this file never claims more than was agreed.
 | M3        | Physical and virtual memory management       | **Done** - criteria met; guard page armed (ADR-029)        |
 | M4        | Heap allocation and kernel data structures   | **Done** - criteria 1-5 met; stretch tree open (ADR-031)   |
 | M5        | Storage: disk driver and filesystem          | **Done** - criteria 1-6 met; no free list yet (ADR-032)     |
-| M6        | Input: keyboard and pointer                  | Not started                                                |
+| M6        | Input: keyboard and pointer                  | **Done** - criteria 1-5 met; no repeat or keymaps (ADR-033) |
 | M7        | Compositor, windows, theme                   | Not started                                                |
 | M8        | Shell and process model                      | Not started                                                |
 | M9        | Applications                                 | Not started                                                |
@@ -491,7 +491,91 @@ mount's generation is one because the first boot wrote generation zero, the coun
 is now `boot 2`, and the format line is absent - asserted, not merely not looked for. Criterion 5 is
 26 host tests, 8 in `disk` and 18 in `fs`. Tests: 162 on the host.
 
-## M6 onward - provisional themes
+## M6 - Input: keyboard and pointer
+
+**Goal.** Let the machine be told something. Every milestone so far has run a boot sequence chosen
+at compile time: the log is written, not driven. M6 adds the two devices a person actually uses - a
+keyboard and a pointer - as interrupt-driven inputs whose events outlive the handler that produced
+them, and proves them with keystrokes that arrive through the machine's own controller rather than
+through a function call.
+
+**Agreed shape** (ADR-033): the 8042 carries both ports; a table-driven scancode set 1 decoder and a
+three-byte mouse packet parser live in the library where the host tests can drive them; events go
+into a fixed 64-entry ring read under a mask; the acceptance run is a cfg-gated kernel that listens
+for four keys and one packet and is typed into through QEMU's monitor.
+
+**Landed.**
+
+- [x] `keyboard.rs`: the decoder as a value - translation-on set 1, both shifts, control, alt, caps
+      lock that latches on the press and does not unlatch on the release, caps inverting shift for
+      letters, the number row from the table rather than from arithmetic, the arrow keys behind
+      `0xe0`, and unknown codes dropped rather than invented. Nine host tests, including one that
+      walks every code in the table and checks it against itself.
+- [x] The 8042 setup: both ports disabled while the configuration byte is rewritten, translation
+      forced on, IRQ1 enabled, the keyboard's clock on, the handler installed before the line is
+      unmasked.
+- [x] `mouse.rs`: the three-byte parser (bit 3 as the only synchronisation, sign extension as a
+      nine-bit two's complement, overflow dropping the whole packet) and the position (y inverted
+      once, clamped to the panel rather than wrapped). Seven host tests.
+- [x] The second port: enabled, its clock and IRQ12 turned on in the same configuration byte, the
+      mouse told to use defaults and start reporting with its `0xfa` acknowledgements checked, and
+      the cascade line unmasked along with IRQ12 - a driver that forgot the cascade would configure a
+      mouse that never moves and every register would look right.
+- [x] The queue: 64 events, one producer in the IRQ, one consumer that masks interrupts across its
+      read, and a count of what a full ring dropped.
+- [x] The input phase of `cargo xtask test`: a kernel built with `GREY_OS_INPUT_TEST=1` says when it
+      is listening, the harness types `grey` and moves the pointer through QMP, and the phase
+      asserts each key separately plus the pointer packet. QMP has no `sendkey`, so the keystroke is
+      relayed through the human monitor; the movement is a real QMP `input-send-event`.
+
+**Open.** No key repeat (the controller does not repeat and the kernel does not synthesise it), no
+keymap beyond US set 1, no scroll wheel or the extra buttons, no hot-plug, no USB. Nothing draws the
+pointer yet: that arrives with M7's windows.
+
+**Acceptance criteria.**
+
+1. A normal boot reports the keyboard configured on IRQ1, the mouse configured on IRQ12 through the
+   cascade, and how many events each has produced.
+2. A byte the mouse's port produced is never decoded as a keystroke, and a command answer from the
+   controller is never decoded as one either.
+3. Host tests cover the decoder for every code in the table, the modifier states, caps lock, the
+   extended prefix, the packet parser's resynchronisation and sign handling, and the pointer's
+   clamping.
+4. Four keystrokes typed into the machine's own keyboard controller are decoded and reported, each
+   one named - not merely counted.
+5. A pointer movement injected through the same console reaches the PS/2 port, is parsed, and moves
+   the pointer by the amounts sent.
+
+**Status against them.** All five met. A normal boot prints, after the timer line:
+
+```text
+grey-os: input: keyboard on irq1, 8042 config 0x67, translation on so set 1 arrives
+grey-os: input: mouse on irq12 through the cascade, 3-byte packets, pointer at 640,400
+grey-os: input ready: 0 keys decoded, 0 dropped, 0 pointer packets
+```
+
+and the input phase of `cargo xtask test`:
+
+```text
+grey-os: input test: listening for keys and pointer
+grey-os: key: 'g' shift=false ctrl=false alt=false caps=false
+grey-os: key: 'r' shift=false ctrl=false alt=false caps=false
+grey-os: key: 'e' shift=false ctrl=false alt=false caps=false
+grey-os: key: 'y' shift=false ctrl=false alt=false caps=false
+grey-os: mouse: dx=+25 dy=+10 buttons=0x00 at 665,390
+grey-os: input ok: 4 keys and 1 pointer packets in 423 ticks, 0 dropped
+```
+
+Criterion 1 is the first three lines, including the configuration byte the controller accepted.
+Criterion 2 is the `0x67` in that line being readable at all: the fix for the mouse's `Config`
+failure was masking IRQ1 while the controller is talked to, and the status byte's aux bit is checked
+before either handler reads a data byte. Criterion 3 is 16 host tests, nine in `keyboard` and seven
+in `mouse`; 178 on the host in total. Criterion 4 is the four `key:` lines: each character is
+asserted by name, so a stuck scancode cannot pass as four presses. Criterion 5 is the `mouse:` line's
+`dx=+25 dy=+10`, which is the movement sent - `y` positive in the log because QMP's `-10` is up and
+the packet's `y` grows upwards while the screen's grows down.
+
+## M7 onward - provisional themes
 
 The ordering above is dependency-driven and each theme is a milestone of its own.
 Detailed scope, acceptance criteria and verification are added when the milestone

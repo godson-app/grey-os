@@ -137,6 +137,16 @@ mod arch {
         outb(port, inb(port) & !(1 << bit));
     }
 
+    /// Stops IRQ `irq` reaching the CPU.
+    ///
+    /// Needed for more than tidiness: the 8042 puts the answers to its own commands in the
+    /// same output buffer a keystroke arrives in, so a driver sending it commands has to
+    /// stop the keyboard's handler from consuming them as scancodes.
+    pub fn mask(irq: u8) {
+        let (port, bit) = line(irq);
+        outb(port, inb(port) | (1 << bit));
+    }
+
     /// Acknowledges `irq`, so the controller will deliver the next one.
     ///
     /// A slave line has to be acknowledged twice: once in the slave, then in the master,
@@ -156,7 +166,7 @@ mod arch {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use arch::{eoi, init, is_unmasked, unmask};
+pub use arch::{eoi, init, is_unmasked, mask, unmask};
 
 #[cfg(test)]
 mod tests {

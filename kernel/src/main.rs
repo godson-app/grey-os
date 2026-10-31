@@ -13,8 +13,8 @@ use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 use grey_os::{
-    arena, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap, idt, memory, paging, pic,
-    qemu, serial, timer,
+    arena, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap, idt, keyboard, memory,
+    mouse, paging, pic, qemu, serial, timer,
 };
 // `Block` has to be in scope for `drive.sectors()`: the trait is the interface, and the
 // concrete `Pio` type only implements it.
@@ -840,6 +840,47 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         idt::unexpected_irqs()
     );
 
+    // M6: the input devices. Both live behind the 8042 and both report by interrupt, so
+    // this runs after `idt::enable`; each driver installs its gate before its line is
+    // unmasked, which is the same order the timer used.
+    //
+    // SAFETY: nothing else in this boot has claimed ports 0x60 and 0x64, and the
+    // controller is the platform's own.
+    let keyboard_config = unsafe { keyboard::init() };
+    let panel = display::size().unwrap_or((0, 0));
+    // SAFETY: as above. The mouse owns the second port, and the configuration byte it
+    // rewrites is the one the keyboard's `init` just wrote.
+    let mouse_ready = unsafe { mouse::init(panel.0 as u32, panel.1 as u32) };
+    match keyboard_config {
+        Some(config) => println!(
+            "grey-os: input: keyboard on irq1, 8042 config {config:#04x}, translation on so set 1 arrives"
+        ),
+        None => {
+            println!("grey-os: FATAL: the 8042 never answered");
+            qemu::exit_qemu(qemu::QemuExitCode::Failed);
+        }
+    }
+    match mouse_ready {
+        Ok(()) => {
+            let (x, y) = mouse::position();
+            println!(
+                "grey-os: input: mouse on irq12 through the cascade, 3-byte packets, pointer at {x},{y}"
+            );
+        }
+        Err(error) => println!(
+            "grey-os: input: no pointer ({error:?}), keyboard only; the port last said {:#x}",
+            mouse::last_ack()
+        ),
+    }
+    println!(
+        "grey-os: input ready: {} keys decoded, 0 dropped, {} pointer packets",
+        keyboard::events(),
+        mouse::packets()
+    );
+
+    #[cfg(grey_os_input_test)]
+    input_test();
+
     // M2's fault paths are tested the way M0's panic path is: a cfg compiled in from an
     // environment variable, one image per fault, and `cargo xtask test` booting each and
     // asserting the report (ADR-023, ADR-028). Each block is a real instruction the CPU
@@ -1134,6 +1175,68 @@ fn boot_number(bytes: &[u8]) -> u32 {
 fn fatal_storage(error: fs::FsError) -> ! {
     println!("grey-os: FATAL: greyfs refused the disk: {error:?}");
     qemu::exit_qemu(qemu::QemuExitCode::Failed)
+}
+
+/// M6's acceptance run: listens for the keys and the pointer movement the harness injects
+/// through QEMU's monitor, echoes every one, and reports how many arrived.
+///
+/// A kernel cannot press its own keyboard, so this is the only way the interrupt path is
+/// ever exercised by a machine rather than by a host test. It is compiled in only when
+/// `GREY_OS_INPUT_TEST` is set, in the same way the panic and fault paths are (ADR-023),
+/// which is what keeps a machine with nobody at the keyboard from waiting here.
+#[cfg(grey_os_input_test)]
+fn input_test() {
+    /// How many keystrokes the harness types. Four is enough to prove the queue, the
+    /// decoder's table and the interrupt all work, and few enough to keep the phase short.
+    const KEYS: u64 = 4;
+    /// How long to listen before giving up: ten seconds at the boot's timer rate.
+    const BUDGET_TICKS: u64 = 1000;
+
+    println!("grey-os: input test: listening for keys and pointer");
+    let start = timer::ticks();
+    let deadline = start.saturating_add(BUDGET_TICKS);
+    let mut keys = 0u64;
+    let starting_packets = mouse::packets();
+    let mut reported_mouse = false;
+    // Both have to be seen before this stops: the keys prove the interrupt and the decoder,
+    // the packet proves the second port and the parser. Checking the two *after* the body
+    // rather than in the loop header is what stops a packet that arrives during the last
+    // wait from ending the loop before it is reported.
+    loop {
+        while let Some(event) = keyboard::pop() {
+            keys += 1;
+            let modifiers = event.modifiers;
+            match event.key {
+                keyboard::Key::Char(character) => println!(
+                    "grey-os: key: '{character}' shift={} ctrl={} alt={} caps={}",
+                    modifiers.shift, modifiers.control, modifiers.alt, modifiers.caps
+                ),
+                named => println!(
+                    "grey-os: key: {named:?} shift={} ctrl={} alt={} caps={}",
+                    modifiers.shift, modifiers.control, modifiers.alt, modifiers.caps
+                ),
+            }
+        }
+        if !reported_mouse && mouse::packets() != starting_packets {
+            let (dx, dy) = mouse::last_movement();
+            let (x, y) = mouse::position();
+            println!(
+                "grey-os: mouse: dx={dx:+} dy={dy:+} buttons={:#04x} at {x},{y}",
+                mouse::buttons()
+            );
+            reported_mouse = true;
+        }
+        if (keys >= KEYS && reported_mouse) || timer::ticks() >= deadline {
+            break;
+        }
+        timer::wait_ticks(1);
+    }
+    println!(
+        "grey-os: input ok: {keys} keys and {} pointer packets in {} ticks, {} dropped",
+        mouse::packets().saturating_sub(starting_packets),
+        timer::ticks().saturating_sub(start),
+        keyboard::dropped()
+    );
 }
 
 /// Set once the panic path runs, so a panic inside it cannot recurse forever.

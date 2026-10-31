@@ -877,6 +877,65 @@ page-aligned top, both recorded as open. The arena's address is a constant, not 
 first user-space mapping is where that stops being a placeholder.
 
 
+## ADR-033: The 8042 carries both inputs, and it answers its own commands
+
+**Status:** accepted, M6.
+
+**Context.** The milestone is "input: keyboard and pointer", and the machine has one input
+controller: the 8042, with a keyboard on its first port and a mouse on its second. Both report by
+interrupt (IRQ1 and IRQ12, the latter through the slave's cascade). USB would be a different
+milestone and a host-controller stack.
+
+**Decision.** Both devices are driven through the 8042, and both decoders live in the library as
+plain data so the host tests can drive them byte by byte. The keyboard's decoder is a table over
+scancode set 1 - the set a controller with translation enabled hands over - with the modifier state
+on the event rather than as events of its own, caps lock inverting shift for letters only, releases
+swallowed, and the arrow keys resolved behind the `0xe0` prefix. The mouse's parser assembles three
+bytes, uses bit 3 of the first as its only synchronisation, and treats overflow as a dropped packet
+rather than half a movement.
+
+Events go into a fixed 64-entry ring: one producer (the handler), one consumer (whatever reads a
+key), no allocation and no lock. The consumer masks interrupts across the read, which is what makes
+the borrow exclusive - `idt::enabled()` was added so it puts the flag back only if it was on. A full
+ring drops the newest event and counts it: a keystroke that arrives while the reader is busy is
+already late.
+
+**What building it taught.** Three things, each of which the milestone's proof caught and no amount
+of reading would have:
+
+1. The controller answers its own commands - `read config`, the mouse's `ack` - in the *same* output
+   buffer a keystroke arrives in. With IRQ1 live, the keyboard's handler read the mouse's
+   configuration byte and fed `0x47` to the scancode decoder, so `mouse::init` saw silence and
+   reported `Config`. The fix is to mask IRQ1 for the length of the mouse's handshake (`pic::mask` is
+   new) and, in both handlers, to check the status byte's aux bit before reading: a byte that belongs
+   to the other port is left for the other handler.
+2. QMP has no `sendkey`; the command lives in the human monitor, so the harness relays it through
+   `human-monitor-command`. `input-send-event` *is* a QMP command, and a relative movement reaches
+   the PS/2 mouse through the same console the keystrokes use.
+3. The acceptance loop was written as `while keys < 4 || packets == 0`, and printed the pointer line
+   in its body. A packet that arrived during the last wait ended the loop before the body ran again,
+   so the run said "4 keys and 1 pointer packets" with no pointer line to assert. The loop now checks
+   after its body, not in its header.
+
+**Why a machine drives it.** A kernel cannot press its own keyboard, and a host test of the decoder
+proves only that the decoder works. So `GREY_OS_INPUT_TEST` compiles in a listening run: it prints
+`input test: listening`, waits up to ten seconds for four keys and one pointer packet, and echoes
+each one. `cargo xtask test` watches the serial output for the marker, then types through QEMU's
+monitor - the same path a person's key takes - and asserts each character separately, because a
+count alone would pass if one stuck scancode were decoded four times.
+
+**Consequences.** `keyboard.rs` and `mouse.rs` each split at the same seam as `paging`: the
+arithmetic and the table are host-tested (nine keyboard tests, seven mouse tests), and the port half
+is `x86_64`-only and exercised by the boot. `pic::mask` and `idt::enabled` join the API. The input
+phase costs a rebuild and about two seconds per `cargo xtask test`, which is the price of proving an
+interrupt path with a machine rather than with a mock.
+
+**Open.** No key repeat (the 8042 does not repeat; the kernel does not synthesise it), no keymap
+beyond US set 1, no scroll wheel or the fourth and fifth buttons (IntelliMouse mode is not enabled),
+no hot-plug after boot, and no USB. The mouse is clamped to the panel's pixels but nothing draws a
+pointer yet: that is M7's.
+
+
 ## ADR-032: An ATA drive polled through its ports, and a filesystem the kernel formats
 
 **Status:** accepted, M5.

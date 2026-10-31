@@ -16,8 +16,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use ovmf_prebuilt::{Arch, FileType, Prebuilt, Source};
 use std::ffi::OsString;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Where `build.rs` stages the images, relative to the workspace root.
@@ -45,6 +48,20 @@ const GREYFS_WRITE: &str = "grey-os: greyfs: wrote /boot-count";
 /// which is the whole persistence claim: `boot 1` means the counter was written, `boot 2`
 /// means a second boot read it back from the platter.
 const STORAGE_OK: &str = "grey-os: storage ok: boot";
+
+/// Variable that makes `kernel/build.rs` compile the listening input run in (M6).
+const INPUT_TEST_ENV: &str = "GREY_OS_INPUT_TEST";
+/// Printed once the input test is listening. The harness types only after it sees this:
+/// keystrokes sent before the 8042 is configured are dropped by the controller.
+const INPUT_LISTENING: &str = "grey-os: input test: listening";
+/// Printed once the input run has stopped listening.
+const INPUT_OK: &str = "grey-os: input ok:";
+/// The keys the harness types, in order. Each one has to appear in a `key: 'x'` line, so
+/// the word is the assertion.
+const INPUT_KEYS: [&str; 4] = ["g", "r", "e", "y"];
+/// Printed by a normal boot once the keyboard has been configured and its handler installed
+/// (M6). The mouse's line follows it, but a machine without a pointer is allowed.
+const INPUT_READY: &str = "grey-os: input: keyboard on irq1";
 
 const USAGE: &str = "usage: cargo xtask <build|run|test> [--no-build] [--bios]";
 
@@ -266,6 +283,8 @@ fn test(options: &Options) -> Result<ExitCode> {
             GREYFS_FORMATTED,
             GREYFS_WRITE,
             &format!("{STORAGE_OK} 1"),
+            INPUT_READY,
+            "grey-os: input ready:",
         ],
         EXIT_CLEAN,
     )?;
@@ -276,6 +295,8 @@ fn test(options: &Options) -> Result<ExitCode> {
 
     storage_persistence(options)?;
 
+    input_path(options)?;
+
     let phases = panic_path(options).and_then(|()| exception_paths(options));
     // Restore the image the other commands boot whether the phases passed or not:
     // leaving `target/` holding a kernel that faults on every boot would make the next
@@ -284,6 +305,187 @@ fn test(options: &Options) -> Result<ExitCode> {
     phases?;
     restored?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Boots a kernel that listens for the keyboard, types into it through QEMU's monitor, and
+/// asserts what the kernel decoded.
+///
+/// This is the one phase that needs to talk to a running guest: a kernel cannot press its
+/// own keyboard, and accepting the decoder's host tests as proof of the interrupt path
+/// would be accepting that a function works because it was called. QEMU's QMP socket is the
+/// injection point, and the serial output is watched line by line so the keys are typed
+/// only after the kernel says it is listening.
+fn input_path(options: &Options) -> Result<()> {
+    println!("--- input path: rebuilding the kernel with {INPUT_TEST_ENV}=1");
+    build(&[(INPUT_TEST_ENV, "1")])?;
+
+    let socket = image_path("qmp.sock");
+    let _ = fs::remove_file(&socket);
+    let mut command = boot_command(options, true)?;
+    command.args([
+        "-qmp",
+        &format!("unix:{},server=on,wait=off", socket.display()),
+    ]);
+    println!("boot command: {command:?}");
+    let mut child = command
+        .spawn()
+        .context("failed to start qemu-system-x86_64")?;
+    let stdout = child.stdout.take().context("qemu's stdout was not piped")?;
+
+    // The serial log has to be watched while the guest runs, not collected afterwards: the
+    // whole phase depends on knowing when the kernel started listening.
+    let (sender, receiver) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut log = String::new();
+    let mut typed = false;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                log.push_str(&line);
+                log.push('\n');
+                if !typed && line.contains(INPUT_LISTENING) {
+                    println!(
+                        "typing `{}` into the machine's keyboard through qmp",
+                        INPUT_KEYS.concat()
+                    );
+                    inject(&socket)?;
+                    typed = true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if started.elapsed() > TEST_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "the input run did not finish within {}s; the kernel is hung\
+                         \n--- serial ---\n{log}",
+                        TEST_TIMEOUT.as_secs()
+                    );
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let status = child.wait().context("failed to collect qemu output")?;
+    if !typed {
+        bail!("the kernel never reported `{INPUT_LISTENING}`\n--- serial ---\n{log}");
+    }
+    expect(
+        &log,
+        status.code(),
+        &[
+            BOOT_OK,
+            INPUT_LISTENING,
+            &format!("{INPUT_OK} {} keys", INPUT_KEYS.len()),
+        ],
+        EXIT_CLEAN,
+    )?;
+    // Each key separately: the count alone would pass if the decoder reported one key four
+    // times, which is exactly the failure a stuck scan code produces.
+    for key in INPUT_KEYS {
+        let needle = format!("grey-os: key: '{key}'");
+        if !log.contains(&needle) {
+            bail!("the keyboard never reported `{needle}`\n--- serial ---\n{log}");
+        }
+    }
+    println!(
+        "pass: `{INPUT_OK} {} keys` with each of `{}` decoded, qemu exited {EXIT_CLEAN}",
+        INPUT_KEYS.len(),
+        INPUT_KEYS.concat()
+    );
+    // The pointer is required too: the same console that carries the keystrokes carries the
+    // movement, and a three-byte packet is only a packet if the device produced one.
+    if !log.contains("grey-os: mouse:") {
+        bail!("the pointer never reported a packet\n--- serial ---\n{log}");
+    }
+    println!("pass: a pointer packet reached the guest and was decoded");
+    Ok(())
+}
+
+/// Connects to QEMU's monitor, enables it, and types the keys.
+///
+/// QMP speaks one JSON object per line, and every command is answered with either a
+/// `return` or an `error` object. Reading each answer is not decoration: QEMU processes
+/// commands in order, and a command whose reply is not consumed leaves the next reader off
+/// by one.
+fn inject(socket: &Path) -> Result<()> {
+    let mut connected = None;
+    // The socket file appears as the guest starts and can exist a moment before it accepts
+    // a connection, so the connect is retried rather than trusted to be immediate.
+    for _ in 0..50 {
+        match UnixStream::connect(socket) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let mut stream =
+        connected.with_context(|| format!("failed to connect to {}", socket.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut reader = BufReader::new(stream.try_clone().context("failed to clone the socket")?);
+    let mut greeting = String::new();
+    reader
+        .read_line(&mut greeting)
+        .context("failed to read qemu's qmp greeting")?;
+    if !greeting.contains("QMP") {
+        bail!("unexpected greeting from qemu's monitor: {greeting}");
+    }
+    qmp(
+        &mut stream,
+        &mut reader,
+        r#"{"execute":"qmp_capabilities"}"#,
+    )?;
+    for key in INPUT_KEYS {
+        // QMP has no `sendkey`: it lives in the human monitor, which QMP can relay. The
+        // relay is still a keystroke through the machine's keyboard controller - the path a
+        // person's key takes - not a call into the kernel.
+        qmp(
+            &mut stream,
+            &mut reader,
+            &format!(
+                r#"{{"execute":"human-monitor-command","arguments":{{"command-line":"sendkey {key}"}}}}"#
+            ),
+        )?;
+        // One keystroke per call, spaced out: the controller's buffer holds a couple of
+        // bytes, and the kernel's queue is drained between them.
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    // A relative movement, which is what a real mouse sends: the axes are relative to where
+    // the pointer already is, so the guest reports the same numbers back.
+    qmp(
+        &mut stream,
+        &mut reader,
+        r#"{"execute":"input-send-event","arguments":{"events":[{"type":"rel","data":{"axis":"x","value":25}},{"type":"rel","data":{"axis":"y","value":-10}}]}}"#,
+    )?;
+    Ok(())
+}
+
+/// Sends one QMP command and checks that QEMU accepted it.
+fn qmp(stream: &mut UnixStream, reader: &mut BufReader<UnixStream>, command: &str) -> Result<()> {
+    stream
+        .write_all(command.as_bytes())
+        .and_then(|()| stream.write_all(b"\n"))
+        .and_then(|()| stream.flush())
+        .context("failed to send a qmp command")?;
+    let mut reply = String::new();
+    reader
+        .read_line(&mut reply)
+        .context("failed to read a qmp reply")?;
+    if !reply.contains(r#""return""#) {
+        bail!("qemu rejected `{command}`: {reply}");
+    }
+    Ok(())
 }
 
 /// Builds a kernel whose only job is to panic, boots it, and asserts the report.
