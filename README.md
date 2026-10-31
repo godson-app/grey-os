@@ -52,6 +52,20 @@ cargo run
 
 This builds the kernel, wraps it in a bootable UEFI disk image with the `bootloader` crate, and launches QEMU with a window. The bootloader's log appears briefly on serial, then the kernel takes the panel over: the log scrolls, a desktop of six windows appears, three task lines and three programs run, and the kernel exits QEMU with a success status. The serial log lands in this terminal. The pointer, the keyboard and the shell need a person or the harness; a plain `cargo run` boots, runs the demonstration and exits.
 
+To look at the desktop instead of watching it flash past, boot the preview:
+
+```bash
+cargo xtask run --interactive
+```
+
+The same demonstration runs, and then the shell keeps the keyboard with no deadline: `help`, `ls`,
+`mem`, `cpus`, `run fib`, a click raises a window, and `exit` ends the session - or close the
+window, which counts as success too. The shell is the window on the panel, not this terminal:
+click the QEMU window once so the keyboard goes to the guest, and type there. The terminal only
+carries the boot log - serial is output, and nothing typed into it reaches the guest. The preview
+is a kernel compiled with `GREY_OS_INTERACTIVE=1` (ADR-041), so any later plain `cargo run` or
+`cargo xtask build` boots the ordinary image again.
+
 The first build is slow because it compiles the bootloader and fetches firmware.
 
 A healthy boot prints approximately (the memory map is elided):
@@ -202,9 +216,10 @@ are a `cpus` command, and `run fib` loads `apps/fib.gvm` from the disk and inter
 shell's window.
 
 Because the kernel exits through QEMU's `isa-debug-exit` device, the QEMU window closes as soon as
-boot finishes and `cargo run` exits with status 0. A panic prints its message and location to the
-terminal and exits with status 1, after painting the panel 0xb01b2f, keeping the log so far on it
-and rendering the report underneath in text.
+boot finishes and `cargo run` exits with status 0. The preview above is the exception: its shell
+waits for a command, so the window stays until `exit` or a closed window. A panic prints its message
+and location to the terminal and exits with status 1, after painting the panel 0xb01b2f, keeping the
+log so far on it and rendering the report underneath in text.
 
 ## `xtask`
 
@@ -213,12 +228,13 @@ The same boot, automated:
 ```bash
 cargo xtask build   # stage both images in target/grey-os/
 cargo xtask run     # build, then boot the UEFI image with a window
+cargo xtask run --interactive   # the same boot, but the shell stays up until `exit`
 cargo xtask test    # build, boot clean, then boot one kernel per injected failure
 cargo xtask ci      # fmt, both clippy halves, host tests, the boot tests, release build
 ```
 
 `test` checks the serial markers _and_ the exit status, and fails on a hang rather
-than waiting forever. It runs thirteen phases over one deterministic disk:
+than waiting forever. It runs fourteen phases over one deterministic disk:
 
 1. **The clean boot**, which must print `grey-os: boot ok` and exit 33 - and, before that, the
    bring-up lines: the frame totals, the framebuffer's resolved physical span, the kernel's own
@@ -232,10 +248,15 @@ than waiting forever. It runs thirteen phases over one deterministic disk:
    relative pointer movement decoded, a screenshot taken and checked for the desktop's colour and
    the pointer's pixels, and five commands typed into the shell - `ls`, `mem`, `cpus`, `run fib`,
    `run nope` - with each answer and `exit` asserted.
-4. **The panic path**, a kernel rebuilt with `GREY_OS_PANIC_TEST=1`, which must print `[panic]`, its
+4. **The preview**, rebuilt with `GREY_OS_INTERACTIVE=1`, which is the kernel a person types into:
+   the panel is photographed the moment the shell says it is listening and has to still hold the
+   desktop - the boot log paints on serial only once the first frame is up, so a band of the shell
+   window's body is its window colour rather than log lines - and `exit`, typed through the monitor,
+   has to end the session with `grey-os: boot ok` and status 33 like any other finished boot.
+5. **The panic path**, a kernel rebuilt with `GREY_OS_PANIC_TEST=1`, which must print `[panic]`, its
    message, its location and `[panic] panel painted red`, and exit 35. The last line is how the
    painted screen is verified from outside a guest that cannot be looked into.
-5. **Five fault paths**, each rebuilt with `GREY_OS_EXCEPTION_TEST=gp`, `pf`, `ud`, `df` or `guard`:
+6. **Five fault paths**, each rebuilt with `GREY_OS_EXCEPTION_TEST=gp`, `pf`, `ud`, `df` or `guard`:
    each has to print its own `[exception]` report - the vector, its error code where the vector has
    one, and the faulting instruction - and exit 35. `guard` writes one byte past the heap, so the
    report is a write to a page that is not present and `cr2` is the heap's end.
@@ -243,7 +264,9 @@ than waiting forever. It runs thirteen phases over one deterministic disk:
 The images are then rebuilt without the flags, so a phase that failed leaves nothing behind that
 would make the next `cargo xtask run` baffling. `--no-build` skips the nested `cargo build` for
 `build` and `run`; `test` refuses it, since the flags have to be compiled in. `--bios` boots the BIOS
-image instead (built, never verified - see `ROADMAP.md`).
+image instead (built, never verified - see `ROADMAP.md`). `--interactive` is `run`'s alone and, like
+the failure flags, is compiled in: it builds the preview kernel and refuses `--no-build` for the same
+reason `test` does.
 
 To watch the panic path yourself, including the red panel:
 

@@ -17,9 +17,11 @@ use grey_os::{
     idt, keyboard, memory, mouse, paging, pic, qemu, scheduler, serial, sync, theme, timer,
     usermode, vm, window,
 };
-// The shell only exists in the acceptance build: a normal boot has no way to type into it and
-// a kernel that waited for a command would hang the harness's clean boot.
-#[cfg(grey_os_input_test)]
+// The shell only exists in the builds that can type into it: the acceptance run, whose keys
+// come from the harness, and a preview, whose keys come from the person at the keyboard. A
+// normal boot has no way to type into it and a kernel that waited for a command would hang the
+// harness's clean boot (ADR-041).
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
 use grey_os::shell;
 // `Block` has to be in scope for `drive.sectors()`: the trait is the interface, and the
 // concrete `Pio` type only implements it.
@@ -962,6 +964,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             drawn = desktop.draw_all(&mut canvas);
         }
     });
+    // The panel belongs to the desktop from this frame on, not from the end of the boot. A
+    // preview keeps the shell running for as long as somebody is looking at it, and every
+    // `println!` between here and the end of the boot would otherwise repaint the boot log
+    // over the windows: the log's grid is the whole panel, so one line of it is enough to
+    // replace the desktop with a terminal of log lines. Serial is unaffected, and
+    // `paint_panic` ignores the flag, so a fatal failure still paints its report.
+    display::set_quiet(true);
     // Two changes, each repainted from the damage they produced: a raise, which changes two
     // title bars because the focus moves, and a move, which changes where the window is and
     // leaves the desktop behind it.
@@ -1078,11 +1087,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // half of the mechanism - see `user_demo`.
     user_demo();
 
-    // The shell: the input run drives it with typed commands, and a normal boot lets it run
-    // for a second so the window is not empty. There is no way to end a session except
-    // `exit`, and a kernel that waited forever would hang the harness's clean boot, so the
-    // loop is bounded by ticks rather than open-ended.
-    #[cfg(grey_os_input_test)]
+    // The shell: the acceptance run drives it with keys the harness injects, and a preview with
+    // a person's own (ADR-041); a normal boot does not compile this loop in at all. There is no
+    // way to end a session except `exit`, so the acceptance run's loop is bounded by ticks,
+    // while the preview's is not - nothing is waiting for it.
+    #[cfg(any(grey_os_input_test, grey_os_interactive))]
     {
         SHELL_WINDOW.store(shell_window, Ordering::Relaxed);
         run_shell(&mut *desktop, shell_window, &mut *storage);
@@ -1090,10 +1099,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // The panel is repainted in full *before* the line that says the desktop is ready: a
     // harness photographs the panel the moment it reads that line, and a repaint after it
-    // would be a repaint nobody saw.
+    // would be a repaint nobody saw. A preview is the run that gets here with the panel still
+    // up, so this frame is the one a person sees and the one `cargo xtask test` photographs.
     paint_all(desktop);
-    // From here the panel belongs to the desktop; the boot log continues on serial.
-    display::set_quiet(true);
     let overlapping = desktop
         .windows
         .iter()
@@ -1211,7 +1219,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         // The input run is the only one a harness looks at while it is still alive: it asks
         // QEMU for a screenshot once it has seen the compositor's line, and a kernel that had
-        // exited first would leave nothing to dump.
+        // exited first would leave nothing to dump. A preview reaches here only after `exit`,
+        // and a window someone closed never reaches it at all.
         #[cfg(grey_os_input_test)]
         timer::wait_ticks(50);
         println!("grey-os: boot ok");
@@ -1805,13 +1814,20 @@ fn task_count() {
 fn task_fib() {
     run_app(apps::FIB);
 }
-/// How long the shell listens before the boot continues.
+/// How long the shell listens before the boot continues, or `None` to listen until `exit`.
 ///
 /// A session with no way to end the machine has to end something, and a kernel that waited
 /// forever would hang the harness's clean boot. The input run gets long enough for the
-/// harness to type; a normal boot gets a short demonstration.
+/// harness to type; a preview has a person at the keyboard, so nothing but `exit` - or closing
+/// the window - ends it.
 #[cfg(grey_os_input_test)]
-const SHELL_TICKS: u64 = 2400;
+const SHELL_TICKS: Option<u64> = Some(2400);
+/// A preview is the same shell with no deadline (ADR-041).
+///
+/// `not(grey_os_input_test)` keeps the two definitions from existing at once when somebody sets
+/// both variables: the acceptance run's bound wins, because a harness is waiting for it.
+#[cfg(all(grey_os_interactive, not(grey_os_input_test)))]
+const SHELL_TICKS: Option<u64> = None;
 
 /// Where a ring 3 program's output goes: the serial log and the applications window.
 ///
@@ -1875,7 +1891,10 @@ fn user_demo() {
 /// Typing goes through the editor, which is where the line and its history live; a submitted
 /// line is parsed, executed and answered in the window. The pointer's first job is here too:
 /// a click raises whatever is under it.
-#[cfg(grey_os_input_test)]
+///
+/// Two builds reach this: the acceptance run, whose input comes from the harness and whose
+/// loop must end on its own, and a preview, where a person types and `SHELL_TICKS` is `None`.
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
 fn run_shell(
     desktop: &mut compositor::Compositor,
     window: u32,
@@ -1885,9 +1904,16 @@ fn run_shell(
     draw_prompt(desktop, window, &editor);
     redraw(desktop);
     println!("grey-os: shell: listening for commands");
-    let deadline = timer::ticks().saturating_add(SHELL_TICKS);
+    // `None` in a preview: the only way out then is `exit` below, or closing the window.
+    let deadline = SHELL_TICKS.map(|ticks| timer::ticks().saturating_add(ticks));
     let mut seen_packets = mouse::packets();
-    while timer::ticks() < deadline {
+    // The left button on the last packet: a click is the button going down, not a packet
+    // arriving. Every movement is a packet, and raising whatever the pointer passed over would
+    // rearrange the desktop under somebody's hand - and repaint it a packet at a time, which is
+    // the flicker the first preview showed while the mouse was moved.
+    const LEFT_BUTTON: u8 = 0x01;
+    let mut pressed = mouse::buttons() & LEFT_BUTTON != 0;
+    while deadline.is_none_or(|deadline| timer::ticks() < deadline) {
         let mut submitted = None;
         while let Some(event) = keyboard::pop() {
             match editor.handle(event.key) {
@@ -1899,12 +1925,16 @@ fn run_shell(
         if mouse::packets() != seen_packets {
             seen_packets = mouse::packets();
             let (x, y) = mouse::position();
-            let raised = desktop.windows.click(x, y);
-            framebuffer::with_screen(|screen| {
-                if let Some(mut canvas) = framebuffer::canvas(screen) {
-                    desktop.draw_pointer(&mut canvas, x, y);
-                }
-            });
+            let down = mouse::buttons() & LEFT_BUTTON != 0;
+            let clicked = down && !pressed;
+            pressed = down;
+            // The pointer is drawn by `redraw` below, which is also what erases the one it
+            // moved away from; drawing it here as well would only draw it twice.
+            let raised = if clicked {
+                desktop.windows.click(x, y)
+            } else {
+                None
+            };
             if let Some(id) = raised {
                 println!("grey-os: shell: click at {x},{y} raised window #{id}");
             }
@@ -1933,7 +1963,7 @@ fn run_shell(
 ///
 /// The prompt is always the last line of the shell window, which is what lets the history sit
 /// above it while a line is being typed.
-#[cfg(grey_os_input_test)]
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
 fn draw_prompt(desktop: &mut compositor::Compositor, window: u32, editor: &shell::Editor) {
     let text = alloc::format!("> {}", editor.line());
     if let Some(shell_window) = desktop.windows.window_mut(window) {
@@ -1958,12 +1988,12 @@ fn draw_prompt(desktop: &mut compositor::Compositor, window: u32, editor: &shell
 ///
 /// Set once, just before the shell runs, for the same reason [`APPS_WINDOW`] is: the shell's
 /// executor holds the desktop borrow, and a program's host is called from inside it.
-#[cfg(grey_os_input_test)]
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
 static SHELL_WINDOW: AtomicU32 = AtomicU32::new(0);
 
 /// Adds a line to the shell's window and to serial: where a program's output goes when the
 /// program was started by `run`.
-#[cfg(grey_os_input_test)]
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
 fn run_line(line: alloc::string::String) {
     let window = SHELL_WINDOW.load(Ordering::Relaxed);
     with_desktop(|desktop| shell_push(desktop, window, line));
@@ -1973,7 +2003,7 @@ fn run_line(line: alloc::string::String) {
 ///
 /// The line goes to serial too, for the same reason the tasks' do: a harness can read a line
 /// but not a pixel.
-#[cfg(grey_os_input_test)]
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
 fn shell_push(desktop: &mut compositor::Compositor, window: u32, text: alloc::string::String) {
     serial::print_args(format_args!("grey-os: shell: {text}"));
     if let Some(shell_window) = desktop.windows.window_mut(window) {
@@ -2001,7 +2031,7 @@ fn shell_push(desktop: &mut compositor::Compositor, window: u32, text: alloc::st
 /// The keyboard the harness types through cannot send a slash without a name for it, and a
 /// person should not have to type the whole path to run one of the three programs the disk
 /// was formatted with.
-#[cfg(grey_os_input_test)]
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
 fn program_path(name: &str) -> alloc::string::String {
     if name.contains('/') {
         alloc::string::String::from(name)
@@ -2015,7 +2045,7 @@ fn program_path(name: &str) -> alloc::string::String {
 /// Everything a command prints is collected first and pushed afterwards: the desktop is
 /// borrowed mutably to push, so a command that iterates the desktop has to be done reading
 /// before the first line goes in.
-#[cfg(grey_os_input_test)]
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
 fn execute(
     desktop: &mut compositor::Compositor,
     window: u32,
@@ -2075,7 +2105,7 @@ fn execute(
             text: contents,
         } => match storage.as_mut() {
             Some(filesystem) => {
-                let mut bytes = alloc::string::String::from(contents);
+                let mut bytes = contents;
                 bytes.push('\n');
                 match filesystem.write(&name, bytes.as_bytes(), fs::Kind::File) {
                     Ok(entry) => out.push(alloc::format!(

@@ -183,6 +183,16 @@ deleted. It is kept for now because it works and because deleting the only worki
 path in the same milestone that introduces its replacement is how a project loses a
 day.
 
+**Update (M12).** The runner stopped working in M5 and nobody noticed: it was never
+given the `greyfs` data disk, and it attached the boot image with no `if=ide,index=2`,
+so the ESP became the machine's primary master. `cargo run` then died on
+`grey-os: FATAL: greyfs refused the disk: BadMagic` - the drift this ADR predicted,
+caught by a boot log rather than by a test, because no test runs the runner. It now
+passes `-smp 4` and `-nic none`, puts the boot image on the secondary channel, and
+creates and attaches the 4 MiB data disk on the primary master, so the two paths boot
+the same machine. The argument list is still two copies, and merging them remains the
+open question here.
+
 ## ADR-012: Automated panic test is deferred, deliberately
 
 **Status:** open, M1. Approved to land in M1 - see ADR-019.
@@ -291,6 +301,12 @@ line rather than the parts that happened to be fixed first. The separate
 `src/bin/qemu-uefi.rs` runner still resolves its OVMF cache relatively; it is
 superseded by `xtask` (ADR-011) and is a candidate for removal rather than
 repair.
+
+**Update (M12).** The runner was repaired instead, because it is what `cargo run` runs
+and `cargo run` is the first command in the README: it now resolves the OVMF cache
+through `CARGO_MANIFEST_DIR` and copies the vars drive per run, so the relative-path
+trap is gone from both paths. That leaves ADR-011's two command lines as two, which is
+still the open half of this.
 
 ## ADR-017: The heap arrives in M1, and M4 is re-scoped
 
@@ -1394,3 +1410,57 @@ in every program's space needs either a synchronisation point or a higher-half k
 construction.
 
 
+
+
+## ADR-041: A preview mode, and why the kernel still ends its own run
+
+**Status:** accepted, M12.
+
+**Context.** ADR-005 ends every boot through QEMU's `isa-debug-exit`, because that is what turns a
+demonstration into a pass or a failure a script can read. The cost became visible once M7 put a
+desktop on the panel and M8 gave it a shell: the window closes about a second after the desktop is
+painted, so looking at the thing being built meant watching a flash. The shell was compiled only
+into `GREY_OS_INPUT_TEST` builds, whose loop is bounded at 2400 ticks because the harness has to get
+its process back - correct for a test and useless for a person, who cannot type into a session that
+ends by itself.
+
+**Decision.** `GREY_OS_INTERACTIVE=1`, spelled `cargo xtask run --interactive`, compiles the shell
+into the image and runs it with no tick deadline. After the same boot demonstration, the keyboard,
+the pointer and the shell window belong to whoever is at the window, until `exit` - which prints
+`boot ok` and reports 33, exactly like a finished boot - or until the window is closed, which QEMU
+calls 0 and `run` accepts as success.
+
+The flag is read at compile time, like the panic and fault flags (ADR-023), and `--interactive`
+refuses `--no-build` for the same reason `test` does: which mode the kernel is in has to be decided
+by the artifact, not by the argument list. In the other direction, `xtask` writes
+`GREY_OS_INTERACTIVE=0` into every build it starts, so a variable exported in somebody's shell cannot
+turn the boot tests into sessions that never end.
+
+**Consequences.** The two shell callers differ in one `const` - `SHELL_TICKS` is `Some(2400)` for the
+acceptance run and `None` for the preview - rather than in a branch, so neither can drift into the
+other's behaviour by accident. The clean boot is untouched: without the flag the loop is not
+compiled at all, and `boot ok` still arrives at the same moment it always did.
+
+The preview is a different artifact, and that is the price: the image left in `target/` by
+`cargo xtask run --interactive` boots into a shell that waits, so a plain `cargo run` afterwards
+appears to hang rather than exit. `cargo xtask build` - and `cargo xtask test` on its way out - put
+the ordinary image back, which is the same rule the panic and fault images already follow.
+
+**A preview found two bugs the tests could not.** The first preview showed a terminal of boot-log
+lines with fragments of windows in it, which is "the UI is broken" from the only place that can see
+it. `display::set_quiet` was called after the shell loop instead of when the desktop's first frame
+went up, so the line that announces the shell repainted the console's whole grid - and the grid is
+the panel - over the desktop; the windows came back only where a keystroke damaged one. Every other
+run hid this: a finished shell is followed by a full repaint, and the harness photographs the panel
+after that. The flag is now set with the first frame, and the preview is a phase of
+`cargo xtask test`: it boots the interactive image, photographs the panel the moment the shell says
+it is listening, requires a band of the shell window's body to still be its window colour, then types
+`exit` through the monitor and asserts `boot ok` and status 33. The preview also showed two faults in
+how the pointer was handled: it was drawn where it moved to and never erased where it had been, so it
+smeared across the windows it crossed, and every packet was treated as a click, so merely passing
+over a window raised and repainted it. `Compositor::draw_pointer` now damages the rect it covered
+last, the shell raises a window only when the left button goes down, and a host test holds the first.
+
+**Open.** A window that is closed rather than exited is still only stated here. QMP can quit a
+guest, but it cannot click the window's close button, so that half of the exit-code rule has no
+test.

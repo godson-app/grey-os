@@ -41,6 +41,11 @@ pub struct Compositor {
     pub windows: Windows,
     /// How many frames have been painted, for the report.
     pub frames: u64,
+    /// Where [`Self::draw_pointer`] last put the pointer, so a frame that moves it can have
+    /// the desktop repaint the triangle it left behind. The pointer is painted straight onto
+    /// the panel rather than composited from a damage rect, so nothing else covers it, and a
+    /// pointer that is never erased is a smear of triangles across every window it crosses.
+    pointer: Option<(i32, i32)>,
 }
 
 impl Compositor {
@@ -50,6 +55,7 @@ impl Compositor {
             theme,
             windows: Windows::new(width, height, theme.cascade),
             frames: 0,
+            pointer: None,
         }
     }
 
@@ -90,7 +96,17 @@ impl Compositor {
     ///
     /// The shape is a filled triangle with a one-pixel dark outline, drawn row by row: at this
     /// size the outline is what keeps a white pointer visible over a white window.
+    ///
+    /// A move damages the rect the last call covered, because the triangle is painted onto the
+    /// panel rather than composited: the desktop is what has to erase the old one, and it does
+    /// that on the next frame - the caller's [`Self::draw_damage`] or [`Self::draw_all`].
     pub fn draw_pointer(&mut self, canvas: &mut Canvas<'_>, x: i32, y: i32) -> Rect {
+        if let Some((previous_x, previous_y)) = self.pointer {
+            if (previous_x, previous_y) != (x, y) {
+                self.windows.damage(pointer_rect(previous_x, previous_y));
+            }
+        }
+        self.pointer = Some((x, y));
         const HEIGHT: i32 = 16;
         for row in 0..HEIGHT {
             let width = (row * 2 / 3).max(1);
@@ -101,8 +117,15 @@ impl Compositor {
             let fill = Rect::new(x + 1, y + row, width as u32, 1);
             canvas.fill_rect(fill, self.theme.pointer);
         }
-        Rect::new(x, y, (HEIGHT * 2 / 3) as u32 + 2, HEIGHT as u32)
+        pointer_rect(x, y)
     }
+}
+
+/// The rect a pointer at `(x, y)` covers: sixteen rows tall, and as wide as the widest of
+/// them plus the outline.
+fn pointer_rect(x: i32, y: i32) -> Rect {
+    const HEIGHT: i32 = 16;
+    Rect::new(x, y, (HEIGHT * 2 / 3) as u32 + 2, HEIGHT as u32)
 }
 
 impl Compositor {
@@ -447,6 +470,31 @@ mod tests {
         assert_eq!(covered.y, 40);
         assert!(covered.width >= 3);
         assert_eq!(covered.height, 16);
+    }
+
+    #[test]
+    fn a_pointer_that_moves_is_erased_where_it_was() {
+        let (mut desktop, mut surface) = compositor();
+        desktop.draw_all(&mut surface.canvas());
+        desktop.draw_pointer(&mut surface.canvas(), 50, 40);
+        // Drawn again where it is: nothing has to be repainted.
+        desktop.draw_pointer(&mut surface.canvas(), 50, 40);
+        assert_eq!(
+            desktop.windows.pending(),
+            0,
+            "an idle pointer damaged the panel"
+        );
+        desktop.draw_pointer(&mut surface.canvas(), 90, 40);
+        assert!(
+            desktop.windows.pending() > 0,
+            "the pointer moved and nothing asked for the one it left behind to be repainted"
+        );
+        let damage = desktop.draw_damage(&mut surface.canvas());
+        assert!(!damage.is_empty());
+        // The triangle is gone from where it was and still there where it went: a pointer that
+        // is drawn but never erased is a smear of triangles, which is what a preview showed.
+        assert_eq!(surface.pixel(50, 40), GREY.desktop);
+        assert_eq!(surface.pixel(90, 40), GREY.pointer_edge);
     }
 
     #[test]

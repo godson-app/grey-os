@@ -5,6 +5,7 @@
 //! ```text
 //! cargo xtask build   # stage both images in target/grey-os/
 //! cargo xtask run     # build, then boot the UEFI image in QEMU
+//! cargo xtask run --interactive   # the same boot, but the shell stays up (ADR-041)
 //! cargo xtask test    # build, boot clean, then boot a kernel per injected failure
 //! cargo xtask ci      # every gate in one command: fmt, lints, host tests, boot tests
 //! ```
@@ -52,6 +53,10 @@ const STORAGE_OK: &str = "grey-os: storage ok: boot";
 
 /// Variable that makes `kernel/build.rs` compile the listening input run in (M6).
 const INPUT_TEST_ENV: &str = "GREY_OS_INPUT_TEST";
+/// Variable that makes `kernel/build.rs` compile the preview in (ADR-041): the shell, with no
+/// tick deadline. Only `run --interactive` sets it, because a boot test would wait for a
+/// session that nobody is there to end.
+const INTERACTIVE_ENV: &str = "GREY_OS_INTERACTIVE";
 /// Printed once the input test is listening. The harness types only after it sees this:
 /// keystrokes sent before the 8042 is configured are dropped by the controller.
 const INPUT_LISTENING: &str = "grey-os: input test: listening";
@@ -91,6 +96,10 @@ const INPUT_READY: &str = "grey-os: input: keyboard on irq1";
 
 /// The theme's desktop colour, which the screenshot check looks for in the corners.
 const DESKTOP_COLOUR: [u8; 3] = [0x1f, 0x6f, 0x8b];
+/// A window's body colour, from the same theme. A preview's screenshot is judged on it: the
+/// boot log's background is [`DESKTOP_COLOUR`], so a log line painted after the desktop was
+/// composited replaces window pixels with the desktop's colour and the body stops matching.
+const WINDOW_BODY_COLOUR: [u8; 3] = [0x1a, 0x20, 0x26];
 /// The pointer's fill, which has to appear in a frame that drew one.
 const POINTER_COLOUR: [u8; 3] = [0xf5, 0xf8, 0xfa];
 /// Printed once the desktop has been composited. The harness takes its screenshot after it
@@ -101,7 +110,7 @@ const THEME_READY: &str = "grey-os: theme";
 /// Printed by a normal boot with the window list's shape on it (M7).
 const DESKTOP_READY: &str = "grey-os: desktop:";
 
-const USAGE: &str = "usage: cargo xtask <build|run|test|ci> [--no-build] [--bios]";
+const USAGE: &str = "usage: cargo xtask <build|run|test|ci> [--no-build] [--bios] [--interactive]";
 
 /// QEMU's `isa-debug-exit` reports `(value << 1) | 1`; the kernel sends 0x10.
 const EXIT_CLEAN: i32 = (0x10 << 1) | 1;
@@ -215,6 +224,9 @@ struct Options {
     build: bool,
     /// Boot the UEFI image (default); `--bios` picks the BIOS one.
     uefi: bool,
+    /// Build the preview kernel - the shell with no deadline - and keep the window up
+    /// (ADR-041). `run` only: no other command has anybody to type.
+    interactive: bool,
 }
 
 fn main() -> Result<ExitCode> {
@@ -224,16 +236,29 @@ fn main() -> Result<ExitCode> {
     let mut options = Options {
         build: true,
         uefi: true,
+        interactive: false,
     };
     for argument in arguments {
         match argument.as_str() {
             "--no-build" => options.build = false,
             "--bios" => options.uefi = false,
+            "--interactive" => options.interactive = true,
             other => bail!("unknown option `{other}`\n{USAGE}"),
         }
     }
     if !matches!(command.as_str(), "build" | "run" | "test" | "ci") {
         bail!("unknown command `{command}`\n{USAGE}");
+    }
+    // The preview is a kernel as much as the failure runs are: the flag decides what is
+    // compiled, so agreeing to boot a previously built image would boot whatever was there.
+    if options.interactive && !options.build {
+        bail!(
+            "`--interactive` has to build: it compiles the preview in with {INTERACTIVE_ENV}=1, \
+             and `--no-build` would boot the image left by the last build\n{USAGE}"
+        );
+    }
+    if options.interactive && command != "run" {
+        bail!("`--interactive` is for `run` only: nothing else has a keyboard\n{USAGE}");
     }
     // `test` flips `PANIC_TEST_ENV` and `EXCEPTION_TEST_ENV` and therefore has to rebuild for
     // every phase; agreeing to `--no-build` and then building anyway would be a lie, and
@@ -256,7 +281,14 @@ fn main() -> Result<ExitCode> {
     }
 
     if options.build {
-        build(&[])?;
+        // The preview is the one build that asks for `INTERACTIVE_ENV`; every other build,
+        // `test`'s phases included, gets a kernel that ends on its own.
+        let environment: &[(&str, &str)] = if options.interactive {
+            &[(INTERACTIVE_ENV, "1")]
+        } else {
+            &[]
+        };
+        build(environment)?;
     }
 
     match command.as_str() {
@@ -286,6 +318,10 @@ fn build(environment: &[(&str, &str)]) -> Result<()> {
     command
         .args(["build", "--package", "grey-os"])
         .current_dir(workspace_root());
+    // Every build starts from a normal kernel, whatever the caller's shell has exported: an
+    // inherited `GREY_OS_INTERACTIVE` would otherwise turn the boot tests into sessions that
+    // never exit. A caller that wants the preview says so below, and the last `env` wins.
+    command.env(INTERACTIVE_ENV, "0");
     for (key, value) in environment {
         command.env(key, value);
     }
@@ -347,6 +383,7 @@ fn ci() -> Result<ExitCode> {
     let options = Options {
         build: true,
         uefi: true,
+        interactive: false,
     };
     let _ = test(&options)?;
 
@@ -382,7 +419,23 @@ fn run(options: &Options) -> Result<ExitCode> {
     let status = boot_command(options, false)?
         .status()
         .context("failed to run qemu-system-x86_64")?;
+    if options.interactive {
+        return preview_exit(status);
+    }
     interpret(status)
+}
+
+/// Maps a preview's exit status, where two different endings are both correct.
+///
+/// `exit` in the shell is a finished boot and reports 33 like any other. Closing the window is
+/// the other way a session ends, and QEMU calls that 0 - a failure to the boot tests, whose
+/// whole point is that a kernel ends by itself, but the intended end of a session somebody
+/// walked away from.
+fn preview_exit(status: ExitStatus) -> Result<ExitCode> {
+    match status.code() {
+        Some(0) => Ok(ExitCode::SUCCESS),
+        _ => interpret(status),
+    }
 }
 
 /// Boots headless once per M0/M2/M3 failure path and asserts every one of them.
@@ -463,6 +516,8 @@ fn test(options: &Options) -> Result<ExitCode> {
     storage_persistence(options)?;
 
     input_path(options)?;
+
+    preview_path(options)?;
 
     let phases = panic_path(options).and_then(|()| exception_paths(options));
     // Restore the image the other commands boot whether the phases passed or not:
@@ -625,6 +680,104 @@ fn input_path(options: &Options) -> Result<()> {
     Ok(())
 }
 
+/// Boots the preview - the shell with no deadline - photographs it, and ends it with `exit`.
+///
+/// Two claims the other phases cannot make. The first is the panel: a preview holds the desktop
+/// up for as long as somebody is looking at it, so nothing may paint over it after the first
+/// frame - and in the first preview something did, the boot log, which turned the desktop into
+/// a terminal of log lines with fragments of windows in it. A headless boot cannot see that,
+/// and the input path never does: its panel is photographed after the boot has repainted what
+/// the log had covered. So this phase screenshots the preview while the shell is listening and
+/// measures it, which is the only moment the panel is up and nobody has repainted it.
+///
+/// The second claim is the ending. A preview's loop has no deadline, so the session lasts until
+/// `exit` is typed; that it then reports a finished boot and qemu's clean status is what keeps
+/// one exit-status contract for both kinds of run.
+fn preview_path(options: &Options) -> Result<()> {
+    println!("--- preview: rebuilding the kernel with {INTERACTIVE_ENV}=1");
+    build(&[(INTERACTIVE_ENV, "1")])?;
+
+    let socket = image_path("qmp.sock");
+    let _ = fs::remove_file(&socket);
+    let mut command = boot_command(options, true)?;
+    command.args([
+        "-qmp",
+        &format!("unix:{},server=on,wait=off", socket.display()),
+    ]);
+    println!("boot command: {command:?}");
+    let mut child = command
+        .spawn()
+        .context("failed to start qemu-system-x86_64")?;
+    let stdout = child.stdout.take().context("qemu's stdout was not piped")?;
+    // The serial log has to be watched while the guest runs: the panel is photographed on a
+    // line, not after the guest exits - in a preview it never exits on its own.
+    let (sender, receiver) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut log = String::new();
+    let mut photographed = false;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                log.push_str(&line);
+                log.push('\n');
+                if !photographed && line.contains(SHELL_LISTENING) {
+                    // Nothing is painted between this line and the photograph: the kernel
+                    // prints it before it waits for a key, and the loop after it repaints
+                    // only what a keystroke or a click damages.
+                    let path = image_path("preview.ppm");
+                    screenshot(&socket, &path)?;
+                    check_preview_screenshot(&path)?;
+                    println!("typing `exit` into the preview through qmp");
+                    let (mut stream, mut reader) = monitor(&socket)?;
+                    type_line(&mut stream, &mut reader, "exit")?;
+                    photographed = true;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if started.elapsed() > TEST_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "the preview did not finish within {}s; the kernel is hung\
+                         \n--- serial ---\n{log}",
+                        TEST_TIMEOUT.as_secs()
+                    );
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let status = child.wait().context("failed to collect qemu output")?;
+    if !photographed {
+        bail!("the kernel never reported `{SHELL_LISTENING}`\n--- serial ---\n{log}");
+    }
+    expect(
+        &log,
+        status.code(),
+        &[
+            SHELL_LISTENING,
+            "grey-os: shell: > exit",
+            SHELL_EXIT,
+            BOOT_OK,
+        ],
+        EXIT_CLEAN,
+    )?;
+    println!(
+        "pass: `{SHELL_LISTENING}` with the desktop still on the panel, `exit` typed into it, \
+         `{SHELL_EXIT}` and `{BOOT_OK}`, qemu exited {EXIT_CLEAN}"
+    );
+    Ok(())
+}
+
 /// Connects to QEMU's monitor, enables it, and types the keys.
 ///
 /// QMP speaks one JSON object per line, and every command is answered with either a
@@ -702,15 +855,27 @@ fn monitor(socket: &Path) -> Result<(UnixStream, BufReader<UnixStream>)> {
 fn type_commands(socket: &Path) -> Result<()> {
     let (mut stream, mut reader) = monitor(socket)?;
     for command in SHELL_COMMANDS {
-        for key in command.chars() {
-            qmp(&mut stream, &mut reader, &sendkey(&key_name(key)))?;
-            std::thread::sleep(Duration::from_millis(60));
-        }
-        qmp(&mut stream, &mut reader, &sendkey("ret"))?;
+        type_line(&mut stream, &mut reader, command)?;
         // Long enough for the command to run and its answer to be drawn.
         std::thread::sleep(Duration::from_millis(250));
     }
     Ok(())
+}
+
+/// Types one line into the guest and presses Enter, on an open monitor connection.
+///
+/// One keystroke per round trip, spaced out: the controller's buffer holds a couple of bytes
+/// and the kernel's queue is drained between them.
+fn type_line(
+    stream: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    line: &str,
+) -> Result<()> {
+    for key in line.chars() {
+        qmp(stream, reader, &sendkey(&key_name(key)))?;
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    qmp(stream, reader, &sendkey("ret"))
 }
 
 /// QEMU's name for a character the monitor does not accept as itself.
@@ -758,16 +923,12 @@ fn screenshot(socket: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Checks that the screenshot is a desktop rather than a blank panel.
+/// The dimensions and raw RGB of a raw PPM, which is the format a QEMU screendump writes.
 ///
-/// Three claims, each of which a compositor that drew nothing or drew it wrong would fail:
-/// the corners are the theme's desktop colour, the frame holds several distinct colours (so
-/// windows were painted on it), and the pointer's fill appears somewhere. The file is kept
-/// under `target/` so a person can look at what the test measured.
-fn check_screenshot(path: &Path) -> Result<()> {
+/// P6, then width, height, the maximum value, then raw RGB. QEMU writes exactly that, so the
+/// tokens are read rather than a general PPM parser written.
+fn read_panel(path: &Path) -> Result<(usize, usize, Vec<u8>)> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    // P6, then width, height, the maximum value, then raw RGB. QEMU writes exactly that, so
-    // the tokens are read rather than a general PPM parser written.
     let mut tokens = Vec::new();
     let mut cursor = 0;
     while tokens.len() < 4 {
@@ -797,7 +958,7 @@ fn check_screenshot(path: &Path) -> Result<()> {
             tokens[3]
         );
     }
-    let pixels = &bytes[cursor..];
+    let pixels = bytes[cursor..].to_vec();
     if pixels.len() < width * height * 3 {
         bail!(
             "{} holds {} bytes of pixels, not {} for {width}x{height}",
@@ -806,6 +967,17 @@ fn check_screenshot(path: &Path) -> Result<()> {
             width * height * 3
         );
     }
+    Ok((width, height, pixels))
+}
+
+/// Checks that the screenshot is a desktop rather than a blank panel.
+///
+/// Three claims, each of which a compositor that drew nothing or drew it wrong would fail:
+/// the corners are the theme's desktop colour, the frame holds several distinct colours (so
+/// windows were painted on it), and the pointer's fill appears somewhere. The file is kept
+/// under `target/` so a person can look at what the test measured.
+fn check_screenshot(path: &Path) -> Result<()> {
+    let (width, height, pixels) = read_panel(path)?;
     let pixel = |x: usize, y: usize| -> [u8; 3] {
         let index = (y * width + x) * 3;
         [pixels[index], pixels[index + 1], pixels[index + 2]]
@@ -851,6 +1023,53 @@ fn check_screenshot(path: &Path) -> Result<()> {
     println!(
         "pass: {width}x{height} screenshot, {} distinct colours, {pointer_pixels} pointer pixels, saved to {}",
         distinct.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// Checks that the panel under a running shell is still the desktop.
+///
+/// The claim is one band of the shell window's body: `kernel/src/main.rs` puts that window at
+/// 80,380 and gives it 720x380, so the rows just under its title bar - clear of the prompt
+/// above and of the window overlapping its bottom left below - belong to it and nothing else.
+/// The boot log's background is the desktop's colour, so a line of the log painted after the
+/// desktop composites replaces window pixels with teal and text: a band that is mostly window
+/// colour is a band the log did not paint over. Sampled across the band rather than at one
+/// pixel, because the text of a window that moved underneath would not shift it much.
+fn check_preview_screenshot(path: &Path) -> Result<()> {
+    /// The band: x from 300 to 790, y from 440 to 468, on the 1280x800 panel OVMF picks.
+    const BAND: (std::ops::Range<usize>, std::ops::Range<usize>) = (300..790, 440..468);
+    let (width, height, pixels) = read_panel(path)?;
+    if width < BAND.0.end || height < BAND.1.end {
+        bail!(
+            "{} is {width}x{height}, smaller than the panel this check was written for",
+            path.display()
+        );
+    }
+    let mut body = 0usize;
+    let mut total = 0usize;
+    for y in BAND.1 {
+        for x in BAND.0.clone() {
+            let index = (y * width + x) * 3;
+            let colour = [pixels[index], pixels[index + 1], pixels[index + 2]];
+            total += 1;
+            if colour == WINDOW_BODY_COLOUR {
+                body += 1;
+            }
+        }
+    }
+    // Nine in ten: the band is empty body, so anything above a tenth of it being some other
+    // colour is something drawn on top of the desktop.
+    if body * 10 < total * 9 {
+        bail!(
+            "{}: {body} of {total} pixels in the shell window's body are {WINDOW_BODY_COLOUR:?}, \
+             so something painted over the desktop after it was composited",
+            path.display()
+        );
+    }
+    println!(
+        "pass: {body} of {total} pixels of the shell window's body still hold the window colour, saved to {}",
         path.display()
     );
     Ok(())

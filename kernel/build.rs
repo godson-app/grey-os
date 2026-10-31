@@ -41,10 +41,12 @@ fn main() {
     println!("cargo::rerun-if-env-changed=GREY_OS_PANIC_TEST");
     println!("cargo::rerun-if-env-changed=GREY_OS_EXCEPTION_TEST");
     println!("cargo::rerun-if-env-changed=GREY_OS_INPUT_TEST");
+    println!("cargo::rerun-if-env-changed=GREY_OS_INTERACTIVE");
     // Declares the cfgs so `--check-cfg` accepts them rather than warning about a cfg
     // nothing in this workspace is expected to set.
     println!("cargo::rustc-check-cfg=cfg(grey_os_panic_test)");
     println!("cargo::rustc-check-cfg=cfg(grey_os_input_test)");
+    println!("cargo::rustc-check-cfg=cfg(grey_os_interactive)");
     for (_, cfg) in FAULTS {
         println!("cargo::rustc-check-cfg=cfg({cfg})");
     }
@@ -57,6 +59,19 @@ fn main() {
     };
     if input {
         println!("cargo::rustc-cfg=grey_os_input_test");
+    }
+
+    // A preview has somebody at the keyboard by definition, so it compiles the shell in and
+    // lets it run until `exit` (ADR-041). Separate from the input run, whose loop has to end
+    // on its own because a harness is waiting for the process. `xtask` sets this for
+    // `run --interactive` and clears it for everything else; `cargo run` passes whatever the
+    // shell has exported.
+    let interactive = match std::env::var_os("GREY_OS_INTERACTIVE") {
+        Some(value) => !value.is_empty() && value != "0",
+        None => false,
+    };
+    if interactive {
+        println!("cargo::rustc-cfg=grey_os_interactive");
     }
 
     // Empty or `0` counts as off. `=1` is the documented spelling, but rejecting
