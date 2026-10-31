@@ -11,10 +11,10 @@ use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use grey_os::{
-    arena, compositor, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap, idt, keyboard,
-    memory, mouse, paging, pic, qemu, scheduler, serial, theme, timer, window,
+    apps, arena, compositor, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap, idt,
+    keyboard, memory, mouse, paging, pic, qemu, scheduler, serial, theme, timer, vm, window,
 };
 // The shell only exists in the acceptance build: a normal boot has no way to type into it and
 // a kernel that waited for a command would hang the harness's clean boot.
@@ -793,8 +793,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // The first storage (M5): an ATA drive in PIO mode, and `greyfs` over it. This runs
     // before the interrupts because every transfer here polls a status register; the
     // filesystem needs the arena for its directory, which is why it cannot run earlier.
-    #[allow(unused_mut)]
-    let mut storage = storage();
+    //
+    // From M9 it lives in the arena: an application task has its own stack and cannot borrow
+    // the boot task's storage, so it reaches the filesystem through [`with_storage`].
+    let storage: &'static mut Option<fs::Filesystem<disk::Pio>> =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(storage()));
+    STORAGE.store(storage as *mut _, Ordering::Relaxed);
 
     // Interrupts last, and in this order: the PIC is remapped before any line is unmasked,
     // the timer claims IRQ0 and installs its handler, and only then is `IF` set. Enabling
@@ -984,9 +988,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         720,
         380,
     );
+    // M9: where the applications write. Its own window, because a program's output and a
+    // task's progress are two different claims.
+    let apps_window = desktop.windows.create(
+        "apps",
+        alloc::vec![alloc::string::String::from(
+            "three programs from /apps, run by tasks",
+        )],
+        520,
+        300,
+    );
     let _ = desktop.windows.move_to(tasks_window, 820, 60);
     let _ = desktop.windows.move_to(shell_window, 80, 380);
+    let _ = desktop.windows.move_to(apps_window, 300, 470);
     TASKS_WINDOW.store(tasks_window, Ordering::Relaxed);
+    APPS_WINDOW.store(apps_window, Ordering::Relaxed);
 
     // The desktop moves into the arena so a task can draw into it: a task has its own stack
     // and cannot borrow the boot's.
@@ -997,20 +1013,32 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let counter = scheduler::spawn("counter", task_counter);
     let sleeper = scheduler::spawn("sleeper", task_sleeper);
     let worker = scheduler::spawn("worker", task_worker);
-    if counter.is_none() || sleeper.is_none() || worker.is_none() {
+    // M9: one task per application. Each reads its program from the disk, parses it, and
+    // interprets it until it halts.
+    let hello = scheduler::spawn("hello", task_hello);
+    let count = scheduler::spawn("count", task_count);
+    let fib = scheduler::spawn("fib", task_fib);
+    if counter.is_none()
+        || sleeper.is_none()
+        || worker.is_none()
+        || hello.is_none()
+        || count.is_none()
+        || fib.is_none()
+    {
         println!("grey-os: FATAL: the scheduler refused a task");
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
     }
     // The boot task takes part: it yields until every task has finished, redrawing what they
-    // wrote. That is what makes this a scheduler rather than three function calls.
+    // wrote. That is what makes this a scheduler rather than six function calls.
+    let expected = 6;
     let deadline = timer::ticks() + 600;
-    while scheduler::stats().finished < 3 && timer::ticks() < deadline {
+    while scheduler::stats().finished < expected && timer::ticks() < deadline {
         scheduler::yield_now();
         redraw(desktop);
         timer::wait_ticks(1);
     }
     let finished = scheduler::stats();
-    if finished.finished < 3 {
+    if finished.finished < expected {
         println!(
             "grey-os: FATAL: {} of {} tasks finished, {} switches, {} lines written",
             finished.finished,
@@ -1028,6 +1056,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         TASK_LINES.load(Ordering::Relaxed),
         scheduler::stack_bytes(counter.unwrap_or(0)) / 1024
     );
+    println!(
+        "grey-os: apps ok: {} of {} programs ran from /apps, {} lines of output, {} instructions",
+        apps::NAMES.len(),
+        apps::NAMES.len(),
+        APP_LINES.load(Ordering::Relaxed),
+        APP_STEPS.load(Ordering::Relaxed)
+    );
 
     // The shell: the input run drives it with typed commands, and a normal boot lets it run
     // for a second so the window is not empty. There is no way to end a session except
@@ -1035,7 +1070,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // loop is bounded by ticks rather than open-ended.
     #[cfg(grey_os_input_test)]
     {
-        run_shell(&mut *desktop, shell_window, &mut storage);
+        run_shell(&mut *desktop, shell_window, &mut *storage);
     }
 
     // The panel is repainted in full *before* the line that says the desktop is ready: a
@@ -1341,6 +1376,14 @@ fn storage() -> Option<fs::Filesystem<disk::Pio>> {
         "grey-os: greyfs: wrote /{BOOT_COUNT} ({} bytes at sector {}), read back and compared",
         entry.len, entry.start
     );
+    // M9: the applications. Written on the boot that formats the disk (or the boot whose files
+    // do not match), and read back by the tasks in `kernel_main` - a program the kernel writes
+    // to the filesystem and then loads from it is the whole point of the milestone.
+    let (written, app_bytes) = install_apps(&mut filesystem);
+    println!(
+        "grey-os: apps: {written} program(s) written this boot, {app_bytes} bytes of bytecode on disk, {} slot(s) used",
+        filesystem.count()
+    );
     println!(
         "grey-os: storage ok: boot {boot} of this image, {} file(s), {} of {} sectors in use",
         filesystem.count(),
@@ -1348,6 +1391,31 @@ fn storage() -> Option<fs::Filesystem<disk::Pio>> {
         filesystem.superblock().sectors
     );
     Some(filesystem)
+}
+
+/// Writes the applications onto `filesystem` and returns how many were written and how many
+/// bytes of bytecode the disk now holds.
+///
+/// A program already on the disk that matches byte for byte is left alone, so the count in the
+/// log is about this boot rather than about the disk's history. A program that does *not* match
+/// is rewritten, which leaks its old extent - the same "not yet" `greyfs` documents for every
+/// replacement, and the reason this only happens when the kernel's own applications change.
+fn install_apps(filesystem: &mut fs::Filesystem<disk::Pio>) -> (usize, usize) {
+    let mut written = 0;
+    let mut bytes_total = 0;
+    for (name, bytes) in apps::all() {
+        bytes_total += bytes.len();
+        match filesystem.read(name) {
+            Ok(existing) if existing == bytes => continue,
+            Ok(_) | Err(fs::FsError::NotFound) => {}
+            Err(error) => fatal_storage(error),
+        }
+        match filesystem.write(name, &bytes, fs::Kind::Program) {
+            Ok(_) => written += 1,
+            Err(error) => fatal_storage(error),
+        }
+    }
+    (written, bytes_total)
 }
 
 /// The number a `/boot-count` file holds, or zero if it holds something else.
@@ -1404,6 +1472,30 @@ static TASKS_WINDOW: AtomicU32 = AtomicU32::new(0);
 
 /// How many lines the tasks have written, for the report.
 static TASK_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// The window the applications write into.
+static APPS_WINDOW: AtomicU32 = AtomicU32::new(0);
+
+/// How many lines the applications have produced, and how many instructions they ran.
+static APP_LINES: AtomicU64 = AtomicU64::new(0);
+static APP_STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// The filesystem, published the way the desktop is: an application task has its own stack and
+/// cannot borrow the boot task's storage.
+static STORAGE: AtomicPtr<Option<fs::Filesystem<disk::Pio>>> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+/// Runs `use_fs` against the filesystem, or returns `None` if the boot has not published it.
+fn with_storage<R>(use_fs: impl FnOnce(&mut fs::Filesystem<disk::Pio>) -> R) -> Option<R> {
+    let pointer = STORAGE.load(Ordering::Relaxed);
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: the pointer is a leaked `&'static mut` and is never replaced, so a non-null value
+    // is live; the borrow ends when `use_fs` returns, and no other task can run while it is
+    // held - every task here is cooperative, and nothing inside `use_fs` yields.
+    unsafe { (*pointer).as_mut().map(use_fs) }
+}
 
 /// Runs `draw` against the desktop, or returns `None` if the boot has not published it yet.
 fn with_desktop<R>(draw: impl FnOnce(&mut compositor::Compositor) -> R) -> Option<R> {
@@ -1490,6 +1582,125 @@ fn task_worker() {
         task_line(alloc::format!("worker: pass {step}"));
         scheduler::yield_now();
     }
+}
+
+/// Steps an application gets before the kernel stops it.
+///
+/// A program written in an infinite loop ends as `StepLimit` rather than as a hung machine; the
+/// budget is generous enough for the three programs on the disk by three orders of magnitude.
+const APP_BUDGET: u32 = 100_000;
+
+/// Adds a line to the apps window and to serial, and damages the window so [`redraw`] paints it.
+///
+/// Serial as well as pixels for the same reason the task lines do it: a program's output is the
+/// proof that it ran, and a proof only the screenshot can see is one the harness cannot read.
+fn app_line(line: alloc::string::String) {
+    APP_LINES.fetch_add(1, Ordering::Relaxed);
+    serial::print_args(format_args!("grey-os: app: {line}"));
+    let window = APPS_WINDOW.load(Ordering::Relaxed);
+    with_desktop(|desktop| {
+        if let Some(app_window) = desktop.windows.window_mut(window) {
+            app_window.push_line(line);
+            let rect = app_window.rect;
+            desktop.windows.damage(rect);
+        }
+    });
+}
+
+/// The [`vm::Host`] an application runs against.
+///
+/// Output arrives as fragments, so the host assembles them into lines: a window holds lines, and
+/// a program that prints a number and a space should not produce a line per number. `Sleep`
+/// becomes a real [`scheduler::sleep_ticks`], which is what keeps a program from being a loop
+/// that never lets another task run.
+#[derive(Default)]
+struct AppHost {
+    line: alloc::string::String,
+}
+
+impl AppHost {
+    /// Empties the partial line, if there is one, into the window.
+    fn flush(&mut self) {
+        if self.line.is_empty() {
+            return;
+        }
+        let line = core::mem::take(&mut self.line);
+        app_line(line);
+    }
+}
+
+impl vm::Host for AppHost {
+    fn write(&mut self, text: &str) {
+        for character in text.chars() {
+            if character == '\n' {
+                self.flush();
+            } else {
+                self.line.push(character);
+            }
+        }
+    }
+
+    fn sleep(&mut self, ticks: u16) {
+        // The partial line is finished first: a program that prints half a line, sleeps, then
+        // prints the rest should not have the two halves glued across the sleep.
+        self.flush();
+        scheduler::sleep_ticks(u64::from(ticks));
+    }
+}
+
+/// Runs one program from the disk: read, parse, interpret, report.
+///
+/// Every failure is a line in the window rather than a panic, because a bad file is exactly the
+/// case this path exists to survive.
+fn run_app(name: &'static str) {
+    let bytes = match with_storage(|filesystem| filesystem.read(name)) {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(error)) => {
+            app_line(alloc::format!("{name}: {error:?}"));
+            return;
+        }
+        None => {
+            app_line(alloc::format!("{name}: no storage"));
+            return;
+        }
+    };
+    let program = match vm::Program::parse(&bytes) {
+        Ok(program) => program,
+        Err(error) => {
+            app_line(alloc::format!("{name}: not a program: {error:?}"));
+            return;
+        }
+    };
+    let mut host = AppHost::default();
+    let mut machine = vm::Machine::new();
+    let result = machine.run(&program, &mut host, APP_BUDGET);
+    host.flush();
+    match result {
+        Ok(vm::Outcome::Halted { steps }) => {
+            APP_STEPS.fetch_add(u64::from(steps), Ordering::Relaxed);
+            app_line(alloc::format!(
+                "{name}: halted after {steps} steps, {} bytes of code, {} of strings",
+                program.code_len(),
+                program.pool_len()
+            ));
+        }
+        Err(error) => app_line(alloc::format!("{name}: stopped: {error:?}")),
+    }
+}
+
+/// `apps/hello.gvm`: prints, sleeps, prints.
+fn task_hello() {
+    run_app(apps::HELLO);
+}
+
+/// `apps/count.gvm`: a loop with a local.
+fn task_count() {
+    run_app(apps::COUNT);
+}
+
+/// `apps/fib.gvm`: two locals and a swap through them.
+fn task_fib() {
+    run_app(apps::FIB);
 }
 /// How long the shell listens before the boot continues.
 ///

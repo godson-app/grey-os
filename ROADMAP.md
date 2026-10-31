@@ -5,7 +5,7 @@ acceptance criteria are demonstrated by output, not by code existing: the proof 
 a `xtask test` run or a QEMU session whose serial log is pasted into the commit
 message. No milestone is started before the previous one is accepted.
 
-Scope for M0 to M8 is agreed. M9 onward is stated as themes in dependency order:
+Scope for M0 to M9 is agreed. M10 onward is stated as themes in dependency order:
 the authoritative wording comes from the engineering brief and is transcribed here milestone by
 milestone, so that this file never claims more than was agreed.
 
@@ -22,7 +22,7 @@ milestone, so that this file never claims more than was agreed.
 | M6        | Input: keyboard and pointer                  | **Done** - criteria 1-5 met; no repeat or keymaps (ADR-033) |
 | M7        | Compositor, windows, theme                   | **Done** - criteria 1-5 met; TrueType still open (ADR-034) |
 | M8        | Shell and process model                      | **Done** - criteria 1-5 met; cooperative (ADR-035)          |
-| M9        | Applications                                 | Not started                                                |
+| M9        | Applications                                 | **Done** - criteria 1-5 met; bytecode (ADR-036)            |
 | M10       | SMP, ports, polish                           | Not started                                                |
 
 ## M0 - Boot, serial diagnostics, diagnosable panics
@@ -733,7 +733,88 @@ sleeper asked for forty ticks and got them, and only the timer can have woken it
 shell existed, and the shell read it through the filesystem rather than from a copy. Criterion 5 is 24
 host tests, five in `scheduler` and nineteen in `shell`; 223 on the host in total.
 
-## M9 onward - provisional themes
+## M9 - Applications
+
+**Goal.** A program that is a file rather than a function. Everything so far has been linked into one
+image; M9 adds a program format, a machine that runs it, a way to get one onto the disk, and a task
+that loads one from the filesystem and puts its output in a window.
+
+**Agreed shape** (ADR-036): bytecode, not native code. A `GVM1` file is a header, code, and a pool of
+NUL-terminated strings, for a stack machine with 32 cells, 16 locals and 22 opcodes; the parser
+validates every jump, pool offset and local index before the first instruction runs, and the
+interpreter's only failures are underflow, overflow, division by zero and a step budget. Output and
+sleeping go through a `Host` trait, so a host test can record what a program printed and the kernel
+can put it in a window.
+
+**Landed.**
+
+- [x] `vm.rs`: the format, `Program::parse` with a refusal for every way a file can be wrong
+      (`BadMagic`, `BadVersion`, `Truncated`, `TooLarge`, `BadOpcode`, `BadJump`, `BadPool`,
+      `BadLocal`), and the `Machine` with `run(budget) -> Outcome::Halted { steps }`, whose only
+      failures are `StackUnderflow`, `StackOverflow`, `DivideByZero` and `StepLimit`.
+- [x] The 22 opcodes: arithmetic and comparison, `dup`/`drop`/`swap`, absolute jumps, `load`/`store`,
+      `puts`/`print`/`print_char`, `sleep` and `halt`.
+- [x] A `Builder` assembler, so the kernel's applications are readable code rather than hex:
+      `jump_ahead`/`patch` for the forward jump an assembler cannot resolve in one pass.
+- [x] `apps.rs`: three programs - `apps/hello.gvm`, `apps/count.gvm`, `apps/fib.gvm` - written to
+      `greyfs` as `Kind::Program` files on the boot that formats the disk, and left alone when the
+      bytes already match.
+- [x] One task per application: each reads its file, parses it, interprets it with a 100 000 step
+      budget, and pushes its output into a new `apps` window and to serial.
+- [x] `STORAGE`, the filesystem published through an `AtomicPtr` the way the desktop is, because a
+      task has its own stack; the boot now waits for six tasks, not three.
+- [x] 18 host tests: the parser's refusals, arithmetic and comparison, a loop over a local, the stack
+      limits, the budget, the assembler round trip, and the three programs' exact output.
+- [x] `cargo xtask test` asserts the install line, the three programs' output lines, the halt lines and
+      the summary on the clean boot.
+
+**Open.** No ELF, no user mode and no per-program address space: isolation is "cannot reach anything
+but its own stack and locals", not "cannot reach the kernel". No function calls, arrays, heap strings,
+arguments, file access or drawing. Programs cannot start other programs, and the shell has no command
+to run one - the boot starts them. The step budget is a constant rather than a time slice.
+
+**Acceptance criteria.**
+
+1. Programs are files: the kernel writes them to the filesystem, the boot log reports how many bytes
+   and how many slots, and a later boot finds them already there rather than rewriting them.
+2. A program is loaded from the disk and run by a task: the log shows the load, the parse and the halt
+   step count for each, and a task that is still running interleaves with it.
+3. Output is the program's, not the kernel's: `fib` prints `0 1 1 2 3 5 8 13 21 34` and `count` prints
+   `1 2 3 4 5`, both produced by instructions the interpreter executed.
+4. A malformed file cannot fault the machine: each refusal has a host test, and the interpreter is only
+   reachable with a validated program.
+5. A program that misbehaves ends, and the window says why: division by zero is an error and an
+   infinite loop is `StepLimit`, neither of which hangs the boot.
+
+**Status against them.** All five met. The clean boot prints, after the task lines:
+
+```text
+grey-os: apps: 3 program(s) written this boot, 205 bytes of bytecode on disk, 4 slot(s) used
+...
+grey-os: app: hello from apps/hello.gvm
+grey-os: app: 1 2 3 4 5
+grey-os: app: apps/count.gvm: halted after 67 steps, 38 bytes of code, 2 of strings
+grey-os: app: 0 1 1 2 3 5 8 13 21 34
+grey-os: app: apps/fib.gvm: halted after 193 steps, 70 bytes of code, 2 of strings
+grey-os: app: goodbye from 20 ticks later
+grey-os: app: apps/hello.gvm: halted after 4 steps, 10 bytes of code, 56 of strings
+grey-os: apps ok: 3 of 3 programs ran from /apps, 7 lines of output, 264 instructions
+```
+
+Criterion 1 is `205 bytes ... 4 slot(s) used` on the formatting boot and `0 program(s) written` on
+every boot after it. Criterion 2 is the halt lines: each names the file, the program's byte count and
+the instructions it took, and each was read back through `greyfs` rather than from a copy in the
+image. Criterion 3 is the two series, which only the interpreter can produce - the numbers are
+computed by `Add` and `Mod` on a stack, not stored. Criterion 4 is the eight parser refusals, a test
+each, and an interpreter that cannot be reached without one of them having passed. Criterion 5 is the
+budget in `run` and the divide-by-zero check, both host-tested.
+
+The interleaving is worth reading in full, because it is the milestone: `hello` prints, sleeps twenty
+ticks, and its `goodbye` arrives after the counter's five steps and the worker's three passes, while
+`count` and `fib` finish in between.
+
+## M10 onward - provisional themes
+
 
 The ordering above is dependency-driven and each theme is a milestone of its own.
 Detailed scope, acceptance criteria and verification are added when the milestone

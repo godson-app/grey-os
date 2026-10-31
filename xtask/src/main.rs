@@ -68,6 +68,14 @@ const SHELL_LISTENING: &str = "grey-os: shell: listening";
 const SHELL_EXIT: &str = "grey-os: shell: exit";
 /// Printed by the task demonstration (M8).
 const SCHED_OK: &str = "grey-os: sched ok:";
+/// Printed by the application demonstration (M9): the programs installed on the disk, and what
+/// they printed when a task ran them.
+const APPS_INSTALLED: &str = "grey-os: apps: 3 program(s) written this boot";
+const APPS_OK: &str = "grey-os: apps ok:";
+const APP_HELLO: &str = "grey-os: app: hello from apps/hello.gvm";
+const APP_COUNT: &str = "grey-os: app: 1 2 3 4 5";
+const APP_FIB: &str = "grey-os: app: 0 1 1 2 3 5 8 13 21 34";
+const APP_HALTED: &str = "halted after";
 /// Printed by a normal boot once the keyboard has been configured and its handler installed
 /// (M6). The mouse's line follows it, but a machine without a pointer is allowed.
 const INPUT_READY: &str = "grey-os: input: keyboard on irq1";
@@ -303,6 +311,7 @@ fn test(options: &Options) -> Result<ExitCode> {
             ATA_DISK,
             GREYFS_FORMATTED,
             GREYFS_WRITE,
+            APPS_INSTALLED,
             &format!("{STORAGE_OK} 1"),
             INPUT_READY,
             "grey-os: input ready:",
@@ -310,6 +319,11 @@ fn test(options: &Options) -> Result<ExitCode> {
             DESKTOP_READY,
             COMPOSITOR_OK,
             SCHED_OK,
+            APPS_OK,
+            APP_HELLO,
+            APP_COUNT,
+            APP_FIB,
+            APP_HALTED,
         ],
         EXIT_CLEAN,
     )?;
@@ -317,6 +331,10 @@ fn test(options: &Options) -> Result<ExitCode> {
         "pass: `{BOOT_OK}` and the memory bring-up lines seen on serial, qemu exited {EXIT_CLEAN}"
     );
     println!("pass: `{ATA_DISK}` driven, `{GREYFS_FORMATTED}` on a blank disk and the counter written back");
+    println!(
+        "pass: `{APPS_INSTALLED}`, then `{APP_COUNT}` and `{APP_FIB}` printed by the interpreter, \
+         each program's `{APP_HALTED}` line and `{APPS_OK}` seen"
+    );
 
     storage_persistence(options)?;
 

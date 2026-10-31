@@ -877,7 +877,73 @@ page-aligned top, both recorded as open. The arena's address is a constant, not 
 first user-space mapping is where that stops being a placeholder.
 
 
-## ADR-035: Cooperative tasks with real stacks, and a shell that is a parser plus a window
+## ADR-036: An application is a file for a stack machine, run by a task
+
+**Status:** accepted, M9.
+
+**Context.** "Applications" is the first milestone that asks for a program the kernel did not compile
+in. Everything so far has been code linked into one image: the shell is a `match`, the tasks are
+functions. A file on the disk that the kernel loads and runs is a different claim, and it has two
+possible shapes. Native code needs an ELF loader, a per-program address space, a stack the program
+cannot corrupt and a jump into ring 3 with a way back - four subsystems, none of which exist, and
+three of which are milestones of their own. A bytecode needs a parser and an interpreter.
+
+**Decision.** The bytecode. A program is a `GVM1` file: a nine-byte header (magic, version, code
+length, pool length), code, and a pool of NUL-terminated strings. The machine is a stack: 32 cells of
+`i32`, sixteen locals, and twenty-two opcodes - arithmetic, comparison, `dup`/`drop`/`swap`, absolute
+jumps, `load`/`store`, `puts`/`print`/`print_char`, and `sleep`. Output and waiting go through a
+two-method `Host` trait, which is what lets a host test record what a program printed and a window
+receive it from a task.
+
+Validation happens in `Program::parse`, never in the interpreter: every jump target is inside the
+code, every pool offset inside the pool, every local index below sixteen, every `Push` has its four
+bytes. The interpreter's only error paths are the ones a *valid* program can still reach - underflow,
+overflow, division by zero, and the step budget. That split is the decision: a malformed file is
+rejected before a single instruction runs, so "this program cannot fault the machine" is a property of
+the parser, and the parser is host-tested.
+
+The kernel assembles its own applications with a `Builder` rather than carrying hex arrays. Three
+programs: `apps/hello.gvm` (prints, sleeps twenty ticks, prints), `apps/count.gvm` (a loop with a
+comparison and a local), `apps/fib.gvm` (two locals and a swap through them). They are written by
+`install_apps` on the boot that formats the disk, and rewritten only if their bytes changed. Each is
+then run the way a program should be: one task per program, reading the file back through the
+filesystem, parsing it, interpreting it with a budget of 100 000 instructions, and pushing its output
+into the `apps` window and to serial.
+
+**What building it taught.**
+
+1. `print_char` of a negative value was `value.max(0) as u32`, so `-1` became `char::from_u32(0)` -
+   a NUL, printed invisibly, and the test expected `?`. The rule is now stated as a rule: a value that
+   is not a character, or is a control character, prints `?`. Invisible output is worse than an
+   obviously wrong one.
+2. Running off the end of the code is a halt rather than a read past it, and the budget counts the
+   step that discovers there is nothing left: a program of two instructions reports three steps. My
+   first version of that test asserted two, and the machine was right - which is the useful kind of
+   failure, because it forced the behaviour to be written down instead of assumed.
+3. A forward jump is the one thing an assembler cannot resolve in a single pass, and hand-patching an
+   offset after `finish` means knowing where the header ends - a test did exactly that, subtracting
+   `HEADER` by hand, before `jump_ahead` and `patch` gave the two halves of the operation names.
+
+**Why the count is not the point.** `fib(10)` takes 193 steps and `count(5)` takes 67, and neither
+number matters; what matters is that both programs are bytes in a filesystem that a task opened,
+parsed, and ran, and that their output arrived in a window while the counter and worker tasks were
+still running. The step counts are in the log because they are evidence that the interpreter, not the
+kernel, produced the numbers.
+
+**Consequences.** `vm` and `apps` are library modules with 18 host tests, so the format and the
+machine are checked without a disk or a screen. `main.rs` grows a second published pointer -
+`STORAGE`, an `AtomicPtr` to a leaked `&'static mut` - because an application task has its own stack
+and cannot borrow the boot's filesystem, exactly as ADR-035 did for the desktop. The boot waits for
+six tasks instead of three: the three demonstrations and one per application.
+
+**Open.** No ELF, no user mode, no per-program address space: a program can address only its own stack
+and locals, which is a smaller surface than a process but not the same thing as isolation from the
+kernel. No function calls, no loops other than jumps, no arrays, no strings in memory - the pool is
+read-only and `Puts` is the only way to reach it. No arguments: `count(5)` and `fib(10)` are baked into
+the bytes by the kernel that assembles them. Programs cannot open files, spawn tasks or draw. The
+shell has no command to run one; they are started by the boot.
+
+
 
 **Status:** accepted, M8.
 

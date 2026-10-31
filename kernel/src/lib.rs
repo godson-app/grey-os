@@ -22,6 +22,7 @@
 // crate here lets the console's `Vec` and `String` be written once for both builds.
 extern crate alloc;
 
+pub mod apps;
 pub mod arena;
 pub mod canvas;
 pub mod compositor;
@@ -43,6 +44,7 @@ pub mod shell;
 pub mod text;
 pub mod theme;
 pub mod timer;
+pub mod vm;
 pub mod window;
 
 #[cfg(target_arch = "x86_64")]
