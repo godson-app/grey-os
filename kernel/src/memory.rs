@@ -10,9 +10,11 @@
 //! screen at a moment nobody can predict. So the audit names the framebuffer's
 //! physical span, and `pick_heap_region` refuses anything that touches it.
 //!
-//! What is left of the chosen region is split once more: the last whole page becomes a guard,
-//! which M3 leaves unmapped so that a write past the end of the heap faults instead of landing
-//! in whatever follows.
+//! What the picker chooses is where the bootstrap lives: the frame allocator's bitmap and the
+//! console come out of a window-mapped region, because nothing can map a page before a frame
+//! exists. M3 ended that region with a hand-unmapped guard page; M4 grows the heap in an arena
+//! of its own and the guard is the first page the arena never mapped, so the picker no longer
+//! splits anything (ADR-031).
 
 /// Bytes in a page and in a frame: x86_64's smallest mapping granule, and the unit the
 /// frame allocator and every page table below work in.
@@ -93,33 +95,6 @@ pub fn pick_heap_region(
         }
     }
     best
-}
-
-/// Splits a heap region into the part a heap may use and the one page at its end to leave
-/// unmapped.
-///
-/// The guard is the last page *fully inside* the region, so writing one byte past the end of
-/// the heap lands in it: M3's fault test writes exactly there and expects a `#PF`. Rounding
-/// inwards matters for a region whose firmware-reported end is not page-aligned - a guard
-/// there would take a page that belongs to whatever follows.
-///
-/// A region with less than two whole pages has none to spare, so it comes back whole and
-/// unguarded: a heap too small for one object is worse than an unguarded one, and the caller
-/// reports which it got.
-pub fn split_guard_page(span: Span) -> (Span, Option<Span>) {
-    if span.len() < 2 * PAGE_BYTES {
-        return (span, None);
-    }
-    let aligned_end = span.end & !(PAGE_BYTES - 1);
-    let guard_start = aligned_end - PAGE_BYTES;
-    // One whole page has to be left for the heap itself.
-    if guard_start < span.start + PAGE_BYTES {
-        return (span, None);
-    }
-    (
-        Span::new(span.start, guard_start),
-        Some(Span::new(guard_start, aligned_end)),
-    )
 }
 
 #[cfg(test)]
@@ -240,54 +215,5 @@ mod tests {
         let regions = [USABLE];
         // `USABLE` is written as an empty range, so it must be rejected, not picked.
         assert_eq!(pick_heap_region(regions.into_iter(), None), None);
-    }
-
-    #[test]
-    fn the_guard_is_the_last_whole_page_of_the_region() {
-        let (heap, guard) = split_guard_page(Span::new(0x10_0000, 0x14_0000));
-        assert_eq!(heap, Span::new(0x10_0000, 0x13_f000));
-        assert_eq!(guard, Some(Span::new(0x13_f000, 0x14_0000)));
-        // The two halves still cover exactly the region, with nothing shared.
-        assert_eq!(heap.len() + guard.unwrap().len(), 0x4_0000);
-        assert!(!heap.overlaps(&guard.unwrap()));
-    }
-
-    #[test]
-    fn an_unaligned_end_gives_up_the_tail_rather_than_its_neighbour() {
-        // Firmware-reported ends are not always page-aligned. The guard has to be the last
-        // page that ends at or before the region's end, never a page that reaches past it.
-        let (heap, guard) = split_guard_page(Span::new(0x10_0000, 0x14_0abc));
-        assert_eq!(guard, Some(Span::new(0x13_f000, 0x14_0000)));
-        assert_eq!(heap.end, 0x13_f000);
-        assert!(guard.unwrap().end <= 0x14_0abc);
-    }
-
-    #[test]
-    fn an_unaligned_start_keeps_the_first_bytes_for_the_heap() {
-        let (heap, guard) = split_guard_page(Span::new(0x10_0800, 0x14_0000));
-        assert_eq!(
-            heap.start, 0x10_0800,
-            "the heap still starts where the region does"
-        );
-        assert_eq!(guard.map(|guard| guard.start), Some(0x13_f000));
-    }
-
-    #[test]
-    fn a_region_without_a_spare_page_is_not_guarded() {
-        // One page: no room for a guard. Two pages: one page of heap plus one guard is the
-        // smallest split this allows, and a one-page region cannot reach it.
-        let small = Span::new(0x10_0000, 0x10_1000);
-        assert_eq!(split_guard_page(small), (small, None));
-
-        let two = Span::new(0x10_0000, 0x10_2000);
-        let (heap, guard) = split_guard_page(two);
-        assert_eq!(heap, Span::new(0x10_0000, 0x10_1000));
-        assert_eq!(guard, Some(Span::new(0x10_1000, 0x10_2000)));
-    }
-
-    #[test]
-    fn an_empty_region_has_nothing_to_guard() {
-        let empty = Span::new(0x10_0000, 0x10_0000);
-        assert_eq!(split_guard_page(empty), (empty, None));
     }
 }

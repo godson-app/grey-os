@@ -17,7 +17,7 @@ milestone, so that this file never claims more than was agreed.
 | M1        | Display primitives, text, on-screen boot log | **Done** - criteria met; TrueType moved to M7 (ADR-027)    |
 | M2        | Interrupts, exceptions, timers               | **Done** - criteria met; PIC stays until an APIC (ADR-028) |
 | M3        | Physical and virtual memory management       | **Done** - criteria met; guard page armed (ADR-029)        |
-| M4        | Heap allocation and kernel data structures   | **In progress** - mapper landed; allocator next (ADR-030)  |
+| M4        | Heap allocation and kernel data structures   | **Done** - criteria 1-5 met; stretch tree open (ADR-031)   |
 | M5        | Storage: disk driver and filesystem          | Not started                                                |
 | M6        | Input: keyboard and pointer                  | Not started                                                |
 | M7        | Compositor, windows, theme                   | Not started                                                |
@@ -324,19 +324,44 @@ matters by then, the tree built from scratch that ADR-029 leaves open.
       address the walk says nothing maps - a byte written through the mapping, read back through the
       window at the frame, the mapping taken away and the frame returned to the bitmap.
 
-**Open.** The allocator, which is the rest of the milestone:
+- [x] A heap in an arena of its own (ADR-031): 64 MiB of reserved virtual span at
+      `0x5000_0000_0000`, pages taken from the frame allocator as they are needed and mapped
+      `WRITABLE | NO_EXECUTE` through the kernel's own tables, and pages given back when a free leaves
+      whole ones free at the top. The region `pick_heap_region` picks is now only the bootstrap - the
+      frame allocator's bitmap and the console, which exist before a frame can be mapped - and the
+      4000 KiB it used is reserved instead of the 420000 KiB region it was handed.
+- [x] A free-list allocator per size class: 16-byte boundary-tagged headers (size, previous size,
+      magic and free bit, requested size), classes for 64 bytes and below, one per power of two up to
+      4096, then larger; first fit, split on allocation, merged with both neighbours on free, and
+      trimmed by whole pages when the block at the top of the arena comes back. `realloc` keeps the
+      bytes that still fit, shrinks in place, and moves when it must.
+- [x] Checked frees (ADR-030's fourth choice): a double free, a pointer from outside the arena and a
+      size the block was not allocated with are each refused and counted, and the boot log reports
+      that all three were. Nothing is followed: a header whose magic is gone answers "not a block".
+- [x] `frame::Allocator::free` has callers that mean it: every page the arena grows costs a frame,
+      every page it trims gives one back, and each unmap reads the frame out of the tables before
+      taking the entry away, because `unmap_4k` still does not return it.
+- [x] The guard page, without arming it: the first page past the arena's growth frontier was never
+      mapped, so a write to it faults with `cr2` at the heap's end. `GREY_OS_EXCEPTION_TEST=guard`
+      writes at `0x500000004000` and the handler reports `cr2 0x500000004000`.
+- [x] `Vec` and `String` on the allocator: a 512-element `Vec<u64>` grown through several
+      reallocations and a `String` built from parts, both read back and reported.
 
-- The bump heap still never gives a byte back, so `dealloc` is a no-op and nothing above the frame
-  allocator can reuse memory (M3's debt 1).
-- `frame::Allocator::free` has still only ever run from its own probes (M3's debt 2). It needs a
-  caller that means it, which is a heap that shrinks.
-- The heap does not grow yet, so the guard page still sits at the end of the region
-  `pick_heap_region` chose rather than above the heap's current top.
-- The tables a mapping creates are never given back, and `unmap_4k` still does not return the frame
-  it unmaps (ADR-030): which frame a mapping owns is a question the allocator has to answer first.
+**Open.** Nothing that gates the milestone; what is left is either stretch or M5's:
+
+- The intrusive list is not built. `Vec` and `String` are enough for the boot log and the console,
+  and a list needs a consumer to be worth writing; the first milestone with something to thread
+  (M6's input queue, M7's display list) gets it.
+- The tables a growth creates are never freed, and `unmap_4k` still hands back no frame: the arena's
+  page source walks the address first to learn the frame, which is a workaround at the caller, not a
+  fix in the mapper.
+- A free only trims when the block is page-aligned at the top, so a fragmented arena can hold pages
+  it no longer needs. Bounded by one page per block below a free tail, not a leak that grows.
+- The arena's span is a constant. A user-space layout is where that becomes a decision rather than a
+  placeholder.
 - The copy of the bootloader's tree still costs 1044 frames (M3's debt 3). A tree built from scratch
-  is the stretch item at the end of M4, because it needs a table free path of its own - walking up
-  from a leaf to release the tables a removal made empty.
+  is criterion 6, the stretch item, and it is not attempted: it needs a table free path of its own -
+  walking up from a leaf to release the tables a removal made empty.
 
 **Acceptance criteria.**
 
@@ -354,16 +379,36 @@ matters by then, the tree built from scratch that ADR-029 leaves open.
    block.
 6. Stretch, not gating: the page tables the boot owns fall from 1044 frames to double digits.
 
-**Status against them.** None of them yet - M4 is one piece in, and it is the piece the rest is
-built on. What the clean boot prints today, after M3's lines:
+**Status against them.** 1-5 met, 6 not attempted. What the clean boot prints, after M3's lines:
 
 ```text
+grey-os: heap bootstrap 0x0001780000-0x001bb6c000 (430000 KiB region, 4007 KiB used)
+grey-os: heap probe ok: 4 KiB read back, 1 allocations, 4096 bytes in use
+grey-os: frames: 525288 total, 126988 free, 64 KiB bitmap
+grey-os: heap churn ok: 8 allocations and 8 frees over 0 bytes, in use back to 0, 6 pages grown and 6 returned, 0 frames kept plus 3 for the span's page tables
+grey-os: heap frees: a double free, a pointer from outside and a wrong size all refused and counted
+grey-os: heap trim ok: 4 pages went back to the frame allocator
+grey-os: containers ok: a 512-element Vec and a 7 byte String, 4104 bytes in use on the arena
+grey-os: heap guard armed at 0x500000004000: the first page above the heap's 4 mapped pages, nothing mapped there
 grey-os: mapping probe ok: frame mapped at 0x600000000000, written through the mapping and read back by frame
+grey-os: boot ok
 ```
 
-Tests: 126 on the host, seven of them new, covering the level creation, the shared 2 MiB page, the
-four refusals and the flags on the way down; the write through a real mapping and the `invlpg` after
-it are left to the QEMU boot, as `mov cr3` was in M3.
+and the guard phase of `cargo xtask test`:
+
+```text
+grey-os: GREY_OS_EXCEPTION_TEST=guard, writing one byte past the heap at 0x500000004000
+[exception] #PF page fault: error 0x2 on a write to a not-present page, rip 0x100000150f5, cr2 0x500000004000
+```
+
+Criterion 1 is the numbers in the churn line: six pages grown cost six frames plus the three the
+span's tables took, and the frames the frame allocator reports are exactly those nine. Criterion 2 is
+that line's `in use back to 0`. Criterion 4 is the `cr2` above, which is the address the guard line
+named. Criterion 5 is 15 host tests in `arena`: class bookkeeping through the free lists, splitting,
+coalescing with the block before, alignment for every class from 16 to 4096, a trim that gives pages
+back, the three refusals, `realloc` growing and shrinking, and the churn probe itself. Tests: 136 on
+the host. The write through a real arena page and the `invlpg` after it are left to the QEMU boot, as
+`mov cr3` was in M3.
 
 ## M5 onward - provisional themes
 

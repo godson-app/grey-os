@@ -16,13 +16,13 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 - [x] Boots in QEMU through UEFI firmware
 - [x] Framebuffer fill (pixel-format aware)
 - [x] Serial logging on COM1 and a panic handler that reports to serial and screen
-- [x] Heap allocation: a bump allocator over a region picked from the memory map, proved by a boot-time write/read-back (ADR-021, ADR-022)
+- [x] Heap allocation: a bump allocator over a region picked from the memory map, proved by a boot-time write/read-back (ADR-021, ADR-022) - now only the bootstrap (ADR-031)
 - [x] Glyph rendering: a public-domain 8x8 bitmap font and an integer-scaled text renderer, host-tested (ADR-024)
 - [x] On-screen text console: the boot log goes to serial and to the panel, scrolling included (ADR-025)
 - [x] Back buffer and `Canvas::blit`: the console draws into a heap surface and the panel receives only the rows that changed (ADR-026)
 - [x] Interrupts and exception handling: GDT/TSS, IDT, PIC, PIT, injected faults (ADR-028)
 - [x] Memory management: page-table walker, frame allocator, own `CR3`, heap guard page (ADR-029)
-- [ ] A heap that gives memory back: the mapper landed, the allocator is next (ADR-030)
+- [x] A heap that gives memory back: an arena of frames, free lists per size class, checked frees, `Vec`/`String` on top (ADR-030, ADR-031)
 - [ ] Scheduler and kernel threads
 - [ ] Userspace, system calls and ELF loading
 - [ ] Storage and filesystem
@@ -53,18 +53,21 @@ grey-os: memory 0x0000000000-0x0000087000     540 KiB usable
 grey-os: memory 0x0000087000-0x0000088000       4 KiB usable
 ...                                    # one line per firmware region, elided here
 grey-os: memory usable total 512200 KiB
-grey-os: heap candidate 0x0001780000-0x001bb6b000 (429996 KiB, guard page at 0x1bb6b000)
-grey-os: heap ready 0x28001780000..0x2801bb6b000, 429996 KiB reserved
+grey-os: heap bootstrap 0x0001780000-0x001bb6c000 (430000 KiB region, 4007 KiB used)
 grey-os: heap probe ok: 4 KiB read back, 1 allocations, 4096 bytes in use
 grey-os: framebuffer 1280x800, stride 1280, 4 bytes/pixel
 grey-os: display adapter online, 78x48 cells at scale 2
 grey-os: console draws into a 4000 KiB back buffer
-grey-os: frames: 525288 total, 20541 free, 64 KiB bitmap
+grey-os: frames: 525288 total, 126988 free, 64 KiB bitmap
 grey-os: frame probe ok: 8 frames from 0x1000 written and read back
 grey-os: framebuffer physical 0x0080000000-0x00803e8000 (4000 KiB, resolved by page walk)
 grey-os: framebuffer byte 2048000 reads the same through both mappings
 grey-os: page tables: inherited root 0x101000, own root 0x1000, 1044 frames
-grey-os: heap guard armed at 0x2801bb6b000 (physical 0x1bb6b000), one page unmapped
+grey-os: heap churn ok: 8 allocations and 8 frees over 0 bytes, in use back to 0, 6 pages grown and 6 returned, 0 frames kept plus 3 for the span's page tables
+grey-os: heap frees: a double free, a pointer from outside and a wrong size all refused and counted
+grey-os: heap trim ok: 4 pages went back to the frame allocator
+grey-os: containers ok: a 512-element Vec and a 7 byte String, 4104 bytes in use on the arena
+grey-os: heap guard armed at 0x500000004000: the first page above the heap's 4 mapped pages, nothing mapped there
 grey-os: mapping probe ok: frame mapped at 0x600000000000, written through the mapping and read back by frame
 grey-os: gdt loaded: code 0x08, data 0x10, tss 0x18, 16 KiB double-fault stack
 grey-os: idt loaded: 38 gates of 256 (22 exceptions, 16 irqs)
@@ -74,11 +77,14 @@ grey-os: boot ok
 ```
 
 The geometry comes from the firmware; the kernel reports what GOP actually gave it
-rather than assuming a resolution. The heap is the largest usable region in that map that
-does not overlap the framebuffer, converted from its physical address through the offset
-the bootloader picked for the physical-memory window (`0x28001780000` here, 2.5 TiB above
-zero). Its last page is deliberately left unmapped as a guard, so a write past the end of
-the heap faults instead of landing in whatever follows.
+rather than assuming a resolution. The heap is an arena of its own: 64 MiB of reserved
+virtual span at `0x5000_0000_0000`, backed one 4 KiB page at a time out of the frame
+allocator and mapped `WRITABLE | NO_EXECUTE` through the kernel's own tables. The region
+the memory map offers is only the bootstrap - the frame allocator's bitmap and the
+console, which exist before a frame can be mapped - and only the 4007 KiB it used is
+reserved, so the rest of the 430000 KiB region goes back into circulation. A write past
+the arena's growth frontier faults because nothing ever mapped that page: no guard has to
+be armed, and `cr2` names the grown heap's end.
 
 `bootloader_api` 0.11 publishes the framebuffer only as a virtual address, so the kernel
 walks the page tables the bootloader left in `CR3` to find the frames behind it, then reads
@@ -92,6 +98,16 @@ gives a frame an address, creating the tables it needs. The boot proves it the s
 proves the walk - a frame from the allocator mapped at `0x6000_0000_0000`, a byte written
 through the new mapping and read back through the window at the frame, then the mapping taken
 away and the frame handed back. See ADR-030.
+
+The heap on top of it reuses memory: blocks carry a 16-byte header, free blocks sit on one
+list per size class, an allocation splits the block it finds, a free merges with both
+neighbours and gives whole pages back when it frees the top of the arena. The churn probe
+allocates eight sizes from 16 bytes to 8 KiB, writes a pattern through every block, reads it
+back, frees the lot and reports that `bytes_in_use` returned to zero - with the frames it cost
+having to match what the frame allocator says it no longer has. Three bad frees - a double
+free, a pointer from outside the arena, a wrong size - are refused and counted rather than
+followed, which is what keeps a caller's bug from becoming a corrupted free list. A `Vec` and
+a `String` are built on the allocator and read back before the guard line. See ADR-031.
 
 The same lines are drawn on the panel: the 8x8 font at scale 2, 78 columns by 48 rows on
 the 1280x800 surface, 16 pixels in from each edge. The firmware's memory map is longer
@@ -116,8 +132,9 @@ cargo xtask test    # build, boot clean, then boot one kernel per injected failu
 `test` checks the serial markers _and_ the exit status, and fails on a hang rather
 than waiting forever. It boots once per failure path: first the normal image, which must print
 `grey-os: boot ok` and exit 33 - and, before that, the memory bring-up lines: the frame
-totals, the framebuffer's resolved physical span, the kernel's own page-table root and the
-armed heap guard. Then a kernel rebuilt with `GREY_OS_PANIC_TEST=1`, which
+totals, the framebuffer's resolved physical span, the kernel's own page-table root, the heap's
+churn, refusals and trim, the containers and the guard the arena never armed. Then a kernel
+rebuilt with `GREY_OS_PANIC_TEST=1`, which
 must print `[panic]`, its message, its location and `[panic] panel painted red`, and
 exit 35. The last line is how the painted screen is verified from outside a guest that
 cannot be looked into. Five more images follow, each rebuilt with
@@ -192,8 +209,9 @@ grey-os/
         ├── console.rs     # character grid: cursor, wrapping, scrolling (ADR-025)
         ├── display.rs     # console instance, back buffer, panel repaint, panic screen
         ├── framebuffer.rs # boot-info framebuffer -> Canvas adapter
-        ├── memory.rs      # memory map, heap region selection, guard-page split
-        ├── heap.rs        # bump allocator behind `GlobalAlloc`
+        ├── memory.rs      # memory map, the bootstrap region's selection
+        ├── heap.rs        # bump allocator: the bootstrap only (ADR-021, ADR-031)
+        ├── arena.rs       # the heap: pages from frames, free lists per class (ADR-031)
         ├── frame.rs       # 4 KiB frame allocator over a bitmap (ADR-029)
         ├── paging.rs      # page-table entries, the walk, the kernel's own CR3 (ADR-029)
         ├── qemu.rs        # exit codes through `isa-debug-exit`

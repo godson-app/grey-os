@@ -1,9 +1,15 @@
-//! The kernel's allocator.
+//! The kernel's bootstrap allocator.
 //!
 //! ADR-021 chose a bump allocator over a dependency: an allocator bug is silent
 //! memory corruption, and thirty lines can be read. `alloc` moves a cursor forward,
 //! `dealloc` does nothing, and the counters say how much of the reserve was ever
 //! touched - which is what makes a leak visible before anything can be reclaimed.
+//!
+//! ADR-031 left it one job. The heap proper is [`crate::arena`], which grows in pages taken from the
+//! frame allocator; that allocator's bitmap is itself an allocation, so the bitmap, the console and
+//! its back buffer come from here, before a frame exists to map. Once the arena is ready this
+//! allocator is frozen: `main`'s `GlobalAlloc` stops routing to it, and what it used is what the
+//! frame allocator reserves.
 //!
 //! The allocator never sees a physical address. The region arrives as a physical
 //! span from `memory::pick_heap_region`, and the boot sequence converts it through
@@ -20,9 +26,11 @@ pub struct Stats {
     pub base: usize,
     /// One past the last byte of the reserve. `base == end` means uninitialised.
     pub end: usize,
+    /// The first byte that has not been handed out: what the reserve has actually cost.
+    pub cursor: usize,
     /// `alloc` calls that consumed reserve bytes; zero-sized calls do not count.
     pub allocations: usize,
-    /// Bytes handed out and never returned, because nothing is ever returned yet.
+    /// Bytes handed out and never returned: a bump allocator takes nothing back.
     pub bytes_in_use: usize,
     /// The largest `bytes_in_use` has ever been: the real peak demand.
     pub high_water: usize,
@@ -57,6 +65,7 @@ impl BumpAllocator {
                 stats: Stats {
                     base: 0,
                     end: 0,
+                    cursor: 0,
                     allocations: 0,
                     bytes_in_use: 0,
                     high_water: 0,
@@ -89,6 +98,7 @@ impl BumpAllocator {
         state.cursor = start;
         state.stats.base = start;
         state.stats.end = end;
+        state.stats.cursor = start;
         true
     }
 
@@ -140,6 +150,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
             return ptr::null_mut();
         }
         state.cursor = next;
+        state.stats.cursor = next;
         state.stats.allocations += 1;
         state.stats.bytes_in_use += layout.size();
         state.stats.high_water = state.stats.high_water.max(state.stats.bytes_in_use);

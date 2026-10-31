@@ -814,3 +814,65 @@ frame ownership - who may free the frame behind a mapping - is a question the al
 answer first. The tree built from scratch that ADR-029 leaves open stays a stretch item at the end
 of M4, after the allocator closes the loop, because it needs table bookkeeping of its own: walking
 up from a leaf to free the tables that a removal made empty.
+
+## ADR-031: The heap moves into an arena, and its bookkeeping moves into the blocks
+
+**Status:** accepted, M4. Amends ADR-030 in three places, each learned by building it.
+
+**Context.** ADR-030 said the heap would keep growing inside the region `pick_heap_region` chose,
+take its size classes from "a descriptor the heap owns per page", and arm the guard by moving an
+unmapped page above the new top. Building that ran into the bootloader's window: every address in
+that region is already mapped, in 2 MiB pages, by `Mapping::Dynamic` (ADR-022). A page there cannot
+be "taken from the frame allocator" - it already has a mapping and a frame behind it - so growth in
+place would either remap a frame over live memory or claim to grow while consuming nothing, which is
+exactly the lie the milestone's first criterion is written to catch. And a page descriptor per page
+rules out the ordinary case: two small blocks freed next to each other must become one block even
+when a page boundary runs between them, so the block has to describe itself wherever it sits.
+
+**Decision.** The heap gets a span of its own: `ARENA_BASE = 0x5000_0000_0000`, `ARENA_BYTES` 64
+MiB, reserved as virtual address space and backed one 4 KiB page at a time from `frame::FRAMES`,
+mapped `WRITABLE | NO_EXECUTE` into the tree the CPU is running on. Nothing maps that span, so
+`arch::map_4k` never has to split a huge page for it and never meets a duplicate entry.
+
+That leaves the ordering problem the arena creates: the frame allocator's bitmap is itself an
+allocation, and the arena cannot map its first page without a frame. So ADR-021's bump allocator
+stays, for exactly one job - the bootstrap: the bitmap, the console's grid and its 4 MiB back buffer,
+all of which exist before the arena does. Its region is frozen the moment the arena is ready: the
+`#[global_allocator]` routes to the bootstrap until then and to the arena afterwards, the bootstrap's
+blocks are never freed (a bump allocator could not take one back in any order but the reverse), and
+only the bytes it actually used are reserved in the frame allocator. The 420000 KiB region M1
+reserved for a cursor that used 4000 KiB of it goes back into circulation, which is the first thing
+M4's "stop guessing a region" was worth.
+
+Bookkeeping lives in the blocks: a 16-byte header carrying the block's size, the size of the block
+before it, a magic word with the free bit, and the payload size the caller asked for. The previous
+size is a boundary tag, so a free finds both neighbours in constant time, and the requested size is
+what makes a size-mismatched free detectable at all - the block's own size is rounded and normally
+larger, so comparing it to the `Layout` would refuse honest frees. Free blocks are threaded onto one
+list per size class through their payload, forward and backward, because coalescing has to unlink a
+neighbour out of the middle of a list; the class is derived from the block's size rather than stored,
+which is why the size has to be in the header. The links sit in memory the previous tenant wrote
+arbitrary bytes into, so `insert_free` writes both of them: the first version wrote only the forward
+link, and the host tests caught the backward link still holding a freed block's payload.
+
+Free is checked against the header, not against the caller's word: not in the span, not at a header
+boundary, magic gone, already free, or a requested size that differs are five ways to be refused, and
+each is counted in `bad_frees` and reported at boot. `realloc` shrinks in place by recording the
+smaller size and grows by allocating, copying and freeing.
+
+The guard page stops needing to be armed. M3 unmapped one page at the end of the region so that a
+write past the heap would fault; an arena that maps only what it has grown into has an unmapped page
+above its frontier by construction, and it moves with every growth and every trim. `cr2` on the
+resulting `#PF` is therefore the grown heap's end, which is criterion 4 with no `unmap_4k` in the
+path. The frame behind a page that is trimmed is looked up by walking the address before the entry
+is taken away, because `unmap_4k` still does not say what it unmapped; that is a workaround at the
+caller and stays on the open list.
+
+**Consequences.** `heap.rs` keeps ADR-021's bump allocator as the bootstrap and `arena.rs` is the
+allocator proper; `main.rs` owns the `GlobalAlloc` that routes between them, the `KernelPages` that
+maps and unmaps through `paging`, and the boot sequence's new order: bootstrap, frame allocator,
+table switch, arena. `pick_heap_region` still picks the bootstrap's region and `split_guard_page` is
+gone with the region guard. The tables a growth creates are never freed and a trim only happens at a
+page-aligned top, both recorded as open. The arena's address is a constant, not a layout: M5 or the
+first user-space mapping is where that stops being a placeholder.
+

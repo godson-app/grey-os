@@ -54,8 +54,19 @@ const FRAME_TOTALS: &str = "grey-os: frames:";
 const PAGE_TABLES: &str = "grey-os: page tables: inherited root";
 /// Printed once the page walk has resolved the framebuffer's frames (M3).
 const FRAMEBUFFER_PHYSICAL: &str = "grey-os: framebuffer physical";
-/// Printed once the heap's last page is left unmapped (M3).
+/// Printed once the heap names the first page above its growth frontier (M3, then M4: the guard is
+/// the first page the arena never mapped rather than one taken away, ADR-031).
 const HEAP_GUARD: &str = "grey-os: heap guard armed";
+/// Printed once the arena has grown, then handed pages back, with the frame allocator's count
+/// having to agree with both (M4).
+const HEAP_CHURN: &str = "grey-os: heap churn ok";
+/// Printed once a double free, a pointer from outside the arena and a wrong size have all been
+/// refused and counted (M4).
+const HEAP_FREES: &str = "grey-os: heap frees:";
+/// Printed once a free at the top of the arena gave whole pages back to the frame allocator (M4).
+const HEAP_TRIM: &str = "grey-os: heap trim ok";
+/// Printed once a `Vec` and a `String` have been built on the arena and read back (M4).
+const CONTAINERS: &str = "grey-os: containers ok";
 /// Printed once M4's mapper has given a frame an address nothing mapped, written through that
 /// address and read the frame back through the window, then taken the mapping away again (M4).
 const MAPPING_PROBE: &str = "grey-os: mapping probe ok";
@@ -97,8 +108,8 @@ const FAULTS: [Fault; 5] = [
     Fault {
         value: "guard",
         announcement: "GREY_OS_EXCEPTION_TEST=guard, writing one byte past the heap",
-        // Error 0x2: a write (bit 1) to a page with no mapping (bit 0 clear). The heap's guard
-        // page is the only page in the kernel's own tables that is deliberately absent.
+        // Error 0x2: a write (bit 1) to a page with no mapping (bit 0 clear). The arena's guard is
+        // the first page above its growth frontier, which nothing ever mapped (ADR-031).
         report: "[exception] #PF page fault: error 0x2 on a write to a not-present page",
     },
 ];
@@ -204,11 +215,12 @@ fn run(options: &Options) -> Result<ExitCode> {
 ///
 /// The first boot is the normal image: it must print `grey-os: boot ok` and exit 33. That run
 /// also carries the memory claims - frame totals, the framebuffer's resolved span, the kernel's
-/// own page-table root, the armed heap guard and the mapping round trip - because they are all
-/// lines a successful boot prints and a broken one does not. Then one image per injected failure -
-/// a panic, and each fault in [`FAULTS`] - each of which must report itself and exit 35. Asserting
-/// both halves is the point: a flag that does not take effect would pass a test that only checked
-/// the clean boot, and a kernel that always panics would fail the first phase.
+/// own page-table root, the armed heap guard, the arena's churn, refusals and trim, the containers
+/// and the mapping round trip - because they are all lines a successful boot prints and a broken
+/// one does not. Then one image per injected failure - a panic, and each fault in [`FAULTS`] - each
+/// of which must report itself and exit 35. Asserting both halves is the point: a flag that does
+/// not take effect would pass a test that only checked the clean boot, and a kernel that always
+/// panics would fail the first phase.
 fn test(options: &Options) -> Result<ExitCode> {
     let (log, code) = boot_headless(options)?;
     expect(
@@ -220,6 +232,10 @@ fn test(options: &Options) -> Result<ExitCode> {
             PAGE_TABLES,
             FRAMEBUFFER_PHYSICAL,
             HEAP_GUARD,
+            HEAP_CHURN,
+            HEAP_FREES,
+            HEAP_TRIM,
+            CONTAINERS,
             MAPPING_PROBE,
         ],
         EXIT_CLEAN,

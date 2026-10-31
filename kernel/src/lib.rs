@@ -4,8 +4,8 @@
 //! target keeps only what has to be the entry point: `entry_point!`, the boot
 //! sequence, the panic handler and the `println!` macro those use.
 //!
-//! `canvas`, `font`, `text`, `memory`, `frame`, `paging` and `heap` are free of port I/O and
-//! of `bootloader_api`, so `cargo test --package kernel --lib` can run them on the host. The
+//! `canvas`, `font`, `text`, `memory`, `frame`, `paging`, `heap` and `arena` are free of port I/O
+//! and of `bootloader_api`, so `cargo test --package kernel --lib` can run them on the host. The
 //! other modules are `x86_64`-only and are compiled out there, because inline `asm!` and
 //! port I/O do not exist on the machine running the tests.
 //!
@@ -22,6 +22,7 @@
 // crate here lets the console's `Vec` and `String` be written once for both builds.
 extern crate alloc;
 
+pub mod arena;
 pub mod canvas;
 pub mod console;
 pub mod font;

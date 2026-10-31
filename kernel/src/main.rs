@@ -2,18 +2,34 @@
 #![no_main]
 
 // `Box`/`Vec` live here. The kernel has no `std`; `alloc` is the half of the standard
-// library that only needs a `#[global_allocator]`, which `HEAP` below provides.
+// library that only needs a `#[global_allocator]`, which `KernelHeap` below provides.
 extern crate alloc;
 
 use bootloader_api::config::Mapping;
 use bootloader_api::info::MemoryRegionKind;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
+use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 use grey_os::{
-    display, frame, framebuffer, gdt, halt_loop, heap, idt, memory, paging, pic, qemu, serial,
-    timer,
+    arena, display, frame, framebuffer, gdt, halt_loop, heap, idt, memory, paging, pic, qemu,
+    serial, timer,
 };
+
+/// Where the arena's virtual span starts. Above the bootloader's physical window, which ends at
+/// `offset + 1 TiB`, and below the addresses the mapping probes use, so no address this boot
+/// gives out is one something else already owns (ADR-031).
+const ARENA_BASE: usize = 0x5000_0000_0000;
+
+/// Bytes the span reserves: 64 MiB. Large enough for every allocation this boot makes with room
+/// to spare, small enough that a runaway allocation runs out instead of eating the address space
+/// a user-space layout will want (ADR-031).
+const ARENA_BYTES: usize = 64 * 1024 * 1024;
+
+/// The sizes the churn probe walks: every class the arena has, one request larger than a page, and
+/// a repeat at the end. Sixteen or fewer, because `arena::churn` holds them on the stack.
+const CHURN_SIZES: [usize; 8] = [16, 64, 256, 1024, 4096, 8192, 64, 512];
 
 /// The rate the PIT is programmed at. 100 Hz is the usual compromise: fine enough for a
 /// scheduler tick later, coarse enough that the handler's cost does not matter yet.
@@ -89,12 +105,155 @@ macro_rules! println {
     }};
 }
 
-/// The kernel's only allocator: a bump allocator over the region the boot sequence
-/// picks out of the memory map (ADR-021). It is initialised in `kernel_main` once the
-/// map has been read, so an allocation before that point returns null and fails
-/// loudly instead of writing somewhere unowned.
+/// The bootstrap allocator: the only memory the kernel has before the frame allocator - whose own
+/// bitmap is an allocation - can hand out a frame to map. ADR-021's bump allocator, kept for that
+/// one job (ADR-031).
+static BOOTSTRAP: heap::BumpAllocator = heap::BumpAllocator::new();
+
+/// The arena every allocation after the address-space switch comes from (ADR-031).
+static HEAP: arena::Heap<KernelPages> = arena::Heap::new(KernelPages::new());
+
+/// The kernel's `#[global_allocator]`: the bootstrap until the arena is ready, the arena after.
+/// It is initialised in `kernel_main` once the memory map has been read, so an allocation before
+/// that point returns null and fails loudly instead of writing somewhere unowned.
+struct KernelHeap;
+
+// SAFETY: `alloc` returns null or a block from whichever allocator is in charge, aligned and large
+// enough for the layout; `dealloc` hands a block back only to the allocator that handed it out,
+// and the bootstrap's blocks are never reclaimed, which is what a bump allocator does anyway
+// (ADR-021, ADR-031).
+unsafe impl GlobalAlloc for KernelHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller of `GlobalAlloc::alloc` makes the promise both allocators need.
+        unsafe {
+            if HEAP.ready() {
+                HEAP.alloc(layout)
+            } else {
+                BOOTSTRAP.alloc(layout)
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if in_bootstrap(ptr) {
+            // Boot objects live as long as the kernel does: the console, its back buffer, the
+            // frame allocator's bitmap. A bump allocator could not take one back in any order
+            // other than the reverse of allocation anyway.
+            return;
+        }
+        // SAFETY: as `alloc`; a pointer that is not the arena's is counted, not followed.
+        unsafe { HEAP.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if in_bootstrap(ptr) {
+            // A boot block that wants to grow gets an arena block and a copy; the old one stays
+            // where it is, which is what the bootstrap does with everything.
+            // SAFETY: the caller promises the old block is live for `layout.size()` bytes and
+            // that `new_size` with this alignment is a valid layout.
+            unsafe {
+                let bigger = Layout::from_size_align_unchecked(new_size, layout.align());
+                let fresh = KernelHeap.alloc(bigger);
+                if !fresh.is_null() {
+                    core::ptr::copy_nonoverlapping(ptr, fresh, layout.size());
+                }
+                fresh
+            }
+        } else {
+            // SAFETY: as above, for the arena.
+            unsafe { HEAP.realloc(ptr, layout, new_size) }
+        }
+    }
+}
+
 #[global_allocator]
-static HEAP: heap::BumpAllocator = heap::BumpAllocator::new();
+static ALLOCATOR: KernelHeap = KernelHeap;
+
+/// Whether `ptr` came from the bootstrap's reserve rather than the arena's.
+fn in_bootstrap(ptr: *mut u8) -> bool {
+    let stats = BOOTSTRAP.stats();
+    let address = ptr as usize;
+    stats.base != 0 && stats.base <= address && address < stats.end
+}
+
+/// The arena's pages as the kernel can give them out: a frame from the frame allocator, mapped at
+/// the arena's address through the table the CPU is running on (ADR-030).
+struct KernelPages {
+    /// The tree mappings are written into, and the window every frame is reached through.
+    /// `UnsafeCell` because `GlobalAlloc` hands the allocator `&self` while mapping changes what
+    /// the addresses in these cells name.
+    root: UnsafeCell<u64>,
+    offset: UnsafeCell<u64>,
+}
+
+impl KernelPages {
+    const fn new() -> Self {
+        Self {
+            root: UnsafeCell::new(0),
+            offset: UnsafeCell::new(0),
+        }
+    }
+
+    /// Points the page source at the live tree and the physical window. Called once, after the
+    /// kernel has switched to its own tables.
+    ///
+    /// # Safety
+    ///
+    /// `root` must be the tree `CR3` names, `offset` the window that reaches all of physical
+    /// memory, and both must stay valid for the rest of the boot.
+    unsafe fn install(&self, root: u64, offset: u64) {
+        // SAFETY: `self` is a valid reference; nothing else writes these cells, and `install`
+        // runs before the arena is handed its first page.
+        unsafe {
+            *self.root.get() = root;
+            *self.offset.get() = offset;
+        }
+    }
+}
+
+impl arena::Pages for KernelPages {
+    fn map(&mut self, address: usize) -> Option<u64> {
+        // SAFETY: `install` ran before the arena was handed any page, and nothing else writes
+        // these cells.
+        let (root, offset) = unsafe { (*self.root.get(), *self.offset.get()) };
+        let frame = frame::FRAMES.alloc()?;
+        // A page the kernel writes to and never executes from.
+        let flags = paging::Entry::WRITABLE | paging::Entry::NO_EXECUTE;
+        // SAFETY: `root` is the live tree, `offset` the window, `frame` came from the allocator,
+        // and `address` is inside the arena's reserved span, which nothing else maps.
+        match unsafe {
+            paging::map_4k(root, offset, address as u64, frame, flags, || {
+                frame::FRAMES.alloc()
+            })
+        } {
+            Ok(()) => Some(frame),
+            Err(_) => {
+                // The frame never got an address, so it is free again.
+                frame::FRAMES.free(frame);
+                None
+            }
+        }
+    }
+
+    fn unmap(&mut self, address: usize) -> bool {
+        // SAFETY: as `map`.
+        let (root, offset) = unsafe { (*self.root.get(), *self.offset.get()) };
+        // The frame is read before the entry goes: `unmap_4k` takes a mapping away without saying
+        // what it was, which is why the frame is looked up here instead (ADR-031).
+        // SAFETY: `root` is the live tree and `offset` the window.
+        let Some(translation) = (unsafe { paging::walk(root, offset, address as u64) }) else {
+            return false;
+        };
+        // SAFETY: as above; the address is a 4 KiB mapping the arena grew, and the closure hands
+        // out only frames the bitmap says are free, should a table need splitting.
+        if unsafe { paging::unmap_4k(root, offset, address as u64, || frame::FRAMES.alloc()) }
+            .is_err()
+        {
+            return false;
+        }
+        frame::FRAMES.free(translation.address & !(memory::PAGE_BYTES - 1))
+    }
+}
 
 /// Asks the bootloader for a window onto all of physical memory (ADR-022).
 ///
@@ -197,34 +356,36 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("grey-os: FATAL: no usable memory region to draw a heap from");
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
     };
-    // The region's last whole page becomes the guard page: the heap ends there, and the
-    // tables leave that one page unmapped, so a write past the end faults instead of landing
-    // in whatever follows (ADR-029).
-    let (heap, guard_page) = memory::split_guard_page(span);
+    // The region is the bootstrap's reserve and nothing more: ADR-021's bump allocator takes the
+    // frame allocator's bitmap and the console from here, because neither can come from the arena
+    // before a frame exists to map. What the bootstrap does not use goes back to the frame
+    // allocator once the arena is up, which is what stops this region being the 420 MiB guess M1
+    // made it (ADR-031).
+    let boot = span;
 
     // The span picked above is physical memory that firmware happens to map somewhere of
     // its choosing. Convert it through `physical_memory_offset` before the allocator sees
     // it: handing `GlobalAlloc` a physical address writes to whatever is mapped at that
     // virtual address, which is silent corruption rather than a failed boot.
     let range = {
-        let start = offset.checked_add(heap.start);
-        let end = offset.checked_add(heap.end);
+        let start = offset.checked_add(boot.start);
+        let end = offset.checked_add(boot.end);
         start.zip(end).and_then(|(start, end)| {
             Some((usize::try_from(start).ok()?, usize::try_from(end).ok()?))
         })
     };
     let Some((start, end)) = range else {
         println!(
-            "grey-os: FATAL: heap {:#x}..{:#x} does not fit past the {offset:#x} mapping",
-            heap.start, heap.end
+            "grey-os: FATAL: bootstrap region {:#x}..{:#x} does not fit past the {offset:#x} mapping",
+            boot.start, boot.end
         );
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
     };
     // SAFETY: `start..end` is a region the firmware reports as usable, nothing else writes
     // there, the bootloader maps all of physical memory writable at
     // `physical_memory_offset` (ADR-022), and this is the only call to `init`.
-    if !unsafe { HEAP.init(start, end) } {
-        println!("grey-os: FATAL: heap range {start:#x}..{end:#x} is not usable");
+    if !unsafe { BOOTSTRAP.init(start, end) } {
+        println!("grey-os: FATAL: bootstrap range {start:#x}..{end:#x} is not usable");
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
     }
 
@@ -245,7 +406,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("grey-os: FATAL: heap memory did not read back what was written");
         qemu::exit_qemu(qemu::QemuExitCode::Failed);
     }
-    let probed = HEAP.stats();
+    let probed = BOOTSTRAP.stats();
     // UEFI has no VGA text mode, so we draw to the framebuffer instead. This is the only
     // display path: GOP from boot information, no GPU drivers. `screen` was taken above,
     // where its physical span had to be walked; the layout is what gets checked here.
@@ -308,27 +469,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
     println!("grey-os: memory usable total {} KiB", usable_bytes / 1024);
-    match guard_page {
-        Some(guard) => println!(
-            "grey-os: heap candidate {:#012x}-{:#012x} ({} KiB, guard page at {:#x})",
-            heap.start,
-            heap.end,
-            heap.len() / 1024,
-            guard.start
-        ),
-        None => println!(
-            "grey-os: heap candidate {:#012x}-{:#012x} ({} KiB, no room for a guard page)",
-            heap.start,
-            heap.end,
-            heap.len() / 1024
-        ),
-    }
-    let stats = HEAP.stats();
     println!(
-        "grey-os: heap ready {:#x}..{:#x}, {} KiB reserved",
-        stats.base,
-        stats.end,
-        stats.end.saturating_sub(stats.base) / 1024
+        "grey-os: heap bootstrap {:#012x}-{:#012x} ({} KiB region, {} KiB used)",
+        boot.start,
+        boot.end,
+        boot.len() / 1024,
+        (BOOTSTRAP
+            .stats()
+            .cursor
+            .saturating_sub(BOOTSTRAP.stats().base))
+            / 1024
     );
     println!(
         "grey-os: heap probe ok: 4 KiB read back, {} allocations, {} bytes in use",
@@ -354,8 +504,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // The frame allocator (ADR-029). Its bitmap lives on the heap, which is why this runs
-    // after `HEAP.init`, and it is never freed: every later allocation asks this bitmap
+    // The frame allocator (ADR-029). Its bitmap comes from the bootstrap, which is why this runs
+    // after `BOOTSTRAP.init` and before the arena exists, and it is never freed: every later
+    // allocation asks this bitmap
     // first. The index covers the physical address space up to the highest frame that could
     // be handed out or must be kept out of circulation - usable RAM, the framebuffer and the
     // kernel image - so a frame number is just an address divided by the page size, and the
@@ -402,9 +553,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // history, not free space - and a frame at address 0 is also what a null pointer would
     // reach through the physical window.
     frame::FRAMES.mark_used(memory::Span::new(0, memory::PAGE_BYTES));
-    // The whole region, not just the heap: the guard page at its end must never be handed out
-    // either, or the next allocation would map it and the fault test would stop faulting.
-    frame::FRAMES.mark_used(span);
+    // The bootstrap's used bytes, not its whole region: the rest of it is memory the frame
+    // allocator may hand out from now on, which is the 400-and-something MiB M1 reserved for a
+    // bump cursor that never got near it (ADR-031). The cursor is frozen from here: once the
+    // arena is ready every allocation goes there, so nothing can take another byte of this span
+    // after the line below reserves it.
+    let bootstrap_used = (BOOTSTRAP
+        .stats()
+        .cursor
+        .saturating_sub(BOOTSTRAP.stats().base)) as u64;
+    frame::FRAMES.mark_used(memory::Span::new(
+        boot.start,
+        boot.start
+            .saturating_add(bootstrap_used.div_ceil(memory::PAGE_BYTES) * memory::PAGE_BYTES),
+    ));
     frame::FRAMES.mark_used(framebuffer_span);
 
     let frame_stats = frame::FRAMES
@@ -466,33 +628,127 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // making this call, its stack and everything reachable stays mapped.
     unsafe { paging::load_root(own_root) };
 
-    // The guard page: the one page at the end of the heap region, unmapped in the tables just
-    // loaded. Splitting the 2 MiB page that covers it is what makes a 4 KiB hole expressible
-    // inside the physical window at all.
-    match guard_page {
-        Some(guard) => {
-            let address = offset + guard.start;
-            // SAFETY: `own_root` is the tree just loaded, `address` is inside the physical
-            // window the copy maps, and the closure hands out the one frame a split needs.
-            let unmapped =
-                unsafe { paging::unmap_4k(own_root, offset, address, || frame::FRAMES.alloc()) };
-            match unmapped {
-                // One byte past the end of the heap now faults, which is the point: the
-                // allocator's arithmetic is checked by hardware rather than trusted.
-                Ok(()) => println!(
-                    "grey-os: heap guard armed at {address:#x} (physical {:#x}), one page unmapped",
-                    guard.start
-                ),
-                Err(error) => {
-                    println!("grey-os: FATAL: heap guard could not be armed: {error:?}");
-                    qemu::exit_qemu(qemu::QemuExitCode::Failed);
-                }
-            }
-        }
-        None => {
-            println!("grey-os: WARNING: the heap region has no page to spare, heap guard unarmed");
-        }
+    // The arena (ADR-031): a fixed span, pages from the frame allocator, mapped through the tree
+    // just loaded. From here every allocation is memory this kernel mapped itself, so growth
+    // costs frames and a free at the top gives them back.
+    //
+    // SAFETY: `own_root` is the tree the CPU is switching to and `offset` is the window; the span
+    // is the constant above, which nothing else in this boot maps.
+    unsafe { HEAP.source().install(own_root, offset) };
+    // SAFETY: the span is address space nothing else maps, and this is the only call.
+    if !unsafe { HEAP.init_arena(ARENA_BASE, ARENA_BYTES) } {
+        println!("grey-os: FATAL: the arena refused {ARENA_BASE:#x}..{ARENA_BYTES:#x}");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
     }
+
+    // M4's growth proof: the frames a page of heap costs have to be frames the frame allocator
+    // says are gone. A heap that mapped pages out of its own span without asking would show the
+    // same growth and none of the cost, which is the bug this line exists to catch.
+    let free_before = frame::FRAMES
+        .stats()
+        .expect("the frame allocator was initialised above")
+        .free;
+    // SAFETY: every layout in the list is valid, the chunk sizes fit the static buffer inside
+    // `churn`, and each block is freed once with the layout it was allocated with.
+    let churn = unsafe { arena::churn(&HEAP, &CHURN_SIZES) };
+    let taken = free_before.saturating_sub(
+        frame::FRAMES
+            .stats()
+            .expect("the frame allocator was initialised above")
+            .free,
+    );
+    // The invariant: the frames the frame allocator lost are the pages the arena kept plus
+    // whatever tables the span needed, and never fewer than the pages. An arena that mapped pages
+    // out of its own span without asking would show growth and cost nothing, which is the bug
+    // this is here to catch.
+    let net = churn.grown.saturating_sub(churn.returned);
+    let tables = taken.saturating_sub(net);
+    if !churn.balanced() || taken < net {
+        println!(
+            "grey-os: FATAL: churn left {} bytes in use (started at {}), grew {} pages, returned {} and cost {taken} frames for {net}",
+            churn.bytes_after, churn.bytes_before, churn.grown, churn.returned
+        );
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    println!(
+        "grey-os: heap churn ok: {} allocations and {} frees over {} bytes, in use back to {}, {} pages grown and {} returned, {net} frames kept plus {tables} for the span's page tables",
+        churn.allocations,
+        churn.frees,
+        churn.bytes_before,
+        churn.bytes_after,
+        churn.grown,
+        churn.returned
+    );
+
+    // The three frees a checked allocator has to refuse, counted rather than followed (ADR-030).
+    // SAFETY: `refusals` allocates the block it frees, and frees it once with its real size.
+    let refused = unsafe { arena::refusals(&HEAP) };
+    if refused != 3 {
+        println!("grey-os: FATAL: only {refused} of the three bad frees were refused");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    println!(
+        "grey-os: heap frees: a double free, a pointer from outside and a wrong size all refused and counted"
+    );
+
+    // The shrink half: a block of whole pages at the top of an empty arena goes back to the frame
+    // allocator, which is the only caller `frame::FRAMES.free` had until now.
+    let Ok(whole_pages) = Layout::from_size_align(arena::PAGE_BYTES, arena::PAGE_BYTES) else {
+        println!("grey-os: FATAL: the trim probe's layout is not valid");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    };
+    // SAFETY: the layout is valid and the block is freed below, once.
+    let trimmed = unsafe {
+        let pointer = HEAP.alloc_layout(whole_pages);
+        if pointer.is_null() {
+            println!("grey-os: FATAL: the trim probe could not allocate a page");
+            qemu::exit_qemu(qemu::QemuExitCode::Failed);
+        }
+        let mapped = HEAP.stats().pages;
+        HEAP.dealloc_layout(pointer, whole_pages);
+        mapped - HEAP.stats().pages
+    };
+    if trimmed == 0 {
+        println!("grey-os: FATAL: a free at the top of the arena returned no pages");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    println!("grey-os: heap trim ok: {trimmed} pages went back to the frame allocator");
+
+    // The containers the next milestones need, on the new allocator: a `Vec` that grows until it
+    // reallocates several times, and a `String` built from parts. Both are leaked on purpose -
+    // the claim is that they were built, and the heap reporting something in use afterwards is
+    // what gives the guard line below a heap to guard.
+    let mut numbers: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for value in 0..512u64 {
+        numbers.push(value * value);
+    }
+    let expected: u64 = (0..512u64).map(|value| value * value).sum();
+    let mut text = alloc::string::String::new();
+    for word in ["grey", "-", "os"] {
+        text.push_str(word);
+    }
+    if numbers.iter().copied().sum::<u64>() != expected || text != "grey-os" {
+        println!("grey-os: FATAL: a Vec or a String did not come back with what went into it");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    let container_bytes = HEAP.stats().bytes_in_use;
+    println!(
+        "grey-os: containers ok: a {}-element Vec and a {} byte String, {container_bytes} bytes in use on the arena",
+        numbers.len(),
+        text.len()
+    );
+    core::mem::forget(numbers);
+    core::mem::forget(text);
+
+    // The guard page, without arming it: the arena has mapped everything below `end` and nothing
+    // at or above it, so the first byte past the heap faults because no entry describes it
+    // (ADR-031). M3 had to take a mapping away to get this; a heap that grows a page at a time
+    // never puts one there in the first place.
+    let arena_stats = HEAP.stats();
+    println!(
+        "grey-os: heap guard armed at {:#x}: the first page above the heap's {} mapped pages, nothing mapped there",
+        arena_stats.end, arena_stats.pages
+    );
 
     // The mapper, both ways: a frame the allocator handed out, an address nothing mapped, and the
     // frame read back through it. M3 could only take a mapping away (ADR-029); this is the first
@@ -618,16 +874,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     // M3's fault path: a write one byte past the end of the heap has to reach the `#PF`
-    // handler instead of landing in whatever follows. The guard page is the last page of the
-    // heap region, which the tables leave unmapped, and `HEAP.stats().end` is its first byte.
+    // handler instead of landing in whatever follows. The guard is the first page past the arena's
+    // growth frontier, which nothing ever mapped, and `HEAP.stats().end` is its first byte - after
+    // the churn and the containers above, so it is the *grown* heap's end (ADR-031).
     #[cfg(grey_os_fault_guard)]
     {
         let end = HEAP.stats().end;
         println!(
             "grey-os: GREY_OS_EXCEPTION_TEST=guard, writing one byte past the heap at {end:#x}"
         );
-        // SAFETY: `end` is the guard page, which `unmap_4k` deliberately took away, so this
-        // write raises #PF - the point of the run.
+        // SAFETY: `end` is the first page above the arena's mapped pages, which no table entry
+        // describes, so this write raises #PF - the point of the run.
         unsafe { core::ptr::write_volatile(end as *mut u8, 0xa5) };
     }
 
