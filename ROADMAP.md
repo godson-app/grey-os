@@ -25,6 +25,8 @@ milestone, so that this file never claims more than was agreed.
 | M8        | Shell and process model                      | **Done** - criteria 1-5 met; cooperative (ADR-035)          |
 | M9        | Applications                                 | **Done** - criteria 1-5 met; bytecode (ADR-036)            |
 | M10       | SMP, ports, polish                           | **Done** - criteria 1-5 met; APs not started (ADR-037)     |
+| M11       | Hardening before the next primitive          | **Done** - one lock type, one CI command (ADR-038)         |
+| M12       | User mode: ring 3, a syscall gate            | **Done** - 3 programs run, 1 killed by the CPU (ADR-040)   |
 
 ## M0 - Boot, serial diagnostics, diagnosable panics
 
@@ -163,7 +165,7 @@ exception vector, then the 8259 PIC remapped off the exception range, then the P
 
 **Status against them.** All three are met, in QEMU, on the boots `cargo xtask test` performs. The
 boot log reports `gdt loaded: code 0x08, data 0x10, tss 0x18, 16 KiB double-fault stack`,
-`idt loaded: 38 gates of 256 (22 exceptions, 16 irqs)`, `pic remapped to 0x20..=0x2f, only irq0
+`idt loaded: 39 gates of 256 (22 exceptions, 16 irqs, 1 syscall)`, `pic remapped to 0x20..=0x2f, only irq0
 unmasked` and `timer 100 Hz, 13 ticks observed, interrupts enabled, 0 unexpected irqs`. The tick
 count is read only after the boot path has waited for ten of them, so a counter that did not move
 would fail at the wait rather than print a number that looked like progress.
@@ -172,15 +174,19 @@ The fault phases are four further images, each built with `GREY_OS_EXCEPTION_TES
 `gp`, `pf`, `ud` or `df`, each booted and each asserted on its report and on QEMU's exit 35:
 
 ```text
-[exception] #GP general protection fault: error 0x28, rip 0x1000000aad8
+[exception] #GP general protection fault: error 0xfff8, rip 0x1000000aad8
 [exception] #PF page fault: error 0x0 on a read to a not-present page, rip 0x1000000ac51, cr2 0x700000000000
 [exception] #UD invalid opcode: no error code, rip 0x1000000aac4
 [exception] #DF double fault: error 0x0, rip 0x1000000845e
 ```
 
 Each phase faults with a real instruction the CPU refuses - a segment load of a selector past the
-end of the image's own GDT, a read of an unmapped address, `ud2`, and a push onto an unmapped
-stack - rather than by calling a handler from Rust, which would prove only that a function prints.
+end of the image's own GDT (index 8191, `0xfff8`, because an index just past the table stops being
+past it the moment the table grows: M12's user descriptors took it from five entries to seven, and
+the selector M2 used, `0x28`, became the user code descriptor - a readable code segment the CPU
+happily loads into `ds` from ring 0, so the phase quietly stopped faulting), a read of an unmapped
+address, `ud2`, and a push onto an unmapped stack - rather than by calling a handler from Rust, which
+would prove only that a function prints.
 The `#DF` line is criterion 2: it exists because the TSS routed the fault onto its own stack. The
 injected stub moves `RSP` to an address nothing maps and then pushes, so the `#PF` the push raises
 cannot push a frame either and the CPU escalates; the `rip` reported is the stub's `push`, and the
@@ -896,20 +902,94 @@ fib`: the series that `apps/fib.gvm` computes, in the shell's window and on seri
 line after it - and `run nope` saying `NotFound` instead of faulting. Criterion 5 is 13 host tests
 over the reader; 254 on the host in total.
 
+## M11 - Hardening before the next primitive
+
+The review that preceded user mode found three things that would have made the next milestone unsafe
+to build on: seven copies of the same `unsafe impl Sync`, no single command that ran the checks, and
+a headless harness that could hang on an inherited stdin. M11 closes those. It adds no OS primitive,
+which is the point - the primitives come next, and they should arrive on a green tree.
+
+**Delivered.**
+
+1. `kernel/src/sync.rs`: `InterruptMutex<T>` and `IrqGuard`, the kernel's one
+   interior-mutability type. `lock()` returns a guard that masks maskable interrupts and restores
+   the previous flag when it drops, so nesting is safe; `as_ptr()` is the documented escape hatch
+   the allocators need, because `GlobalAlloc` hands them `&self`. The seven sites -
+   `heap::BumpAllocator`, `frame::Allocator`, `arena::Heap`, `scheduler`, `keyboard`, `mouse`, and
+   the desktop pointer in `main.rs` - now use it, and `grep -rn "unsafe impl.*Sync" kernel/src`
+   finds exactly one, in `sync.rs`.
+2. `cargo xtask ci`: formatting, clippy for the host tools, clippy for the kernel's real target with
+   `-D warnings`, the host tests, the whole `xtask test` boot run, and a release build - one
+   command, failing at the first gate.
+3. `.github/workflows/ci.yml`: that command on every push and pull request, with the pinned
+   toolchain, QEMU, and a `target/` cache.
+4. `[profile.release]` gains `panic = "abort"` and `overflow-checks = true`.
+5. `LICENSE` (MIT) and the workspace's `license` field. `README.md`'s storage claim now matches
+   `fs.rs`, which formats only an all-zero sector 0 and refuses anything else.
+6. `boot_headless` sets `Stdio::null()` on QEMU's stdin. `-serial stdio` made QEMU read the
+   terminal as well as write it, and that read is a `SIGTTIN` - not an error - when the harness has
+   no terminal, which is exactly the CI case.
+
+**Acceptance.** `cargo xtask ci` is green from a clean `target/`: 260 host tests, six of them new
+for `sync` (masking, nesting, the `static`, the exclusive borrow), and the thirteen boot phases
+M0-M10 already asserted, unchanged. `git status` is clean afterwards, because every phase restores
+the image it rebuilt.
+
+**Not done, and deliberately.** `InterruptMutex` is not a spinlock: it is still single-core and
+still depends on no interrupt handler taking a lock the interrupted code holds (ADR-028). A guard
+is also not safe to hold across a yield - the scheduler is cooperative, so that rule is a comment
+rather than a check. User mode, preemption and durable writes are the next three themes; the
+milestone that changes the scheduler or the page tables needs this one green first.
+
+## M12 - User mode
+
+Every task until now ran in ring 0, which is a privilege level the kernel gave itself by default.
+M12 is the first milestone where the CPU, not the code, decides what a program may do: a program
+runs at ring 3, in a page table of its own, and can reach the kernel only through one gate.
+
+**Delivered.**
+
+1. `gdt`: `USER_CODE` (0x2b, index 5) and `USER_DATA` (0x33, index 6), DPL 3, installed with the
+   rest of the table; `set_privilege_stack` publishes `TSS.RSP0`, which is the stack the CPU loads
+   when `int 0x80` arrives from ring 3.
+2. `paging`: `map_4k` now sets `USER` on the intermediate levels as well, because the CPU checks the
+   bit at every level and refuses the leaf otherwise. `share_root` builds a new top-level table that
+   points at the kernel's lower tables, so a program's address space shows the kernel's mappings
+   without copying a frame, and `occupied` says which top-level slot the bootloader left free.
+3. `usermode`: an address space per program (one guard page, one read-only code page, three stack
+   pages), the `int 0x80` gate with `DPL 3`, the entry and exit halves in assembly, and three
+   syscalls - write, exit, sleep. The portable half (layout, ABI, dispatch) is tested on the host;
+   the half that needs a CPU is the kernel's only `x86_64`-only code in the module.
+4. `idt`: the syscall gate is the one entry with `DPL 3`; a fault whose saved `cs` names ring 3 ends
+   the program with `128 + vector` instead of panicking the kernel.
+
+**Acceptance.** `cargo xtask test` boots three programs from `kernel/src/usermode.rs`: `hello`
+prints one line and exits 0 after two syscalls; `count` prints three lines across six more entries,
+sleeping between them, and exits with the number of writes it made - which is only right if the
+callee-saved registers survive the gate; `fault` writes the kernel's own text and is killed with
+`#PF` error `0x6` (user, write, present) at exit code 142, and the boot carries on to `boot ok`.
+The tick counts in the reports are how the run shows the timer kept interrupting a ring 3 context.
+
+**Not done, and deliberately.** One program at a time, entered synchronously from a kernel task:
+there is no preemption of ring 3 and no user context in the scheduler, so the timer ticks but cannot
+switch away from a running program. There is no user-space toolchain - the three programs are
+assembly blobs in the kernel's read-only data - no `fork`, no file system in the syscall ABI, and two
+arguments per call. ADR-040 records each of those as the next milestone's work rather than a gap.
+
 ## After M10 - what is not done
 
 The brief's list ends at M10, so this section is no longer a transcription of agreed scope: it is the
 `Open` list of the ten ADRs, gathered in dependency order. Nothing here is agreed and nothing here
 is claimed.
 
-The blockers are named rather than ranked. User mode and system calls come first, because everything
-that follows assumes an address space per program: an ELF loader, a `syscall` gate, and the `GVM1`
-machine moved behind it so that a program cannot touch the kernel's stack. Then preemption (a full
-interrupt frame per task, then per-CPU state), which is also the first step of SMP; then an APIC and
-IOAPIC driver, which makes the PIC and its five ignored source overrides a thing of the past; then a
-real TCP/IP stack or a USB stack, both of which need DMA and a device model this kernel does not have.
-Storage is one extent per file with no free-space reuse, and fixing that is a smaller job than any of
-the above.
+The blockers are named rather than ranked. User mode and system calls were the first, and M12 has them
+in the smallest form that runs: the ring, the address space and the one gate. What is still missing
+there, and what everything after this assumes, is preemption (a full interrupt frame per task, then
+per-CPU state) - a program that can be switched away from rather than only entered - and a loader
+that reads an image the kernel did not write. Then an APIC and IOAPIC driver, which makes the PIC and
+its five ignored source overrides a thing of the past; then a real TCP/IP stack or a USB stack, both
+of which need DMA and a device model this kernel does not have. Storage is one extent per file with
+no free-space reuse, and fixing that is a smaller job than any of the above.
 
 Two items already have a home when their milestone opens: TrueType rasterisation, with the face
 question it drags along, belongs to M7 (ADR-027); and the framebuffer's physical span, which would

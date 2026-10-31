@@ -14,7 +14,7 @@
 //! `static` below is the kernel's single instance.
 
 use crate::memory::{Span, PAGE_BYTES};
-use core::cell::UnsafeCell;
+use crate::sync::InterruptMutex;
 
 /// Frames one bitmap word covers.
 const FRAMES_PER_WORD: usize = u64::BITS as usize;
@@ -189,20 +189,16 @@ struct State {
 /// The kernel's frame allocator, initialised once during boot.
 pub struct Allocator {
     // `alloc` takes `&self` so the allocator can live in a `static`: the same bargain as
-    // `heap::BumpAllocator` (ADR-021).
-    state: UnsafeCell<State>,
+    // `heap::BumpAllocator` (ADR-021). The cell is the kernel's one shared-mutable type, whose
+    // safety argument lives with it in `sync` (ADR-038).
+    state: InterruptMutex<State>,
 }
-
-// SAFETY: the kernel is single-threaded, and no exception or timer handler allocates a frame
-// (ADR-028), so the cell is never entered twice at once. The argument breaks the moment a
-// second thread exists or a handler allocates.
-unsafe impl Sync for Allocator {}
 
 impl Allocator {
     /// An allocator that owns nothing, until [`Allocator::init`].
     pub const fn new() -> Self {
         Self {
-            state: UnsafeCell::new(State {
+            state: InterruptMutex::new(State {
                 words: core::ptr::null_mut(),
                 len: 0,
                 frames: 0,
@@ -226,7 +222,7 @@ impl Allocator {
             return false;
         }
         // SAFETY: `self` is the only reference to the cell, and it does not escape this call.
-        let state = unsafe { &mut *self.state.get() };
+        let state = unsafe { &mut *self.state.as_ptr() };
         if !state.words.is_null() {
             return false;
         }
@@ -241,7 +237,7 @@ impl Allocator {
     fn with<R>(&self, f: impl FnOnce(&mut Bitmap<'_>) -> R) -> Option<R> {
         // SAFETY: `words` and `len` are written once by `init` and never changed afterwards,
         // and the slice formed here does not outlive the call.
-        let state = unsafe { &*self.state.get() };
+        let state = unsafe { &*self.state.as_ptr() };
         if state.words.is_null() {
             return None;
         }
@@ -275,7 +271,7 @@ impl Allocator {
     pub fn stats(&self) -> Option<Stats> {
         // SAFETY: as `with`; only `init` writes these fields, and it has already run when the
         // pointer is non-null.
-        let state = unsafe { &*self.state.get() };
+        let state = unsafe { &*self.state.as_ptr() };
         if state.words.is_null() {
             return None;
         }

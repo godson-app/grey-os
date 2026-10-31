@@ -14,7 +14,8 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use grey_os::{
     acpi, apps, arena, compositor, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap,
-    idt, keyboard, memory, mouse, paging, pic, qemu, scheduler, serial, theme, timer, vm, window,
+    idt, keyboard, memory, mouse, paging, pic, qemu, scheduler, serial, sync, theme, timer,
+    usermode, vm, window,
 };
 // The shell only exists in the acceptance build: a normal boot has no way to type into it and
 // a kernel that waited for a command would hang the harness's clean boot.
@@ -310,6 +311,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             qemu::exit_qemu(qemu::QemuExitCode::Failed);
         }
     };
+
+    // Ring 3's stack for the gate, and the window its loader writes program images through.
+    // After `gdt::init`, because the TSS descriptor has to be the one the CPU was told about.
+    usermode::init(offset);
 
     // Where the framebuffer physically lives. It is ordinary RAM that firmware happens to
     // display from, so the map below may well offer its pages as usable; a heap that took them
@@ -837,7 +842,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         gdt::STACK_BYTES / 1024
     );
     println!(
-        "grey-os: idt loaded: {} gates of 256 ({} exceptions, 16 irqs)",
+        "grey-os: idt loaded: {} gates of 256 ({} exceptions, 16 irqs, 1 syscall)",
         idt::gates(),
         idt::EXCEPTIONS.len()
     );
@@ -1013,7 +1018,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // and cannot borrow the boot's.
     let desktop: &'static mut compositor::Compositor =
         alloc::boxed::Box::leak(alloc::boxed::Box::new(desktop));
-    DESKTOP.set(desktop as *mut compositor::Compositor);
+    *DESKTOP.lock() = desktop as *mut compositor::Compositor;
 
     let counter = scheduler::spawn("counter", task_counter);
     let sleeper = scheduler::spawn("sleeper", task_sleeper);
@@ -1069,6 +1074,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         APP_STEPS.load(Ordering::Relaxed)
     );
 
+    // P2: the same machine, one privilege level down. Three programs, each proving a different
+    // half of the mechanism - see `user_demo`.
+    user_demo();
+
     // The shell: the input run drives it with typed commands, and a normal boot lets it run
     // for a second so the window is not empty. There is no way to end a session except
     // `exit`, and a kernel that waited forever would hang the harness's clean boot, so the
@@ -1120,12 +1129,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // called from Rust, which would prove only that a function prints.
     #[cfg(grey_os_fault_gp)]
     {
-        println!("grey-os: GREY_OS_EXCEPTION_TEST=gp, loading a selector that is not in the gdt");
-        // SAFETY: deliberately loads selector 0x28, which is past the end of the five-entry
-        // table loaded at boot. The #GP it raises is the point of the run: the handler
-        // reports it and exits.
+        println!("grey-os: GREY_OS_EXCEPTION_TEST=gp, loading a selector the gdt cannot reach");
+        // SAFETY: deliberately loads selector 0xfff8 - index 8191, far past the end of the
+        // seven-entry table loaded at boot, and past the end of any table this kernel will
+        // build. The #GP it raises is the point of the run: the handler reports it and exits.
+        //
+        // An index just past the table would be the more natural choice and is the wrong one:
+        // 0x28 is past the five entries M2 had and *inside* the seven M12 has, where it names
+        // the user code descriptor - a readable code segment, which the CPU will happily put in
+        // `ds` from ring 0. The test silently stopped faulting when the table grew, which is
+        // exactly what a selector that depends on the table's size buys.
         unsafe {
-            core::arch::asm!("mov ax, 0x28", "mov ds, ax", out("ax") _);
+            core::arch::asm!("mov ax, 0xfff8", "mov ds, ax", out("ax") _);
         }
     }
 
@@ -1535,39 +1550,17 @@ fn boot_number(bytes: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
-/// Reports a filesystem that refused the disk, then stops: every later milestone reads
-/// files, so carrying on without storage would only move the failure further from its
-/// cause.
 /// The desktop, once it has moved into the arena so tasks can reach it.
 ///
 /// A task has its own stack and cannot borrow the boot's, and the compositor is too big to
 /// copy. So the boot leaks it and publishes the address: every task that draws goes through
 /// [`with_desktop`], and the borrow it takes lasts for one function call inside a cooperative
 /// scheduler - a task cannot be switched away from in the middle of one.
-struct DesktopCell(UnsafeCell<*mut compositor::Compositor>);
-
-// SAFETY: the kernel is single-core and the only writers are the boot task and the tasks it
-// switches to, which never run at the same time.
-unsafe impl Sync for DesktopCell {}
-
-impl DesktopCell {
-    /// A cell with no desktop in it yet.
-    const fn new() -> Self {
-        Self(UnsafeCell::new(core::ptr::null_mut()))
-    }
-
-    /// Publishes the desktop. Called once, after the boot has drawn its first frame.
-    ///
-    /// Takes a raw pointer rather than a `&'static mut` so the boot task can keep using the
-    /// desktop it just published: a reference handed to a cell would be borrowed for the rest
-    /// of the function.
-    fn set(&self, desktop: *mut compositor::Compositor) {
-        // SAFETY: nothing reads the cell before this call, and this is the only write.
-        unsafe { *self.0.get() = desktop };
-    }
-}
-
-static DESKTOP: DesktopCell = DesktopCell::new();
+///
+/// The cell holds the pointer, not the compositor: it is `InterruptMutex` so the read in
+/// `with_desktop` and the write during boot cannot interleave with a handler (ADR-038).
+static DESKTOP: sync::InterruptMutex<*mut compositor::Compositor> =
+    sync::InterruptMutex::new(core::ptr::null_mut());
 
 /// The window the tasks write into.
 static TASKS_WINDOW: AtomicU32 = AtomicU32::new(0);
@@ -1601,14 +1594,14 @@ fn with_storage<R>(use_fs: impl FnOnce(&mut fs::Filesystem<disk::Pio>) -> R) -> 
 
 /// Runs `draw` against the desktop, or returns `None` if the boot has not published it yet.
 fn with_desktop<R>(draw: impl FnOnce(&mut compositor::Compositor) -> R) -> Option<R> {
-    // SAFETY: `set` ran before any task was spawned, so a non-null pointer is a live desktop
-    // that outlives the kernel, and the borrow ends when `draw` returns.
-    let pointer = unsafe { *DESKTOP.0.get() };
+    // The cell guards the pointer; the desktop it names is leaked and outlives the kernel.
+    let pointer = *DESKTOP.lock();
     if pointer.is_null() {
         return None;
     }
-    // SAFETY: as above. A task's call runs to completion - the scheduler only switches when a
-    // task asks it to - so no two tasks hold this borrow at once.
+    // SAFETY: the boot published the pointer before any task was spawned, so a non-null value
+    // is live; a task's call runs to completion, because the scheduler only switches when a
+    // task asks it to, so no two tasks hold this borrow at once.
     Some(draw(unsafe { &mut *pointer }))
 }
 
@@ -1819,6 +1812,63 @@ fn task_fib() {
 /// harness to type; a normal boot gets a short demonstration.
 #[cfg(grey_os_input_test)]
 const SHELL_TICKS: u64 = 2400;
+
+/// Where a ring 3 program's output goes: the serial log and the applications window.
+///
+/// A program writes bytes at a pointer, so they arrive here as bytes and are decoded once. The
+/// kernel's own prefix is deliberate: a log that mixes the kernel's lines with a program's has
+/// to say which is which, and the harness asserts on `user>` so a program that printed nothing
+/// cannot pass.
+fn user_output(bytes: &[u8]) {
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        // `dispatch` refuses text that is not UTF-8 before it reaches here, so this branch is
+        // for a future caller. Silence rather than a panic: a program's bytes are not worth
+        // stopping the machine for.
+        return;
+    };
+    let window = APPS_WINDOW.load(Ordering::Relaxed);
+    for line in text.split('\n').filter(|line| !line.is_empty()) {
+        println!("grey-os: user> {line}");
+        with_desktop(|desktop| {
+            if let Some(app_window) = desktop.windows.window_mut(window) {
+                app_window.push_line(alloc::string::String::from(line));
+                let rect = app_window.rect;
+                desktop.windows.damage(rect);
+            }
+        });
+    }
+}
+
+/// Runs the three ring 3 programs and says what each one proved.
+///
+/// Hello: the ring change happens, the gate works, and `leave` puts the kernel back exactly
+/// where it was - a report that names the exit code is only possible if `iretq` and the stack
+/// switch were both right. Count: the callee-saved registers survive six entries into the
+/// kernel, and the timer keeps ticking while a user context holds the CPU. Fault: a program
+/// that writes the kernel's own text is killed by the CPU rather than by a check, and the
+/// kernel carries on to print the report.
+fn user_demo() {
+    let programs = [
+        ("hello", usermode::hello_program()),
+        ("count", usermode::count_program()),
+        ("fault", usermode::fault_program()),
+    ];
+    for (name, program) in programs {
+        match usermode::run(program, user_output) {
+            Ok(report) => println!(
+                "grey-os: user ok: {name} exited {}, {} syscalls, {} bytes, {} ticks in ring 3",
+                report.exit, report.syscalls, report.bytes, report.ticks
+            ),
+            Err(error) => {
+                // A ring 3 harness that cannot start is a broken boot, not a bad program: the
+                // failure is in the address space or the frame allocator, and continuing would
+                // report a desktop that never proved the isolation it claims.
+                println!("grey-os: FATAL: ring 3 program `{name}` did not run: {error:?}");
+                qemu::exit_qemu(qemu::QemuExitCode::Failed);
+            }
+        }
+    }
+}
 
 /// The shell, driven by the keyboard's queue.
 ///

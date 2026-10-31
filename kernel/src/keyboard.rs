@@ -324,13 +324,13 @@ impl Default for Queue {
 /// `x86_64`-only: everything here is a port or an interrupt.
 #[cfg(target_arch = "x86_64")]
 mod device {
-    use core::cell::UnsafeCell;
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::{Decoder, Event, Queue};
     use crate::idt::{self, InterruptFrame};
     use crate::pic;
     use crate::port::{inb, outb};
+    use crate::sync::InterruptMutex;
 
     /// The controller's data port and its status/command port.
     const DATA: u16 = 0x60;
@@ -365,17 +365,10 @@ mod device {
     /// microseconds; a hundred thousand polls is already far past "something is wrong".
     const POLLS: u32 = 100_000;
 
-    /// A cell the kernel's single-threaded boot may hand out mutably, because every borrow
-    /// of it is bounded by either an interrupt mask or the fact that only the handler runs
-    /// while the reader is masked out.
-    struct Cell<T>(UnsafeCell<T>);
-
-    // SAFETY: `Queue` and `Decoder` are written by the IRQ handler and by `pop`, and `pop`
-    // masks interrupts across its access, so no two borrows of the same cell overlap.
-    unsafe impl<T: Send> Sync for Cell<T> {}
-
-    static QUEUE: Cell<Queue> = Cell(UnsafeCell::new(Queue::new()));
-    static DECODER: Cell<Decoder> = Cell(UnsafeCell::new(Decoder::new()));
+    /// `QUEUE` and `DECODER` are written by the IRQ handler and by `pop`, and `pop` masks
+    /// interrupts across its access, so no two borrows of the same cell overlap (ADR-038).
+    static QUEUE: InterruptMutex<Queue> = InterruptMutex::new(Queue::new());
+    static DECODER: InterruptMutex<Decoder> = InterruptMutex::new(Decoder::new());
     static EVENTS: AtomicU64 = AtomicU64::new(0);
     static DROPPED: AtomicU64 = AtomicU64::new(0);
 
@@ -503,10 +496,10 @@ mod device {
             let byte = unsafe { inb(DATA) };
             // SAFETY: the handler is the only writer of the decoder while the reader is
             // either masked or the one that masked it, and this borrow ends with the block.
-            let decoder = unsafe { &mut *DECODER.0.get() };
+            let decoder = unsafe { &mut *DECODER.as_ptr() };
             if let Some(event) = decoder.feed(byte) {
                 // SAFETY: as above, for the queue; `push` is the producer's half of the ring.
-                let queued = unsafe { (&mut *QUEUE.0.get()).push(event) };
+                let queued = unsafe { (&mut *QUEUE.as_ptr()).push(event) };
                 if queued {
                     EVENTS.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -528,7 +521,7 @@ mod device {
         }
         // SAFETY: the handler cannot run while interrupts are off, so no other borrow of
         // the queue exists for the length of this statement.
-        let event = unsafe { (&mut *QUEUE.0.get()).pop() };
+        let event = unsafe { (&mut *QUEUE.as_ptr()).pop() };
         if enabled {
             idt::enable();
         }
@@ -549,7 +542,7 @@ mod device {
     pub fn modifiers() -> super::Modifiers {
         // SAFETY: reading a `Copy` value that the handler may also be writing; a torn read
         // would be one modifier byte, and the handler's next event carries the truth.
-        unsafe { (*DECODER.0.get()).modifiers() }
+        unsafe { (*DECODER.as_ptr()).modifiers() }
     }
 }
 

@@ -16,8 +16,9 @@
 //! `BootInfo::physical_memory_offset` before calling [`BumpAllocator::init`].
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
 use core::ptr;
+
+use crate::sync::InterruptMutex;
 
 /// What the boot log reports, and what a later leak hunt will read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,21 +47,14 @@ struct State {
 pub struct BumpAllocator {
     // `GlobalAlloc` takes `&self`, so the cursor needs interior mutability for the
     // allocator to stay in a `static`.
-    state: UnsafeCell<State>,
+    state: InterruptMutex<State>,
 }
-
-// SAFETY: the kernel is single-threaded and no interrupt handler allocates, so this
-// cell is never entered twice at once. From M2 on the second half of that is a rule with a
-// reason: exception and timer handlers may not allocate or print, because either would enter
-// this cell (or the console) while the interrupted code still holds it (ADR-028). The
-// argument breaks the moment a handler does, or a second thread exists.
-unsafe impl Sync for BumpAllocator {}
 
 impl BumpAllocator {
     /// A heap holding nothing, ready for [`BumpAllocator::init`].
     pub const fn new() -> Self {
         Self {
-            state: UnsafeCell::new(State {
+            state: InterruptMutex::new(State {
                 cursor: 0,
                 stats: Stats {
                     base: 0,
@@ -90,8 +84,9 @@ impl BumpAllocator {
             return false;
         }
         // SAFETY: `self` is a valid reference, and the reference formed here does
-        // not outlive this function, so the cell is never aliased.
-        let state = unsafe { &mut *self.state.get() };
+        // not outlive this function, so the cell is never aliased. Interrupts are not masked
+        // here because the bootstrap allocator runs before any handler is installed.
+        let state = unsafe { &mut *self.state.as_ptr() };
         if state.stats.end != 0 {
             return false;
         }
@@ -106,7 +101,7 @@ impl BumpAllocator {
     pub fn stats(&self) -> Stats {
         // SAFETY: as in `init` - a single read of a cell nothing else is touching,
         // and `State` is `Copy`, so no reference to the cell escapes.
-        unsafe { *self.state.get() }.stats
+        unsafe { *self.state.as_ptr() }.stats
     }
 }
 
@@ -136,8 +131,9 @@ unsafe impl GlobalAlloc for BumpAllocator {
             // byte it would never be able to give back.
             return layout.align() as *mut u8;
         }
-        // SAFETY: as in `init`. Nothing else runs concurrently, per the `Sync` impl.
-        let state = unsafe { &mut *self.state.get() };
+        // SAFETY: as in `init`. Nothing else runs concurrently: no interrupt handler
+        // allocates, and the host tests point each allocator at its own buffer.
+        let state = unsafe { &mut *self.state.as_ptr() };
         let Some(cursor) = align_up(state.cursor, layout.align()) else {
             return ptr::null_mut();
         };

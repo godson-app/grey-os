@@ -13,6 +13,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "MIT"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -27,6 +28,7 @@ name = "grey-os"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 default-run = "qemu-uefi"
 
 [lints]
@@ -44,3 +46,11 @@ bootloader = "0.11"
 [profile.release]
 lto = true
 codegen-units = 1
+# A kernel cannot unwind, and an unwind through `extern "x86-interrupt"` is undefined
+# behaviour anyway: abort is the only honest panic strategy here, and it is also what makes
+# the panic handler's `-> !` true of the code the compiler generates.
+panic = "abort"
+# On by default in debug and off in release, which means the fast build is the one that
+# silently wraps. An OS that hands out frames and sizes has to be the one that fails loudly,
+# so the check stays on in both profiles and the boot test exercises it.
+overflow-checks = true

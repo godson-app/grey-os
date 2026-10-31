@@ -21,6 +21,16 @@ pub const KERNEL_DATA: u16 = 2 << 3;
 /// Selector of the task state segment (table index 3; its descriptor is two slots long).
 pub const TSS: u16 = 3 << 3;
 
+/// Selector of the 64-bit user code descriptor, at ring 3.
+///
+/// Index 5, not 4: the TSS descriptor is sixteen bytes and takes slots 3 and 4, so the next
+/// free slot is 5. Requesting ring 3 in the bottom two bits is what makes `iretq` change
+/// privilege, and what lets `int 0x80` through a gate whose DPL is 3 (ADR-040).
+pub const USER_CODE: u16 = 5 << 3 | 3;
+
+/// Selector of the user data descriptor, at ring 3. Index 6, directly above the code segment.
+pub const USER_DATA: u16 = 6 << 3 | 3;
+
 /// Bytes of stack reserved for the double-fault handler.
 pub const STACK_BYTES: usize = 16 * 1024;
 
@@ -34,6 +44,14 @@ const CODE_ACCESS: u8 = 0x9a;
 /// Present, ring 0, readable and writable data.
 #[cfg(any(target_arch = "x86_64", test))]
 const DATA_ACCESS: u8 = 0x92;
+
+/// Present, ring 3, executable and readable code.
+#[cfg(any(target_arch = "x86_64", test))]
+const USER_CODE_ACCESS: u8 = 0xfa;
+
+/// Present, ring 3, readable and writable data.
+#[cfg(any(target_arch = "x86_64", test))]
+const USER_DATA_ACCESS: u8 = 0xf2;
 
 /// Present, ring 0, available 64-bit TSS.
 const TSS_ACCESS: u8 = 0x89;
@@ -89,8 +107,9 @@ impl Descriptor {
 #[repr(C, packed)]
 pub struct TaskStateSegment {
     reserved_0: u32,
-    /// `RSP0..RSP2`, the stacks the CPU loads on entry to ring 0..2. Unused until M8: the
-    /// kernel never runs ring 3 code yet.
+    /// `RSP0..RSP2`, the stacks the CPU loads on entry to ring 0..2. Only `RSP0` is used: it
+    /// is where every interrupt and every `int 0x80` lands while a user program runs, because
+    /// the ring-3 stack is not somewhere the kernel can push a frame (ADR-040).
     privilege_stack_table: [u64; 3],
     reserved_1: u64,
     /// `IST1..IST7`, stacks for handlers that must not run on a stack that may be broken.
@@ -103,7 +122,8 @@ pub struct TaskStateSegment {
 
 impl TaskStateSegment {
     /// Every stack unset. `iomap_base` past the limit denies ring 3 every port, which is the
-    /// only answer available before there is ring 3.
+    /// only answer available before there is ring 3 - and stays the answer afterwards: a user
+    /// program reaches the kernel through one gate and touches no hardware directly.
     pub const fn new() -> Self {
         Self {
             reserved_0: 0,
@@ -156,8 +176,8 @@ mod arch {
 
     static mut DOUBLE_FAULT_STACK: Stack = Stack([0; STACK_BYTES]);
 
-    /// Null, code, data, and the two slots the TSS descriptor needs.
-    static mut TABLE: [u64; 5] = [0; 5];
+    /// Null, code, data, the two slots the TSS descriptor needs, and the two user descriptors.
+    static mut TABLE: [u64; 7] = [0; 7];
 
     static mut TSS_STATE: TaskStateSegment = TaskStateSegment::new();
 
@@ -192,8 +212,16 @@ mod arch {
             (*table)[3] = low;
             (*table)[4] = high;
 
+            // The two descriptors ring 3 runs on. Their base and limit are zero-based and
+            // flat like the kernel's, because paging decides what a user program can reach:
+            // segmentation in long mode has already stopped meaning anything (ADR-040).
+            (*table)[5] =
+                Descriptor::new(0, 0xfffff, super::USER_CODE_ACCESS, super::CODE_FLAGS).raw();
+            (*table)[6] =
+                Descriptor::new(0, 0xfffff, super::USER_DATA_ACCESS, super::DATA_FLAGS).raw();
+
             let pointer = TablePointer {
-                limit: (size_of::<[u64; 5]>() - 1) as u16,
+                limit: (size_of::<[u64; 7]>() - 1) as u16,
                 base: table as u64,
             };
             // SAFETY: `pointer` describes `TABLE`, which stays at that address for the rest
@@ -239,10 +267,31 @@ mod arch {
             );
         }
     }
+
+    /// Sets `RSP0`, the stack the CPU switches to when ring 3 enters ring 0.
+    ///
+    /// Written through an unaligned store because the TSS is `packed` and `RSP0` sits at
+    /// offset 4. The CPU reads this field on every privilege change rather than caching it,
+    /// so setting it after `ltr` is enough - which is why it is a separate call and not part
+    /// of [`init`].
+    ///
+    /// # Safety
+    ///
+    /// `top` must be the top (highest byte, 16-byte aligned) of a stack the kernel owns and
+    /// will keep for as long as ring 3 can run: every interrupt taken in ring 3 pushes onto
+    /// it, and a `top` that names freed or user memory is a fault inside the first interrupt.
+    pub unsafe fn set_privilege_stack(top: u64) {
+        // SAFETY: the caller promises `top` is a live kernel stack; the write is a single
+        // eight-byte store to a field of a static that outlives the boot.
+        unsafe {
+            let tss = &raw mut TSS_STATE;
+            addr_of_mut!((*tss).privilege_stack_table[0]).write_unaligned(top);
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use arch::init;
+pub use arch::{init, set_privilege_stack};
 
 #[cfg(test)]
 mod tests {
@@ -286,6 +335,35 @@ mod tests {
         assert_eq!((low >> 32) & 0xff, 0x78);
         assert_eq!((low >> 56) & 0xff, 0x01);
         assert_eq!((low >> 40) & 0xff, u64::from(TSS_ACCESS));
+    }
+
+    #[test]
+    fn the_user_descriptors_are_ring_three_and_flat() {
+        // What `iretq` needs to drop to ring 3: a code segment whose DPL is 3, readable so a
+        // program can run its own code, and a data segment whose DPL is 3 and writable.
+        let code = Descriptor::new(0, 0xfffff, USER_CODE_ACCESS, CODE_FLAGS);
+        assert_eq!(code.raw(), 0x00af_fa00_0000_ffff);
+        let data = Descriptor::new(0, 0xfffff, USER_DATA_ACCESS, DATA_FLAGS);
+        assert_eq!(data.raw(), 0x00cf_f200_0000_ffff);
+        // The DPL is the top two bits of the access byte's low nibble pair, and both say 3.
+        assert_eq!((code.raw() >> 45) & 0x3, 3);
+        assert_eq!((data.raw() >> 45) & 0x3, 3);
+    }
+
+    #[test]
+    fn the_user_selectors_name_slots_five_and_six_with_rpl_three() {
+        // Slot 5 and 6, because the TSS descriptor occupies 3 and 4: a selector of 0x23 would
+        // name the second half of the TSS, which is not a code segment at all.
+        assert_eq!(USER_CODE, 0x2b);
+        assert_eq!(USER_DATA, 0x33);
+        assert_eq!(usize::from(USER_CODE >> 3), 5);
+        assert_eq!(usize::from(USER_DATA >> 3), 6);
+        // The bottom two bits are the requested privilege level, and `iretq` reads them.
+        assert_eq!(USER_CODE & 0x3, 3);
+        assert_eq!(USER_DATA & 0x3, 3);
+        // The kernel's own selectors stay at ring 0, or `iretq` would not change privilege.
+        assert_eq!(KERNEL_CODE & 0x3, 0);
+        assert_eq!(KERNEL_DATA & 0x3, 0);
     }
 
     #[test]

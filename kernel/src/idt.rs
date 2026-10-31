@@ -317,6 +317,13 @@ mod arch {
     /// First vector the PIC's IRQs arrive on, once [`crate::pic::init`] has run.
     const IRQ_BASE: u8 = 0x20;
 
+    /// The one vector a program may raise itself.
+    ///
+    /// `0x80` because it is the hole the PC's own software-interrupt custom left: the first 32
+    /// vectors are the CPU's, `0x20..=0x2f` are the PIC's, and everything above is free - so
+    /// the choice is about being recognisable in a log, not about avoiding a collision.
+    const SYSCALL_VECTOR: usize = 0x80;
+
     /// The table itself. Built once during boot, then only read - by the CPU as well as by
     /// [`gates`].
     static mut TABLE: [Entry; 256] = [Entry::absent(); 256];
@@ -354,6 +361,16 @@ mod arch {
     /// the same story to the panel and to QEMU's exit status.
     fn report(exception: Exception, error: Option<u64>, frame: &InterruptFrame) -> ! {
         let ip = frame.instruction_pointer;
+        // A fault from ring 3 belongs to the program, not to the kernel: it ends the program
+        // with a code that says which vector killed it, and the kernel carries on. The low two
+        // bits of the saved `cs` are the privilege level the CPU was at - the only field of a
+        // selector long mode still consults - so this is the check, not a guess from the
+        // address.
+        if frame.code_segment & 3 == 3 {
+            // `CR2` holds a valid faulting address for `#PF` and nothing else.
+            let address = (exception.vector == 14).then(read_cr2);
+            crate::usermode::killed_by_fault(exception, error, ip, address);
+        }
         match (exception.vector, error) {
             (14, Some(code)) => {
                 let fault = PageFaultError::new(code);
@@ -511,6 +528,12 @@ mod arch {
             let table = &raw mut TABLE;
             install_exception_gates(table);
             install_irq_stubs(table);
+            // The gate back: the only entry in this table with `DPL 3`, which is what makes it
+            // the only one a ring 3 program can raise. `ist 0` sends the transition through
+            // `TSS.RSP0`, so the stub starts on the kernel's own stack rather than on the
+            // program's.
+            (*table)[SYSCALL_VECTOR] =
+                Entry::interrupt_gate(crate::usermode::syscall_gate(), KERNEL_CODE, 0, 3);
             let pointer = TablePointer {
                 limit: (size_of::<[Entry; 256]>() - 1) as u16,
                 base: table as u64,

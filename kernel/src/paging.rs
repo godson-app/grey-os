@@ -254,11 +254,13 @@ pub enum MapError {
 ///
 /// `flags` are [`Entry`] bits for the leaf - [`Entry::WRITABLE`], [`Entry::NO_EXECUTE`],
 /// [`Entry::USER`] - and `PRESENT` is added here, because an entry the CPU treats as absent is
-/// not a mapping. The levels created on the way down carry `PRESENT | WRITABLE` and nothing
-/// else, which is deliberate twice over: a write needs the `WRITABLE` bit at every level, so
-/// leaving it off a parent would make a writable leaf read-only; and `NO_EXECUTE` on a parent
-/// applies to everything below it, so putting it there would silently deny a leaf that asked
-/// to be executable.
+/// not a mapping. The levels created on the way down carry `PRESENT | WRITABLE`, plus `USER`
+/// when the leaf asked for it, and nothing else. That last part is deliberate twice over: a
+/// write needs the `WRITABLE` bit at every level, so leaving it off a parent would make a
+/// writable leaf read-only; and `NO_EXECUTE` on a parent applies to everything below it, so
+/// putting it there would silently deny a leaf that asked to be executable. `USER` has to
+/// travel down for the same kind of reason: the CPU checks it at every level, so a leaf that
+/// says "ring 3 may read this" is unreachable if the table that names it does not (ADR-040).
 pub fn map<T>(
     tables: &mut T,
     root: u64,
@@ -273,17 +275,15 @@ where
         return Err(MapError::Misaligned);
     }
     let mut table = root;
+    // The bits a table created on the way down inherits from the leaf's request.
+    let parents = Entry::PRESENT | Entry::WRITABLE | (flags & Entry::USER);
     for level in [Level::Pml4, Level::Pdpt, Level::Pd] {
         let slot = index(address, level);
         let entry = tables.read(table, slot);
         if !entry.is_present() {
             let fresh = tables.alloc().ok_or(MapError::NoFrame)?;
             tables.zero(fresh);
-            tables.write(
-                table,
-                slot,
-                Entry::pointing_at(fresh, Entry::PRESENT | Entry::WRITABLE),
-            );
+            tables.write(table, slot, Entry::pointing_at(fresh, parents));
             table = fresh;
             continue;
         }
@@ -490,6 +490,52 @@ mod arch {
         unsafe { copy_table(root, offset, Level::Pml4, &mut alloc) }
     }
 
+    /// Builds a root that maps everything `source` maps, by pointing at the same tables.
+    ///
+    /// One frame is allocated and every present top-level entry is copied into it; nothing
+    /// below is touched. That is the opposite trade from [`clone_root`], and the right one
+    /// here: the kernel's half of the map - its code, its stack, the physical window, the
+    /// framebuffer, the arena - is tens of thousands of frames and all of it supervisor-only,
+    /// so a copy would cost pages to reproduce a map that no user program can read anyway.
+    /// What the copy buys is the ability to write *new* top-level entries: a user space fills
+    /// in one slot, and the tables the kernel is using in the slots beside it are neither
+    /// copied nor disturbed.
+    ///
+    /// # Safety
+    ///
+    /// `offset` must be the physical window, `source` the root `CR3` names (or another live
+    /// tree of the same shape), and `target` a frame nothing else uses and nothing else maps.
+    pub unsafe fn share_root(target: u64, source: u64, offset: u64) {
+        // SAFETY: the caller promises `target` is a free, mapped frame.
+        unsafe { zero_frame(offset, target) };
+        for entry in 0..ENTRIES {
+            // SAFETY: `source` is a live table and `entry` is one of its indices.
+            let copied = unsafe { read_entry(offset, source, entry) };
+            if copied.is_present() {
+                // SAFETY: `target` is a table of the same level, and `entry` is in range.
+                unsafe { write_entry(offset, target, entry, copied) };
+            }
+        }
+    }
+
+    /// Which top-level entries of `root` are present.
+    ///
+    /// A user address space needs a slot of its own, and this is how one is found: the
+    /// alternative is a hardcoded index, which is a claim about where the bootloader put the
+    /// kernel rather than a fact about the machine in front of it.
+    ///
+    /// # Safety
+    ///
+    /// As [`walk`]: `root` must be a live table and `offset` the physical window.
+    pub unsafe fn occupied(root: u64, offset: u64) -> [bool; ENTRIES] {
+        let mut used = [false; ENTRIES];
+        for (slot, present) in used.iter_mut().enumerate() {
+            // SAFETY: `root` is a live PML4 and `slot` is one of its 512 indices.
+            *present = unsafe { read_entry(offset, root, slot) }.is_present();
+        }
+        used
+    }
+
     /// Takes away the 4 KiB mapping at `address`, splitting a 2 MiB page if one covers it.
     ///
     /// The physical window is mapped with 2 MiB pages, so a single 4 KiB hole inside it is not
@@ -638,7 +684,9 @@ mod arch {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use arch::{clone_root, load_root, map_4k, root, span, unmap_4k, walk, UnmapError};
+pub use arch::{
+    clone_root, load_root, map_4k, occupied, root, share_root, span, unmap_4k, walk, UnmapError,
+};
 
 #[cfg(test)]
 mod tests {
@@ -931,6 +979,41 @@ mod tests {
         let leaf = pool.read(Pool::<8>::frame(3), index(FRESH, Level::Pt));
         assert!(leaf.is_present() && leaf.is_writable() && !leaf.is_executable());
         assert_eq!(leaf.address(), FRAME);
+    }
+
+    #[test]
+    fn a_user_leaf_makes_the_tables_below_it_user_accessible() {
+        // The CPU checks the user bit at every level, so a leaf that says ring 3 may reach it
+        // is unreachable unless every table that names it says the same. This is the bug that
+        // would otherwise show up as a #PF on the first instruction of a user program.
+        let mut pool = Pool::<8>::new();
+        let root = Pool::<8>::frame(0);
+        map(&mut pool, root, FRESH, FRAME, Entry::USER | Entry::WRITABLE)
+            .expect("an empty root takes the mapping");
+        let mut table = root;
+        for level in [Level::Pml4, Level::Pdpt, Level::Pd] {
+            let entry = pool.read(table, index(FRESH, level));
+            assert_ne!(entry.bits() & Entry::USER, 0, "a parent is supervisor-only");
+            table = entry.address();
+        }
+        let leaf = pool.read(table, index(FRESH, Level::Pt));
+        assert_ne!(leaf.bits() & Entry::USER, 0, "the leaf lost its flag");
+
+        // A kernel mapping is unchanged by any of this: no user bit on the leaf or on any
+        // table that names it, so ring 3 cannot reach the same address through it.
+        let mut pool = Pool::<8>::new();
+        let root = Pool::<8>::frame(0);
+        map(&mut pool, root, FRESH, FRAME, Entry::WRITABLE).expect("a kernel mapping");
+        let mut table = root;
+        for level in [Level::Pml4, Level::Pdpt, Level::Pd] {
+            let entry = pool.read(table, index(FRESH, level));
+            assert_eq!(entry.bits() & Entry::USER, 0, "a kernel parent went user");
+            table = entry.address();
+        }
+        assert_eq!(
+            pool.read(table, index(FRESH, Level::Pt)).bits() & Entry::USER,
+            0
+        );
     }
 
     #[test]

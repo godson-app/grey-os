@@ -142,13 +142,13 @@ pub enum MouseError {
 /// The 8042's second port, its interrupt, and the position it moves.
 #[cfg(target_arch = "x86_64")]
 mod device {
-    use core::cell::UnsafeCell;
     use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
     use super::{Mouse, Parser};
     use crate::idt::{self, InterruptFrame};
     use crate::pic;
     use crate::port::{inb, outb};
+    use crate::sync::InterruptMutex;
 
     /// The same two ports the keyboard uses: one controller, two ports.
     const DATA: u16 = 0x60;
@@ -182,14 +182,10 @@ mod device {
     /// The value [`last_ack`] reports when nothing came back at all.
     const NO_ACK: u32 = 0x100;
 
-    struct Cell<T>(UnsafeCell<T>);
-
-    // SAFETY: `PARSER` and `MOUSE` are written by the IRQ handler and read through the
-    // getters below, which each read one `Copy` value; the handler is the only writer.
-    unsafe impl<T: Send> Sync for Cell<T> {}
-
-    static PARSER: Cell<Parser> = Cell(UnsafeCell::new(Parser::new()));
-    static MOUSE: Cell<Mouse> = Cell(UnsafeCell::new(Mouse::new(0, 0)));
+    /// `PARSER` and `MOUSE` are written by the IRQ handler and read through the getters
+    /// below, which each read one `Copy` value; the handler is the only writer (ADR-038).
+    static PARSER: InterruptMutex<Parser> = InterruptMutex::new(Parser::new());
+    static MOUSE: InterruptMutex<Mouse> = InterruptMutex::new(Mouse::new(0, 0));
     static WIDTH: AtomicU32 = AtomicU32::new(0);
     static HEIGHT: AtomicU32 = AtomicU32::new(0);
     static PACKETS: AtomicU64 = AtomicU64::new(0);
@@ -296,7 +292,7 @@ mod device {
         // Start in the middle: a pointer at the origin sits under the boot log's first line.
         // SAFETY: nothing has read the mouse yet, and `apply` is the only writer after this.
         unsafe {
-            *MOUSE.0.get() = Mouse::new((width / 2) as i32, (height / 2) as i32);
+            *MOUSE.as_ptr() = Mouse::new((width / 2) as i32, (height / 2) as i32);
         }
         // SAFETY: the caller promised this runs after the keyboard's own setup.
         unsafe {
@@ -376,12 +372,12 @@ mod device {
             let byte = unsafe { inb(DATA) };
             // SAFETY: the handler is the only writer of the parser, and this borrow ends
             // with the block.
-            let packet = unsafe { (*PARSER.0.get()).feed(byte) };
+            let packet = unsafe { (*PARSER.as_ptr()).feed(byte) };
             if let Some(packet) = packet {
                 let width = WIDTH.load(Ordering::Relaxed);
                 let height = HEIGHT.load(Ordering::Relaxed);
                 // SAFETY: as above, for the position.
-                unsafe { (*MOUSE.0.get()).apply(packet, width, height) };
+                unsafe { (*MOUSE.as_ptr()).apply(packet, width, height) };
                 LAST_DX.store(packet.dx, Ordering::Relaxed);
                 LAST_DY.store(packet.dy, Ordering::Relaxed);
                 PACKETS.fetch_add(1, Ordering::Relaxed);
@@ -394,13 +390,13 @@ mod device {
     pub fn position() -> (i32, i32) {
         // SAFETY: reading one `Copy` value the handler may also be writing; a torn read is
         // one coordinate, and the next packet corrects it.
-        unsafe { (*MOUSE.0.get()).position() }
+        unsafe { (*MOUSE.as_ptr()).position() }
     }
 
     /// Which buttons the last packet reported.
     pub fn buttons() -> u8 {
         // SAFETY: as `position`.
-        unsafe { (*MOUSE.0.get()).buttons() }
+        unsafe { (*MOUSE.as_ptr()).buttons() }
     }
 
     /// How many packets have been decoded.

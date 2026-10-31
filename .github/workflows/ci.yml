@@ -1,0 +1,54 @@
+# The gates `cargo xtask ci` runs locally, run on every push and pull request.
+#
+# One job rather than a matrix: the checks share a `target/` directory and a toolchain, and
+# the boot phases need the same machine anyway. Splitting them would multiply the install
+# cost without making a failure easier to read - the step name is already the diagnosis.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A new push makes the previous run's answer irrelevant, so it is replaced rather than
+# queued behind.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    # The boot tests are thirteen phases under QEMU's software emulation (no KVM on a hosted
+    # runner), so a hung phase has to be caught by the harness's own timeout and not by the
+    # job's. This is the outer backstop, not the per-boot one.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain, including clippy and rustfmt, comes from `rust-toolchain.toml`.
+      # `rustup show` is what makes rustup install it before the first cargo command runs.
+      - name: Install the pinned toolchain
+        run: rustup show
+
+      # The boot tests are QEMU, not a mock. Without this, every phase after the host tests
+      # fails with "failed to start qemu-system-x86_64".
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Every gate
+        run: cargo xtask ci

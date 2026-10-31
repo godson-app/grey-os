@@ -5,8 +5,9 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 > **Status: early development, but no longer a boot demo.** The kernel boots under UEFI, owns its
 > page tables, heap and frame allocator, drives an ATA disk with its own filesystem, decodes the
 > keyboard and the pointer, composites a small desktop of overlapping windows, runs cooperative
-> tasks, has a shell, and loads and runs programs from the disk. There is no user mode, no
-> preemption and no networking. Do not run this on hardware you care about.
+> tasks, has a shell, and loads and runs programs from the disk. It also runs a program at ring 3,
+> in a page table of its own, reaching the kernel only through `int 0x80`. There is no preemption,
+> no ELF loading and no networking. Do not run this on hardware you care about.
 
 ## Goals
 
@@ -17,7 +18,7 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 
 ## Current state
 
-Ten milestones, each with its own record in `DECISIONS.md` and its acceptance run in `ROADMAP.md`.
+Twelve milestones, each with its own record in `DECISIONS.md` and its acceptance run in `ROADMAP.md`.
 
 - [x] **M0** Boot, serial diagnostics, diagnosable panics: UEFI through the `bootloader` crate, COM1 at 115200 8N1, a panic handler that reports to serial and paints the panel (ADR-023)
 - [x] **M1** Display, text and an on-screen boot log: the 8x8 font at an integer scale, a character grid, and a back buffer the panel only receives repaints of (ADR-024, ADR-025, ADR-026)
@@ -30,8 +31,10 @@ Ten milestones, each with its own record in `DECISIONS.md` and its acceptance ru
 - [x] **M8** Shell and process model: cooperative round-robin over eight slots with real 32 KiB stacks, a parser and a line editor, and a shell over the real filesystem (ADR-035)
 - [x] **M9** Applications: `GVM1` bytecode for a stack machine, three programs written to the disk at first format, and one task per program (ADR-036)
 - [x] **M10** What the machine is: ACPI read for the CPU count, the IOAPIC and the interrupt overrides, a `cpus` command, `run` for programs, and a README that matches (ADR-037)
+- [x] **M11** Hardening before the next primitive: one `InterruptMutex` in place of seven ad-hoc `unsafe impl Sync`s, a `cargo xtask ci` that runs every gate, a release profile that aborts instead of unwinding, and a headless harness that no longer hangs on an inherited stdin (ADR-038)
+- [x] **M12** User mode: ring 3 through the user selectors and `TSS.RSP0`, a page table per program shared at the top level, `int 0x80` as the one DPL 3 gate with write/exit/sleep, and a fault in a program that kills the program rather than the kernel (ADR-040)
 
-Not there yet, in the order they matter: user mode and system calls, ELF loading, preemption,
+Not there yet, in the order they matter: preemption of ring 3, ELF loading, a user-space toolchain,
 application processors, an APIC/IOAPIC driver, networking.
 
 ## Requirements
@@ -83,7 +86,7 @@ grey-os: greyfs: wrote /boot-count (16 bytes at sector 16), read back and compar
 grey-os: apps: 3 program(s) written this boot, 205 bytes of bytecode on disk, 4 slot(s) used
 grey-os: storage ok: boot 1 of this image, 4 file(s), 21 of 8192 sectors in use
 grey-os: gdt loaded: code 0x08, data 0x10, tss 0x18, 16 KiB double-fault stack
-grey-os: idt loaded: 38 gates of 256 (22 exceptions, 16 irqs)
+grey-os: idt loaded: 39 gates of 256 (22 exceptions, 16 irqs, 1 syscall)
 grey-os: pic remapped to 0x20..=0x2f, only irq0 unmasked
 grey-os: timer 100 Hz, 13 ticks observed, interrupts enabled, 0 unexpected irqs
 grey-os: input: keyboard on irq1, 8042 config 0x67, translation on so set 1 arrives
@@ -109,6 +112,14 @@ grey-os: app: apps/hello.gvm: halted after 4 steps, 10 bytes of code, 56 of stri
 grey-os: task: sleeper: woke at tick 71
 grey-os: sched ok: 7 tasks (6 finished), 24 switches, 10 lines written by tasks, 32 KiB per stack
 grey-os: apps ok: 3 of 3 programs ran from /apps, 7 lines of output, 264 instructions
+grey-os: user> hello from ring 3
+grey-os: user ok: hello exited 0, 2 syscalls, 18 bytes, 1 ticks in ring 3
+grey-os: user> tick from ring 3
+grey-os: user> tick from ring 3
+grey-os: user> tick from ring 3
+grey-os: user ok: count exited 3, 7 syscalls, 51 bytes, 15 ticks in ring 3
+grey-os: user: #PF page fault at rip 0x4000000100a: error 0x6, address 0x100000000, killed
+grey-os: user ok: fault exited 142, 0 syscalls, 0 bytes, 0 ticks in ring 3
 grey-os: desktop: 6 windows on 1280x800, 7 overlapping pair(s), focused #6, 3 drawn in the first frame
 grey-os: compositor ok: 4 damage rects merged into 2, pointer drawn at 640,400, 10 frame(s)
 grey-os: boot ok
@@ -203,6 +214,7 @@ The same boot, automated:
 cargo xtask build   # stage both images in target/grey-os/
 cargo xtask run     # build, then boot the UEFI image with a window
 cargo xtask test    # build, boot clean, then boot one kernel per injected failure
+cargo xtask ci      # fmt, both clippy halves, host tests, the boot tests, release build
 ```
 
 `test` checks the serial markers _and_ the exit status, and fails on a hang rather
@@ -257,6 +269,11 @@ xtask = "run --package xtask --"
 
 Without it, `cargo run --package xtask -- test` does the same thing.
 
+`cargo xtask ci` is the whole set in one command, in the order that fails fastest: `cargo fmt
+--check`, clippy for the host tools and for the kernel's real target with `-D warnings`, the host
+tests, `cargo xtask test`, and a release build. It is what `.github/workflows/ci.yml` runs, and it is
+the only command a change has to pass.
+
 Lint the two halves separately: the kernel is `x86_64`-only `no_std` code and does
 not compile for the host architecture (ADR-006 in `DECISIONS.md`).
 
@@ -301,6 +318,7 @@ grey-os/
         ├── window.rs      # one window: a rect, a title and lines
         ├── compositor.rs  # the desktop: window list, focus, damage rects, pointer
         ├── memory.rs      # memory map, the bootstrap region's selection
+        ├── sync.rs        # the one interior-mutability cell and its interrupt guard (ADR-038)
         ├── heap.rs        # bump allocator: the bootstrap only (ADR-021, ADR-031)
         ├── arena.rs       # the heap: pages from frames, free lists per class (ADR-031)
         ├── frame.rs       # 4 KiB frame allocator over a bitmap (ADR-029)
@@ -336,9 +354,11 @@ drive. Before trying it:
 
 - Back up your data and boot from USB or a spare drive, never your main system disk.
 - Secure Boot must be disabled to boot an unsigned image, then re-enabled for Windows games that require it.
-- The kernel will look for an ATA disk on the primary channel and *format it* if it finds one without
-  a `greyfs` superblock. Nothing in this repository writes to a disk other than an image file under
-  `target/`, and that is the only reason a stray `cargo run` cannot damage a machine.
+- The kernel looks for an ATA disk on the primary channel and formats it **only when sector 0 is
+  entirely zero** - a blank disk. Anything else is treated as somebody's data: a `greyfs` superblock
+  is mounted, and any other content is refused with an error rather than overwritten. Nothing in this
+  repository writes to a disk other than an image file under `target/`, and that is the only reason a
+  stray `cargo run` cannot damage a machine.
 - A real machine's ACPI tables may name more CPUs than the one this kernel uses; the boot log says
   how many it found, and ADR-037 says why the rest stay asleep.
 
@@ -350,4 +370,4 @@ drive. Before trying it:
 
 ## License
 
-Not yet chosen.
+MIT, copyright the Grey OS contributors. See [`LICENSE`](LICENSE).

@@ -138,13 +138,13 @@ pub struct Stats {
 #[cfg(target_arch = "x86_64")]
 mod arch {
     use alloc::alloc::{alloc, Layout};
-    use core::cell::UnsafeCell;
 
     use super::{
         after_yield, is_awake, next_ready, Context, Entry, Slot, State, Stats, MAX_TASKS,
         STACK_BYTES,
     };
     use crate::idt;
+    use crate::sync::InterruptMutex;
 
     /// One task, with everything the scheduler needs to run it and to report it.
     struct Task {
@@ -177,15 +177,8 @@ mod arch {
     }
 
     /// The scheduler's state. One writer at a time: every function below masks interrupts for
-    /// its critical section, and the timer's `tick` runs only with them unmasked.
-    struct Cell<T>(UnsafeCell<T>);
-
-    // SAFETY: every access is masked, and the only other writer is the timer's handler, which
-    // cannot run while they are masked. `Scheduler` holds a raw pointer to each task's stack,
-    // which is why it is not `Send`; the kernel is single-core and the pointer never leaves it.
-    unsafe impl<T> Sync for Cell<T> {}
-
-    static SCHEDULER: Cell<Scheduler> = Cell(UnsafeCell::new(Scheduler::new()));
+    /// its critical section, and the timer's `tick` runs only with them unmasked (ADR-038).
+    static SCHEDULER: InterruptMutex<Scheduler> = InterruptMutex::new(Scheduler::new());
 
     // The switch itself. Written as assembly because "save the callee-saved registers and the
     // stack pointer, load the other task's, return" has no Rust spelling: the compiler decides
@@ -231,7 +224,7 @@ mod arch {
     pub unsafe fn init() {
         // SAFETY: the caller promised this is the only call, and no task exists yet.
         unsafe {
-            let scheduler = &mut *SCHEDULER.0.get();
+            let scheduler = &mut *SCHEDULER.as_ptr();
             scheduler.tasks[0] = Some(Task {
                 name: "boot",
                 stack_len: 0,
@@ -293,7 +286,7 @@ mod arch {
             let layout = Layout::from_size_align(STACK_BYTES, 16).ok();
             // SAFETY: interrupts are masked just above, so nothing else can be reading or
             // writing the table, and this borrow ends with the block.
-            let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+            let scheduler = unsafe { &mut *SCHEDULER.as_ptr() };
             let free = scheduler
                 .tasks
                 .iter()
@@ -356,7 +349,7 @@ mod arch {
         let pointers = {
             // SAFETY: interrupts are masked just above, and this borrow ends with the block -
             // before the switch, which is the point.
-            let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+            let scheduler = unsafe { &mut *SCHEDULER.as_ptr() };
             let current = scheduler.current;
             let states = slots(scheduler);
             match next_ready(&states, Some(current), crate::timer::ticks()) {
@@ -415,7 +408,7 @@ mod arch {
                 idt::disable();
             }
             // SAFETY: masked, so the timer's handler cannot see a half-written state.
-            let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+            let scheduler = unsafe { &mut *SCHEDULER.as_ptr() };
             let current = scheduler.current;
             if let Some(task) = scheduler.tasks[current].as_mut() {
                 task.state = State::Sleeping(until);
@@ -441,7 +434,7 @@ mod arch {
                 idt::disable();
             }
             // SAFETY: masked, as above.
-            let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+            let scheduler = unsafe { &mut *SCHEDULER.as_ptr() };
             let current = scheduler.current;
             if let Some(task) = scheduler.tasks[current].as_mut() {
                 task.state = State::Finished;
@@ -461,7 +454,7 @@ mod arch {
         let ticks = crate::timer::ticks();
         // SAFETY: this runs in the timer's interrupt handler, which cannot be interrupted by
         // another timer tick, and every other accessor masks interrupts.
-        let scheduler = unsafe { &mut *SCHEDULER.0.get() };
+        let scheduler = unsafe { &mut *SCHEDULER.as_ptr() };
         for task in scheduler.tasks.iter_mut().flatten() {
             if is_awake(task.state, ticks) {
                 task.state = State::Ready;
@@ -476,7 +469,7 @@ mod arch {
             idt::disable();
         }
         // SAFETY: masked, as above.
-        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        let scheduler = unsafe { &*SCHEDULER.as_ptr() };
         let stats = Stats {
             tasks: scheduler.tasks.iter().flatten().count(),
             finished: scheduler
@@ -501,7 +494,7 @@ mod arch {
             idt::disable();
         }
         // SAFETY: masked, as above; only the name is read.
-        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        let scheduler = unsafe { &*SCHEDULER.as_ptr() };
         let name = scheduler
             .tasks
             .get(slot)
@@ -520,7 +513,7 @@ mod arch {
             idt::disable();
         }
         // SAFETY: masked, as above; only the name is read.
-        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        let scheduler = unsafe { &*SCHEDULER.as_ptr() };
         let name = scheduler
             .tasks
             .get(scheduler.current)
@@ -539,7 +532,7 @@ mod arch {
             idt::disable();
         }
         // SAFETY: masked, as above.
-        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        let scheduler = unsafe { &*SCHEDULER.as_ptr() };
         let runs = scheduler
             .tasks
             .get(slot)
@@ -558,7 +551,7 @@ mod arch {
             idt::disable();
         }
         // SAFETY: masked, as above.
-        let scheduler = unsafe { &*SCHEDULER.0.get() };
+        let scheduler = unsafe { &*SCHEDULER.as_ptr() };
         let bytes = scheduler
             .tasks
             .get(slot)

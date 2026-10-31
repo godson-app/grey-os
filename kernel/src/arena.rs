@@ -25,7 +25,8 @@
 //! the allocator the kernel runs.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::cell::UnsafeCell;
+
+use crate::sync::InterruptMutex;
 
 /// Bytes in a page: the unit the arena grows in and the frame allocator hands out.
 pub const PAGE_BYTES: usize = 4096;
@@ -159,8 +160,8 @@ where
 {
     /// The page source. `GlobalAlloc` takes `&self` and mapping mutates the source, so it needs
     /// the same interior mutability the state does.
-    pages: UnsafeCell<A>,
-    state: UnsafeCell<State>,
+    pages: InterruptMutex<A>,
+    state: InterruptMutex<State>,
 }
 
 /// Reads word `word` of the header at `addr`.
@@ -261,8 +262,8 @@ where
     /// An arena with `pages` as the thing that backs it, and no span yet.
     pub const fn new(pages: A) -> Self {
         Self {
-            pages: UnsafeCell::new(pages),
-            state: UnsafeCell::new(State::empty()),
+            pages: InterruptMutex::new(pages),
+            state: InterruptMutex::new(State::empty()),
         }
     }
 
@@ -270,13 +271,13 @@ where
     pub fn ready(&self) -> bool {
         // SAFETY: a single read of a cell nothing else touches; `State` is `Copy`, so no
         // reference escapes.
-        unsafe { (*self.state.get()).base != 0 }
+        unsafe { (*self.state.as_ptr()).base != 0 }
     }
 
     /// A snapshot of the counters, valid before `init_arena` as well as after it.
     pub fn stats(&self) -> Stats {
         // SAFETY: as `ready`.
-        unsafe { (*self.state.get()).stats }
+        unsafe { (*self.state.as_ptr()).stats }
     }
 
     /// Points the arena at `base..base + capacity` without mapping anything.
@@ -303,7 +304,7 @@ where
         }
         // SAFETY: `self` is a valid reference and the reference formed here does not outlive
         // this function, so the cell is never aliased.
-        let state = unsafe { &mut *self.state.get() };
+        let state = unsafe { &mut *self.state.as_ptr() };
         if state.base != 0 {
             return false;
         }
@@ -316,15 +317,15 @@ where
         true
     }
 
-    /// The mutable state, for the length of one call. Nothing else runs at the same time, per
-    /// the `Sync` impl below.
+    /// The mutable state, for the length of one call. Nothing else runs at the same time, which
+    /// is the argument [`InterruptMutex`] carries (ADR-038).
     // The reference handed back points into an `UnsafeCell`, which is what makes taking `&self`
     // sound: `mut_from_ref` cannot see through the cell, so it is told to stand down here.
     #[allow(clippy::mut_from_ref)]
     fn state(&self) -> &mut State {
-        // SAFETY: `self` outlives the borrow, and the `Sync` argument is that this is never
-        // entered twice at once.
-        unsafe { &mut *self.state.get() }
+        // SAFETY: `self` outlives the borrow, and the cell guarantees exclusive access by
+        // masking interrupt handlers out for the length of it.
+        unsafe { &mut *self.state.as_ptr() }
     }
 
     /// The page source, for the length of one call. This is how the kernel points it at its own
@@ -338,8 +339,8 @@ where
     // As `state`: the reference points into an `UnsafeCell`.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn source(&self) -> &mut A {
-        // SAFETY: as `state` - a single-threaded kernel, per the `Sync` impl.
-        unsafe { &mut *self.pages.get() }
+        // SAFETY: as `state` - a single-threaded kernel, and the cell is the only way in.
+        unsafe { &mut *self.pages.as_ptr() }
     }
 
     /// The page source, for the length of one call, on the same argument as [`Heap::state`].
@@ -347,15 +348,9 @@ where
     #[allow(clippy::mut_from_ref)]
     fn pages(&self) -> &mut A {
         // SAFETY: as `state`.
-        unsafe { &mut *self.pages.get() }
+        unsafe { &mut *self.pages.as_ptr() }
     }
 }
-
-// SAFETY: the kernel is single-threaded and no interrupt handler allocates - that second half is
-// a rule with a reason: a timer or exception handler that allocated would enter this cell while
-// the interrupted code still holds it (ADR-028). The argument breaks the moment a handler
-// allocates or a second thread exists, which is why it is written down rather than assumed.
-unsafe impl<A> Sync for Heap<A> where A: Pages {}
 
 /// Reads the free-list link stored in a free block's payload.
 ///

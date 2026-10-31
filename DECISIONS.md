@@ -1269,3 +1269,128 @@ timestamps, no `fsck` beyond what a mount validates, and no write-cache flush: t
 the controller to drop busy after the last word, which is not the same as `FLUSH CACHE`. The slave
 drive and the secondary channel are not probed. The directory is fixed at 64 slots.
 
+## ADR-038: One `InterruptMutex`, not seven `unsafe impl Sync`s
+
+**Status:** accepted, M11.
+
+**Context.** Seven modules each carried their own `struct Cell<T>(UnsafeCell<T>)` and their own
+`unsafe impl Sync`: the bootstrap allocator, the frame allocator, the arena, the scheduler, the
+keyboard, the mouse, and the desktop pointer. Every one of them was correct for the same reason -
+the kernel runs on one core, and every borrow is either masked by `cli` or taken by the one task
+that is running - and every one of them wrote that reason down in a slightly different form. A
+comment cannot be checked, and seven copies of an argument are seven places for a later edit to
+weaken one of them without noticing.
+
+Two ways for the argument to break were already written down and enforced nowhere: a second core
+(ADR-037's `Open` list) and an interrupt handler that takes a lock the interrupted code holds
+(ADR-028).
+
+**Decision.** One type, `sync::InterruptMutex<T>`, holds the one `unsafe impl Sync` in the kernel,
+and one `IrqGuard` owns the flag. `lock()` masks maskable interrupts and returns a guard that
+dereferences to `&mut T`; dropping the guard restores the flag *only if this guard is the one that
+cleared it*, so nested critical sections unwind correctly. `as_ptr()` exists for the allocators,
+whose `GlobalAlloc` methods take `&self` and cannot hold a guard across the call: forming the
+pointer is safe, dereferencing it is not, and that puts the argument back at the call site where
+the masking actually is.
+
+**Consequences.** `grep -rn "unsafe impl.*Sync" kernel/src` now returns one line, and the argument
+is next to it. New code gets the safe path by default, so forgetting the mask is a compile error
+rather than a race. The host tests exercise the guard's nesting with a thread-local flag standing in
+for `RFLAGS`, so the save/restore logic is tested where there is no CPU to ask.
+
+The type does not make the kernel safe to preempt or to run on two cores. It is not a spinlock, it
+does not disable preemption (there is none), and a `Locked` held across a yield would let a second
+task take the same cell - which is why `with_desktop` reads the pointer out of its guard and drops
+the guard before drawing. Those are the sentences the milestone that adds an AP, a spinlock or a
+preemptive switch has to act on, and ADR-037 already names the first two.
+
+**Open.** The lock is per-cell and there is no ordering rule, because no path holds two at once.
+That stops being true the moment the scheduler and the frame allocator are taken together, which is
+what a preemptive switch will need; the ordering belongs in this ADR then, not in a comment at the
+first site that needs it.
+
+## ADR-039: One command for every gate, and a release profile that fails loudly
+
+**Status:** accepted, M11.
+
+**Context.** The checks existed and nothing ran them together: `cargo fmt --check`, the two clippy
+halves, the host tests, `cargo xtask test` and a release build. A change could be green in the
+author's shell and red everywhere else. The release profile had the two settings an OS cannot
+afford to get wrong, both of them off: it unwound, which a kernel cannot do through an
+`extern "x86-interrupt"` frame, and it wrapped silently on overflow, which in an allocator is
+corruption rather than a wrong answer.
+
+**Decision.** `cargo xtask ci` runs the six gates in the order that fails fastest, and
+`.github/workflows/ci.yml` runs that same command. `[profile.release]` gains `panic = "abort"` and
+`overflow-checks = true`.
+
+**Consequences.** A formatting slip costs seconds; a boot-phase failure still costs minutes, but
+only after the cheap gates have passed. The CI job installs QEMU and the pinned toolchain and caches
+`target/`, so the boot phases run on a runner without KVM - slower than a workstation, and the
+harness's own 120-second per-boot timeout is what decides a hang, not the job's.
+
+`panic = "abort"` makes the panic handler's `-> !` true of the generated code and removes the
+unwind tables from an image that can never use them. `overflow-checks` in release is a deliberate
+cost: the fast build is now the one that checks the frame and extent arithmetic, and a panic there
+is a report rather than a silently wrong page.
+
+**Open.** No coverage measurement and no dependency audit. The BIOS image is still built and still
+not booted by `ci`; `test` covers UEFI only, as the Roadmap says.
+
+## ADR-040: Ring 3 is a ring, a page-table slot and one gate - not yet a scheduler
+
+**Status:** accepted, M12.
+
+**Context.** Every task in the kernel ran at ring 0. That was never a decision, it was the default:
+nothing in the scheduler, the interpreter or the shell needed anything else, because every task was
+code this repository wrote and reviewed. The moment a program is something the kernel merely
+*loaded*, the kernel cannot keep relying on the program's good behaviour, and the only thing in the
+machine that enforces anything is the CPU. Three mechanisms have to exist together before any of
+them is worth anything: a lower privilege level to return to, a page table that says what the
+program may touch, and one gate through which it can ask for anything else. Two of the three are
+worse than useless on their own - a ring 3 program with the kernel's page table can read every byte
+of it, and a separate address space entered at ring 0 protects nothing.
+
+**Decision.** Ring 3 is entered with `iretq` and the two DPL 3 selectors, `USER_CODE` 0x2b and
+`USER_DATA` 0x33, placed after the TSS's two descriptor slots in the GDT. `TSS.RSP0` names a
+dedicated 16 KiB kernel stack, because the CPU switches to it on the way in and there is exactly one
+of it. A program's space is a *new* top-level table whose entries point at the kernel's existing
+lower tables (`paging::share_root`), with the program's own pages in a free slot found by probing
+(`paging::occupied`), never a hardcoded index. `map_4k` sets `USER` at every level, because the CPU
+consults the bit at each one and a missing one is a fault on the program's first instruction. One
+vector, `int 0x80`, is the only gate with `DPL 3`; the ABI is the number in `rax`, two arguments in
+`rdi` and `rsi`, the answer in `rax` with errors negative, and the handlers behind it are ordinary
+Rust reachable in a host test. A fault whose saved `cs` names ring 3 kills the program with
+`128 + vector` as its exit code and returns to the kernel; it does not panic.
+
+`usermode::run` is synchronous: a kernel task calls it, the program runs until it exits or faults,
+and the call returns a report. One program at a time, refused with `Error::Busy` rather than
+half-supported.
+
+**Consequences.** Sharing the top-level entries rather than cloning them is the trade that makes an
+address space cost a handful of frames: the kernel half is tens of thousands of frames and every one
+of them is supervisor-only, so copying it would be both wasteful and unnecessary - a user space
+never needs its own copy of the kernel, only a root that still sees it. The consequence is that a
+kernel mapping added *later* would not appear in a space built earlier, which is why `run` builds the
+space at the moment it is needed rather than at boot.
+
+Because the kernel copies from a program's pointer while running in ring 0, the `U/S` bit stops
+nothing there; `Layout::contains` is what decides, and it accepts only the program's own image. That
+is also why the program's text lives in an executable, non-writable page: the loader writes the
+image through the physical window, so the mapping never has to be writable, and a program cannot
+edit its own code.
+
+Syscalls are numbered by this kernel (1 write, 2 exit, 3 sleep) and deliberately match no existing
+ABI: nothing outside this repository calls them, and a number that matched a real one would invite a
+binary that half works.
+
+**Open.** No preemption of ring 3: the timer arrives, is counted and returns, but a context switch
+out of a user program needs the scheduler to save and restore a user frame and re-enter it through
+`iretq`, which is a scheduler change rather than a syscall. No user-space toolchain - the three
+programs the boot runs are assembly in the kernel's `.rodata`. Two arguments per syscall, no
+`fork`, no file system, no capability model beyond the layout: the address space is the whole
+policy. And `share_root` copies only top-level entries, so a future kernel mapping that must appear
+in every program's space needs either a synchronisation point or a higher-half kernel slot shared by
+construction.
+
+

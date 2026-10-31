@@ -6,6 +6,7 @@
 //! cargo xtask build   # stage both images in target/grey-os/
 //! cargo xtask run     # build, then boot the UEFI image in QEMU
 //! cargo xtask test    # build, boot clean, then boot a kernel per injected failure
+//! cargo xtask ci      # every gate in one command: fmt, lints, host tests, boot tests
 //! ```
 //!
 //! The QEMU command line lives here as well as in `src/bin/qemu-uefi.rs`: the
@@ -100,7 +101,7 @@ const THEME_READY: &str = "grey-os: theme";
 /// Printed by a normal boot with the window list's shape on it (M7).
 const DESKTOP_READY: &str = "grey-os: desktop:";
 
-const USAGE: &str = "usage: cargo xtask <build|run|test> [--no-build] [--bios]";
+const USAGE: &str = "usage: cargo xtask <build|run|test|ci> [--no-build] [--bios]";
 
 /// QEMU's `isa-debug-exit` reports `(value << 1) | 1`; the kernel sends 0x10.
 const EXIT_CLEAN: i32 = (0x10 << 1) | 1;
@@ -162,8 +163,8 @@ struct Fault {
 const FAULTS: [Fault; 5] = [
     Fault {
         value: "gp",
-        announcement: "GREY_OS_EXCEPTION_TEST=gp, loading a selector that is not in the gdt",
-        report: "[exception] #GP general protection fault: error 0x28",
+        announcement: "GREY_OS_EXCEPTION_TEST=gp, loading a selector the gdt cannot reach",
+        report: "[exception] #GP general protection fault: error 0xfff8",
     },
     Fault {
         value: "pf",
@@ -188,6 +189,24 @@ const FAULTS: [Fault; 5] = [
         report: "[exception] #PF page fault: error 0x2 on a write to a not-present page",
     },
 ];
+/// Printed by a ring 3 program through the write syscall (P2). The prefix is the kernel's, so a
+/// program whose bytes never reached the log cannot make this appear.
+const USER_HELLO: &str = "grey-os: user> hello from ring 3";
+/// A line from the counting program: three of them, with a sleep between each.
+const USER_TICK: &str = "grey-os: user> tick from ring 3";
+/// Printed once a program has returned through `iretq`. The exit code, syscall count and byte
+/// count are all in the line, and the byte count is the sum of the messages the two programs
+/// wrote - so it cannot be right unless every byte crossed the gate.
+const USER_HELLO_OK: &str = "grey-os: user ok: hello exited 0, 2 syscalls, 18 bytes";
+const USER_COUNT_OK: &str = "grey-os: user ok: count exited 3, 7 syscalls, 51 bytes";
+/// The report a ring 3 fault has to produce: a page fault (error 0x6 is user + write +
+/// present) on the kernel's own text, which the program's page table maps supervisor-only.
+const USER_FAULT: &str = "grey-os: user: #PF page fault at rip";
+const USER_FAULT_DETAIL: &str = "error 0x6, address 0x100000000, killed";
+/// `128 + 14`, the shell's convention for a fault: the kernel carried the program's death as an
+/// exit code rather than panicking.
+const USER_FAULT_EXIT: &str = "grey-os: user ok: fault exited 142";
+
 /// Upper bound on a `test` run, so a hung boot fails instead of hanging CI.
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -213,7 +232,7 @@ fn main() -> Result<ExitCode> {
             other => bail!("unknown option `{other}`\n{USAGE}"),
         }
     }
-    if !matches!(command.as_str(), "build" | "run" | "test") {
+    if !matches!(command.as_str(), "build" | "run" | "test" | "ci") {
         bail!("unknown command `{command}`\n{USAGE}");
     }
     // `test` flips `PANIC_TEST_ENV` and `EXCEPTION_TEST_ENV` and therefore has to rebuild for
@@ -224,6 +243,16 @@ fn main() -> Result<ExitCode> {
             "`cargo xtask test` has to build: it boots the image once per failure, rebuilding \
              with {PANIC_TEST_ENV} and then {EXCEPTION_TEST_ENV} set\n{USAGE}"
         );
+    }
+
+    if command == "ci" {
+        // `ci` owns its build order: the lints and host tests come before the first boot, and
+        // the release build comes last. A plain `--bios` run or a skipped build would make it
+        // check something other than what CI checks, so both are refused rather than ignored.
+        if !options.build || !options.uefi {
+            bail!("`cargo xtask ci` takes no options\n{USAGE}");
+        }
+        return ci();
     }
 
     if options.build {
@@ -274,6 +303,76 @@ fn build(environment: &[(&str, &str)]) -> Result<()> {
                 list_dir(&image_dir())
             );
         }
+    }
+    Ok(())
+}
+
+/// Runs every gate the repository claims, in the order that fails fastest.
+///
+/// The cheap checks come first on purpose: a formatting slip should cost seconds, not one QEMU
+/// boot per phase. The boot tests are the same [`test`] that `cargo xtask test` runs - calling
+/// it directly rather than spawning a second xtask keeps one process in charge of the exit
+/// status, and the image build is the same `cargo build` either way.
+fn ci() -> Result<ExitCode> {
+    cargo_step("formatting", &["fmt", "--all", "--", "--check"])?;
+    cargo_step(
+        "host lints",
+        &[
+            "clippy",
+            "--workspace",
+            "--exclude",
+            "kernel",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    cargo_step(
+        "kernel lints",
+        &[
+            "clippy",
+            "--package",
+            "kernel",
+            "--target",
+            "x86_64-unknown-none",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    )?;
+    cargo_step("host tests", &["test", "--package", "kernel", "--lib"])?;
+
+    println!("grey-os: ci: boot tests");
+    let options = Options {
+        build: true,
+        uefi: true,
+    };
+    let _ = test(&options)?;
+
+    cargo_step(
+        "release build",
+        &["build", "--release", "--package", "grey-os"],
+    )?;
+
+    println!("grey-os: ci ok: every gate passed");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Runs one `cargo` command from the workspace root, failing the run when it fails.
+///
+/// `CARGO` is preferred over the literal name so the step runs the same toolchain that started
+/// this xtask; `cargo` is the fallback for a binary run outside cargo.
+fn cargo_step(name: &str, arguments: &[&str]) -> Result<()> {
+    println!("grey-os: ci: {name}");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let status = Command::new(cargo)
+        .args(arguments)
+        .current_dir(workspace_root())
+        .status()
+        .with_context(|| format!("failed to run cargo {}", arguments.join(" ")))?;
+    if !status.success() {
+        bail!("cargo {} failed", arguments.join(" "));
     }
     Ok(())
 }
@@ -335,6 +434,13 @@ fn test(options: &Options) -> Result<ExitCode> {
             APP_COUNT,
             APP_FIB,
             APP_HALTED,
+            USER_HELLO,
+            USER_TICK,
+            USER_HELLO_OK,
+            USER_COUNT_OK,
+            USER_FAULT,
+            USER_FAULT_DETAIL,
+            USER_FAULT_EXIT,
         ],
         EXIT_CLEAN,
     )?;
@@ -348,6 +454,10 @@ fn test(options: &Options) -> Result<ExitCode> {
     );
     println!(
         "pass: `{ACPI_RSDP}`, `{ACPI_MADT}` and `{SMP_STARTED}` seen on serial, so the cpu count came out of the madt"
+    );
+    println!(
+        "pass: `{USER_HELLO}` and `{USER_TICK}` written from ring 3, `{USER_COUNT_OK}` after seven \
+         syscalls, and `{USER_FAULT_DETAIL}` for the program that wrote the kernel's text"
     );
 
     storage_persistence(options)?;
@@ -934,6 +1044,12 @@ fn boot_command(options: &Options, capture: bool) -> Result<Command> {
         command.args(["-display", "none"]);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
+        // `-serial stdio` makes QEMU read the terminal as well as write it. With no terminal -
+        // a CI runner, a background job, a process whose stdin is a pipe that never closes -
+        // that read is a `SIGTTIN` that stops QEMU and hangs the harness until its timeout.
+        // The guest never reads serial input here; the input phases drive the guest through
+        // the monitor and QMP instead.
+        command.stdin(Stdio::null());
     }
 
     if options.uefi {

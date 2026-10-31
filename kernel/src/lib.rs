@@ -42,9 +42,11 @@ pub mod paging;
 pub mod pic;
 pub mod scheduler;
 pub mod shell;
+pub mod sync;
 pub mod text;
 pub mod theme;
 pub mod timer;
+pub mod usermode;
 pub mod vm;
 pub mod window;
 
