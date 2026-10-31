@@ -43,6 +43,10 @@ pub enum Command {
     Tasks,
     /// The windows and which one has focus.
     Windows,
+    /// What the firmware's tables say the machine is.
+    Cpus,
+    /// Runs a program from the filesystem.
+    Run(String),
     /// Raises a window by id.
     Raise(u32),
     /// Closes a window by id.
@@ -101,6 +105,8 @@ pub fn parse(line: &str) -> Result<Option<Command>, Error> {
         "ticks" | "uptime" => Command::Ticks,
         "tasks" | "ps" => Command::Tasks,
         "windows" | "win" => Command::Windows,
+        "cpus" | "cpu" => Command::Cpus,
+        "run" | "exec" => Command::Run(single(&rest, "a program name")?),
         "raise" | "focus" => Command::Raise(id(rest.first().copied())?),
         "close" => Command::Close(id(rest.first().copied())?),
         "clear" | "cls" => Command::Clear,
@@ -128,6 +134,8 @@ pub const HELP: &[&str] = &[
     "ticks             the timer and the tasks",
     "tasks             the scheduler's table",
     "windows           the windows and the focus",
+    "cpus              the firmware's cpu and interrupt tables",
+    "run <name>        run a program from the disk",
     "raise <id>        bring a window to the front",
     "close <id>        close a window",
     "clear             empty this window",
@@ -345,6 +353,11 @@ mod tests {
             ("ticks", Command::Ticks),
             ("tasks", Command::Tasks),
             ("windows", Command::Windows),
+            ("cpus", Command::Cpus),
+            (
+                "run apps/fib.gvm",
+                Command::Run(String::from("apps/fib.gvm")),
+            ),
             ("raise 3", Command::Raise(3)),
             ("close 12", Command::Close(12)),
             ("clear", Command::Clear),
@@ -380,6 +393,7 @@ mod tests {
         assert_eq!(parse("cat"), Err(Error::Missing("a file name")));
         assert_eq!(parse("write"), Err(Error::Missing("a file name")));
         assert_eq!(parse("raise"), Err(Error::Missing("a window id")));
+        assert_eq!(parse("run"), Err(Error::Missing("a program name")));
         assert_eq!(
             parse("raise three"),
             Err(Error::BadNumber(String::from("three")))

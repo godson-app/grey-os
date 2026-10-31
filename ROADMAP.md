@@ -5,7 +5,8 @@ acceptance criteria are demonstrated by output, not by code existing: the proof 
 a `xtask test` run or a QEMU session whose serial log is pasted into the commit
 message. No milestone is started before the previous one is accepted.
 
-Scope for M0 to M9 is agreed. M10 onward is stated as themes in dependency order:
+Scope for M0 to M10 is agreed, and all ten themes have landed; what remains is the `Open` list
+each milestone's ADR records. What comes after M10 is stated below as themes in dependency order:
 the authoritative wording comes from the engineering brief and is transcribed here milestone by
 milestone, so that this file never claims more than was agreed.
 
@@ -23,7 +24,7 @@ milestone, so that this file never claims more than was agreed.
 | M7        | Compositor, windows, theme                   | **Done** - criteria 1-5 met; TrueType still open (ADR-034) |
 | M8        | Shell and process model                      | **Done** - criteria 1-5 met; cooperative (ADR-035)          |
 | M9        | Applications                                 | **Done** - criteria 1-5 met; bytecode (ADR-036)            |
-| M10       | SMP, ports, polish                           | Not started                                                |
+| M10       | SMP, ports, polish                           | **Done** - criteria 1-5 met; APs not started (ADR-037)     |
 
 ## M0 - Boot, serial diagnostics, diagnosable panics
 
@@ -813,12 +814,102 @@ The interleaving is worth reading in full, because it is the milestone: `hello` 
 ticks, and its `goodbye` arrives after the counter's five steps and the worker's three passes, while
 `count` and `fib` finish in between.
 
-## M10 onward - provisional themes
+## M10 - SMP, ports, polish
 
+**Goal.** The last theme in the brief's list, and the one that needs the most honesty: "SMP" on this
+kernel is a set of subsystems that do not exist, and the useful thing a single-CPU cooperative
+kernel can do about it is find out what the machine actually is and say so, instead of assuming one
+CPU and a pair of 8259s.
 
-The ordering above is dependency-driven and each theme is a milestone of its own.
-Detailed scope, acceptance criteria and verification are added when the milestone
-is approved, per the brief's one-at-a-time rule.
+**Agreed shape** (ADR-037): read the firmware's description of the machine - the RSDP, the root
+table and the MADT - and report the processors, the IOAPIC and the interrupt source overrides; start
+no application processor and keep the PIC and the PIT; add the two shell commands the report needs
+(`cpus`, and `run` for the programs M9 put on the disk); and bring the README and the harness up to
+what the kernel has been since M8.
+
+**Landed.**
+
+- [x] `acpi.rs`: `Phys` as the one read path, the RSDP from the bootloader's UEFI hint or the ACPI
+      1.0 search (extended BIOS data area, then the BIOS area), both root table formats, and the
+      MADT's processor, x2APIC, IOAPIC and source-override entries, with a checksum on every table.
+- [x] 13 host tests: four processors with one disabled, a 1.0 `RSDT`, the EBDA path, no RSDP, a bad
+      RSDP checksum, a root that is not one, a table that is not a MADT, a MADT with a bad checksum,
+      an entry with a zero length, an x2APIC entry, and both halves of the hint rule.
+- [x] The boot report: the RSDP and how it was found, the CPU count and how many the firmware
+      enabled, the IOAPIC's address, the override count, and `1 of N cpu(s) started`.
+- [x] `cpus` in the shell: the same facts, asked for from inside the running system.
+- [x] `run <name>` in the shell: `run fib` is `apps/fib.gvm`, interpreted with the M9 machine, its
+      output in the shell's window and on serial, and a missing file as a message.
+- [x] The harness boots QEMU with `-smp 4`, asserts the three firmware lines on the clean boot, and
+      types `cpus`, `run fib` and `run nope` into the shell along with the M8 commands.
+- [x] `sendkey`'s three missing names (`spc`, `slash`, `dot`) and `SHELL_TICKS` doubled, because the
+      session now types twice as much.
+- [x] A README that describes this kernel rather than M4's.
+
+**Open.** No application processor is started: no trampoline, no per-CPU state, no spinlocks, no
+APIC or IOAPIC programming, and no preemption, so two CPUs would run one cooperative thread each
+rather than share the work. The PIC and the PIT remain the interrupt controller and the timer, and
+the MADT's five source overrides on QEMU are counted and not obeyed. ACPI is read-only: no FADT, no
+shutdown, no reboot. No port to a second architecture.
+
+**Acceptance criteria.**
+
+1. The boot log reports what the firmware says: the RSDP's address and how it was found, how many
+   CPUs the MADT describes and how many of them the firmware enabled, the IOAPIC's address, and the
+   source-override count - and the numbers follow the machine, not a constant.
+2. A machine whose tables cannot be read says so and boots anyway, with one CPU and the PIC, rather
+   than failing or pretending.
+3. The same facts are available from inside the running system: `cpus`, typed into the shell by the
+   harness, prints what the boot printed.
+4. A program can be started from the shell, its output reaches the shell's window and serial, and a
+   program that is not there is a message rather than a fault.
+5. Host tests cover the reading: checksums, both root table formats, the legacy search, the
+   bootloader's hint, and a MADT whose entries are malformed.
+
+**Status against them.** All five met. The clean boot prints:
+
+```text
+grey-os: acpi: rsdp at 0x1f77e014 (from the bootloader's table), revision 2, 5 table(s) named
+grey-os: acpi: madt: 4 cpu(s), 4 enabled, ioapic at 0xfec00000, 5 source override(s)
+grey-os: smp: 1 of 4 cpu(s) started, on the bootstrap processor; the others wait for a trampoline, an ioapic and per-cpu state (ADR-037)
+```
+
+and the shell phase, typing into the running machine:
+
+```text
+grey-os: shell: > cpus
+grey-os: shell: 4 cpu(s) in the firmware's tables, 4 enabled, 1 started
+grey-os: shell: acpi revision 2, 5 table(s), ioapic at 0xfec00000, 5 source override(s)
+grey-os: shell: > run fib
+grey-os: shell: 0 1 1 2 3 5 8 13 21 34
+grey-os: shell: apps/fib.gvm: halted after 193 steps
+grey-os: shell: > run nope
+grey-os: shell: ? apps/nope.gvm: NotFound
+grey-os: shell: exit
+```
+
+Criterion 1 is `4 cpu(s), 4 enabled` on a QEMU given four CPUs and `1 cpu(s)` on one given a single
+CPU, from the same image: the number comes out of the MADT. Criterion 2 is the `Err` path, which
+prints `no usable tables (...)`, assumes one CPU and keeps booting. Criterion 3 is the shell's
+`cpus`, which reads what the boot stored rather than re-reading the tables. Criterion 4 is `run
+fib`: the series that `apps/fib.gvm` computes, in the shell's window and on serial, with the halt
+line after it - and `run nope` saying `NotFound` instead of faulting. Criterion 5 is 13 host tests
+over the reader; 254 on the host in total.
+
+## After M10 - what is not done
+
+The brief's list ends at M10, so this section is no longer a transcription of agreed scope: it is the
+`Open` list of the ten ADRs, gathered in dependency order. Nothing here is agreed and nothing here
+is claimed.
+
+The blockers are named rather than ranked. User mode and system calls come first, because everything
+that follows assumes an address space per program: an ELF loader, a `syscall` gate, and the `GVM1`
+machine moved behind it so that a program cannot touch the kernel's stack. Then preemption (a full
+interrupt frame per task, then per-CPU state), which is also the first step of SMP; then an APIC and
+IOAPIC driver, which makes the PIC and its five ignored source overrides a thing of the past; then a
+real TCP/IP stack or a USB stack, both of which need DMA and a device model this kernel does not have.
+Storage is one extent per file with no free-space reuse, and fixing that is a smaller job than any of
+the above.
 
 Two items already have a home when their milestone opens: TrueType rasterisation, with the face
 question it drags along, belongs to M7 (ADR-027); and the framebuffer's physical span, which would

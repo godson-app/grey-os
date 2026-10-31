@@ -877,7 +877,81 @@ page-aligned top, both recorded as open. The arena's address is a constant, not 
 first user-space mapping is where that stops being a placeholder.
 
 
-## ADR-036: An application is a file for a stack machine, run by a task
+## ADR-037: What M10 can honestly claim of "SMP, ports, polish", and what it cannot
+
+**Status:** accepted, M10.
+
+**Context.** The theme names three things and only one of them is cheap. "SMP" on x86_64 means
+starting application processors: a trampoline in low memory that begins in real mode, `INIT` then
+two `SIPI`s through the local APIC, a GDT/TSS/IDT and a stack per CPU, a scheduler that is safe
+without a lock held across a switch, a spinlock on every table that is currently protected only by
+masking interrupts, an APIC timer instead of the PIT, an IOAPIC instead of the 8259s, and
+preemption - because two CPUs running a cooperative scheduler at once is two CPUs running one
+thread each. Each of those is a subsystem. Building four of the six and calling the milestone done
+would be a worse outcome than saying plainly which one was built.
+
+**Decision.** This milestone makes the kernel *know* the machine, and says out loud that it still
+uses one CPU of it.
+
+`acpi.rs` finds the RSDP - from the address the bootloader took out of the UEFI configuration table,
+or, failing that, by the search ACPI 1.0 specifies (the extended BIOS data area, then the BIOS area)
+- and reads the root table and the MADT. What comes out is a `Report`: the RSDP's address and how it
+was found, the table signatures the root names, the processors the firmware describes and how many
+it enabled, the IOAPIC's address, and how many interrupt source overrides there are. All of it is
+reported on serial, kept in atomics for the shell's `cpus`, and *acted on by nothing*: no AP is
+started, the PIC stays the interrupt controller and the PIT stays the timer.
+
+The whole read path goes through one trait method - copy `len` bytes from a physical address -
+because that is the only thing that needs the bootloader's physical window. The tests supply a
+machine made of regions they choose, so both root table formats, the EBDA path, the bootloader's
+hint, a bad checksum, a table that is not a MADT, a MADT entry with a zero length and an x2APIC
+entry are all host-testable.
+
+**What building it taught.**
+
+1. The ACPI 1.0 search found nothing on QEMU with OVMF: the RSDP was at `0x1f77e014`, in reserved
+   RAM high above the legacy areas, published only in the UEFI configuration table. The first
+   version of this milestone therefore logged `no usable tables (NoRsdp)` on the only machine it
+   had. `BootInfo::rsdp_addr` carries the address the firmware published, so the hint is tried
+   first and the scan is the fallback - and the log says which one worked, because on a machine
+   that finds it by scanning, the bootloader's answer being missing is itself worth knowing.
+2. The test builder's ACPI header was four bytes short - 32 bytes instead of 36, because two
+   four-byte fields were written as one eight-byte run - and every table it made failed its own
+   checksum. The tests failed with `BadRoot` on tables they had just built, which is the right
+   failure: the header is now spelled out field by field with a comment on the two it got wrong.
+3. A MADT's entries are a chain of `(type, length)` records, so both ends of the length need a
+   guard: a length below two would never advance the loop, and `offset + length` past the table
+   would read whatever follows it. A malformed entry now ends the walk, and a test appends one to
+   prove the walk ends rather than looping.
+
+**Ports, honestly.** No port to a second architecture was attempted, and the reason is not
+laziness: this kernel's boot path, its serial console, its timer, its interrupt controller and its
+disk driver are four different platform interfaces, and each would be a milestone of its own. What
+M10 does add is the seam the next platform would need - the firmware's description of the machine is
+now read into a `Report` that `main.rs` consumes, rather than being assumed inline - and one
+port that this kernel can now use from a program rather than from the boot: the shell's `run`, which
+loads `apps/<name>.gvm` off the disk, interprets it, and puts its output in the shell's window.
+
+**Polish.** `cpus` and `run` in the shell; `program_path`, so `run fib` is `apps/fib.gvm`; the
+harness types six commands through QEMU's monitor - including the two characters `sendkey` has no
+literal name for, `spc` - and asserts the answers; `SHELL_TICKS` doubled, because the session now
+types twice as much; and a README that describes the kernel this repository actually has rather
+than the one it had in M4.
+
+**Consequences.** `cargo xtask` boots QEMU with `-smp 4`, because a machine with one CPU would let a
+kernel that never read the MADT pass. The clean boot asserts the RSDP line, the `4 cpu(s), 4
+enabled` line and the `1 of 4 cpu(s) started` line; the shell phase asserts `cpus` and `run fib`
+and a `run` of a file that is not there. 254 host tests, 13 of them new for `acpi`.
+
+**Open.** No AP is started, so "SMP" is a decision not to have it yet, with the reasons written
+down: no trampoline, no per-CPU state, no spinlocks, no APIC or IOAPIC driver, no preemption. The
+PIC and the PIT are still the interrupt controller and the timer, and the MADT's source overrides -
+five of them on QEMU, including the one that says the timer is not on IRQ 0 - are counted and
+ignored. ACPI is read-only here: no FADT, no `\_S5`, no reboot or shutdown through it, and no
+attempt to use the tables for anything but a report. An IOAPIC at physical address zero would read
+as "absent", which is not a machine that exists but is a hole this code would not notice.
+
+
 
 **Status:** accepted, M9.
 

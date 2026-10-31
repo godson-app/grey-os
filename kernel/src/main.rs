@@ -13,8 +13,8 @@ use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use grey_os::{
-    apps, arena, compositor, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap, idt,
-    keyboard, memory, mouse, paging, pic, qemu, scheduler, serial, theme, timer, vm, window,
+    acpi, apps, arena, compositor, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap,
+    idt, keyboard, memory, mouse, paging, pic, qemu, scheduler, serial, theme, timer, vm, window,
 };
 // The shell only exists in the acceptance build: a normal boot has no way to type into it and
 // a kernel that waited for a command would hang the harness's clean boot.
@@ -790,6 +790,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // M10: what the firmware says this machine is. ACPI is read through the same window the
+    // page-table walk used, and everything found here is reported rather than acted on: no
+    // application processor is started and the 8259s stay the interrupt controller (ADR-037).
+    announce_acpi(offset, boot_info.rsdp_addr.as_ref().copied());
+
     // The first storage (M5): an ATA drive in PIO mode, and `greyfs` over it. This runs
     // before the interrupts because every transfer here polls a status register; the
     // filesystem needs the arena for its directory, which is why it cannot run earlier.
@@ -1070,6 +1075,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // loop is bounded by ticks rather than open-ended.
     #[cfg(grey_os_input_test)]
     {
+        SHELL_WINDOW.store(shell_window, Ordering::Relaxed);
         run_shell(&mut *desktop, shell_window, &mut *storage);
     }
 
@@ -1314,6 +1320,102 @@ fn probe_mapping(root: u64, offset: u64) -> MappingProbe {
 /// disk still boots, and the log says so instead of failing. Every other failure is fatal,
 /// because "there is a disk but it cannot be read" is not a state any later milestone can
 /// work around.
+/// The bootloader's window onto physical memory, as something [`acpi`] can read through.
+struct Physical {
+    offset: u64,
+}
+
+impl acpi::Phys for Physical {
+    fn read(&mut self, address: u64, out: &mut [u8]) -> bool {
+        if address == 0 {
+            return false;
+        }
+        let start = self.offset.saturating_add(address);
+        // SAFETY: `offset` is the bootloader's mapping of all of physical memory, so `start` is
+        // readable for as long as the request stays inside RAM, and `out` is the caller's buffer
+        // of exactly the length that is copied. A table at an address that is not RAM is a
+        // firmware bug, and the fault it causes is a `#PF` whose address reaches the log rather
+        // than silence.
+        unsafe {
+            core::ptr::copy_nonoverlapping(start as *const u8, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+}
+
+/// What ACPI said about the machine, kept for the shell's `cpus` command.
+///
+/// `IOAPIC` is zero when the MADT describes none, which is also the value in flight before the
+/// tables have been read: a machine with an IOAPIC at physical address zero does not exist.
+static CPUS: AtomicU32 = AtomicU32::new(0);
+static CPUS_ENABLED: AtomicU32 = AtomicU32::new(0);
+static IOAPIC: AtomicU32 = AtomicU32::new(0);
+static ACPI_TABLES: AtomicU32 = AtomicU32::new(0);
+static ACPI_REVISION: AtomicU32 = AtomicU32::new(0);
+static IRQ_OVERRIDES: AtomicU32 = AtomicU32::new(0);
+
+/// Reads the firmware's tables and reports what they say.
+///
+/// `rsdp` is the address the bootloader took out of the UEFI configuration table. A UEFI machine
+/// publishes the RSDP there and need not leave one in the legacy areas at all, which is why the
+/// hint comes first and the search is the fallback rather than the other way round.
+///
+/// Never fatal. A machine without usable tables is a machine with one CPU and a pair of 8259s,
+/// which is exactly what this kernel already assumed, so the honest failure is a line that says
+/// so rather than a boot that stops.
+fn announce_acpi(offset: u64, rsdp: Option<u64>) {
+    let mut physical = Physical { offset };
+    match acpi::discover(&mut physical, rsdp) {
+        Ok(report) => {
+            CPUS.store(report.cpus as u32, Ordering::Relaxed);
+            CPUS_ENABLED.store(report.enabled_cpus as u32, Ordering::Relaxed);
+            IOAPIC.store(report.ioapic.unwrap_or(0), Ordering::Relaxed);
+            ACPI_TABLES.store(report.tables.len() as u32, Ordering::Relaxed);
+            ACPI_REVISION.store(u32::from(report.revision), Ordering::Relaxed);
+            IRQ_OVERRIDES.store(report.overrides as u32, Ordering::Relaxed);
+            println!(
+                "grey-os: acpi: rsdp at {:#x} ({}), revision {}, {} table(s) named",
+                report.rsdp,
+                if report.hinted {
+                    "from the bootloader's table"
+                } else {
+                    "found by scanning"
+                },
+                report.revision,
+                report.tables.len()
+            );
+            match report.ioapic {
+                Some(address) => println!(
+                    "grey-os: acpi: madt: {} cpu(s), {} enabled, ioapic at {address:#x}, {} source override(s)",
+                    report.cpus, report.enabled_cpus, report.overrides
+                ),
+                None => println!(
+                    "grey-os: acpi: madt: {} cpu(s), {} enabled, no ioapic, {} source override(s)",
+                    report.cpus, report.enabled_cpus, report.overrides
+                ),
+            }
+            if report.cpus > 1 {
+                println!(
+                    "grey-os: smp: 1 of {} cpu(s) started, on the bootstrap processor; the others wait for a trampoline, an ioapic and per-cpu state (ADR-037)",
+                    report.cpus
+                );
+            } else {
+                println!(
+                    "grey-os: smp: 1 cpu started, the only one the firmware's tables describe"
+                );
+            }
+        }
+        Err(error) => {
+            CPUS.store(1, Ordering::Relaxed);
+            CPUS_ENABLED.store(1, Ordering::Relaxed);
+            println!(
+                "grey-os: acpi: no usable tables ({error:?}), so this boot assumes one cpu and the pic"
+            );
+            println!("grey-os: smp: 1 of 1 cpu started, on the bootstrap processor");
+        }
+    }
+}
+
 fn storage() -> Option<fs::Filesystem<disk::Pio>> {
     // SAFETY: nothing else in this boot has touched the primary ATA channel, and that
     // channel is the platform's own - the PC's first IDE controller, where QEMU's
@@ -1610,32 +1712,40 @@ fn app_line(line: alloc::string::String) {
 /// The [`vm::Host`] an application runs against.
 ///
 /// Output arrives as fragments, so the host assembles them into lines: a window holds lines, and
-/// a program that prints a number and a space should not produce a line per number. `Sleep`
-/// becomes a real [`scheduler::sleep_ticks`], which is what keeps a program from being a loop
-/// that never lets another task run.
-#[derive(Default)]
-struct AppHost {
-    line: alloc::string::String,
+/// a program that prints a number and a space should not produce a line per number. `emit` is
+/// where a finished line goes - the apps window for a boot task, the shell's window for `run`.
+/// `Sleep` becomes a real [`scheduler::sleep_ticks`], which is what keeps a program from being a
+/// loop that never lets another task run.
+struct ProgramHost {
+    partial: alloc::string::String,
+    emit: fn(alloc::string::String),
 }
 
-impl AppHost {
-    /// Empties the partial line, if there is one, into the window.
+impl ProgramHost {
+    fn new(emit: fn(alloc::string::String)) -> Self {
+        Self {
+            partial: alloc::string::String::new(),
+            emit,
+        }
+    }
+
+    /// Empties the partial line, if there is one, through `emit`.
     fn flush(&mut self) {
-        if self.line.is_empty() {
+        if self.partial.is_empty() {
             return;
         }
-        let line = core::mem::take(&mut self.line);
-        app_line(line);
+        let line = core::mem::take(&mut self.partial);
+        (self.emit)(line);
     }
 }
 
-impl vm::Host for AppHost {
+impl vm::Host for ProgramHost {
     fn write(&mut self, text: &str) {
         for character in text.chars() {
             if character == '\n' {
                 self.flush();
             } else {
-                self.line.push(character);
+                self.partial.push(character);
             }
         }
     }
@@ -1671,7 +1781,7 @@ fn run_app(name: &'static str) {
             return;
         }
     };
-    let mut host = AppHost::default();
+    let mut host = ProgramHost::new(app_line);
     let mut machine = vm::Machine::new();
     let result = machine.run(&program, &mut host, APP_BUDGET);
     host.flush();
@@ -1708,7 +1818,7 @@ fn task_fib() {
 /// forever would hang the harness's clean boot. The input run gets long enough for the
 /// harness to type; a normal boot gets a short demonstration.
 #[cfg(grey_os_input_test)]
-const SHELL_TICKS: u64 = 1200;
+const SHELL_TICKS: u64 = 2400;
 
 /// The shell, driven by the keyboard's queue.
 ///
@@ -1794,6 +1904,21 @@ fn draw_prompt(desktop: &mut compositor::Compositor, window: u32, editor: &shell
     }
 }
 
+/// The window `run` prints into, so a program started from the shell writes to the shell.
+///
+/// Set once, just before the shell runs, for the same reason [`APPS_WINDOW`] is: the shell's
+/// executor holds the desktop borrow, and a program's host is called from inside it.
+#[cfg(grey_os_input_test)]
+static SHELL_WINDOW: AtomicU32 = AtomicU32::new(0);
+
+/// Adds a line to the shell's window and to serial: where a program's output goes when the
+/// program was started by `run`.
+#[cfg(grey_os_input_test)]
+fn run_line(line: alloc::string::String) {
+    let window = SHELL_WINDOW.load(Ordering::Relaxed);
+    with_desktop(|desktop| shell_push(desktop, window, line));
+}
+
 /// Adds a line above the prompt and damages the window.
 ///
 /// The line goes to serial too, for the same reason the tasks' do: a harness can read a line
@@ -1818,6 +1943,20 @@ fn shell_push(desktop: &mut compositor::Compositor, window: u32, text: alloc::st
         shell_window.scroll = shell_window.lines.len().saturating_sub(1);
         let rect = shell_window.rect;
         desktop.windows.damage(rect);
+    }
+}
+
+/// Adds a rule for a bare program name: `run fib` is `apps/fib.gvm`.
+///
+/// The keyboard the harness types through cannot send a slash without a name for it, and a
+/// person should not have to type the whole path to run one of the three programs the disk
+/// was formatted with.
+#[cfg(grey_os_input_test)]
+fn program_path(name: &str) -> alloc::string::String {
+    if name.contains('/') {
+        alloc::string::String::from(name)
+    } else {
+        alloc::format!("apps/{name}.gvm")
     }
 }
 
@@ -1991,6 +2130,62 @@ fn execute(
                 shell_window.set_lines(alloc::vec::Vec::new());
                 let rect = shell_window.rect;
                 desktop.windows.damage(rect);
+            }
+        }
+        shell::Command::Cpus => {
+            let cpus = CPUS.load(Ordering::Relaxed);
+            out.push(alloc::format!(
+                "{cpus} cpu(s) in the firmware's tables, {} enabled, 1 started",
+                CPUS_ENABLED.load(Ordering::Relaxed)
+            ));
+            let ioapic = IOAPIC.load(Ordering::Relaxed);
+            out.push(alloc::format!(
+                "acpi revision {}, {} table(s), {} {}, {} source override(s)",
+                ACPI_REVISION.load(Ordering::Relaxed),
+                ACPI_TABLES.load(Ordering::Relaxed),
+                if ioapic == 0 {
+                    "no ioapic"
+                } else {
+                    "ioapic at"
+                },
+                // Only formatted when there is one, so a machine without an IOAPIC does not
+                // print an address of zero.
+                if ioapic == 0 {
+                    alloc::string::String::new()
+                } else {
+                    alloc::format!("{ioapic:#x}")
+                },
+                IRQ_OVERRIDES.load(Ordering::Relaxed)
+            ));
+        }
+        shell::Command::Run(name) => {
+            let path = program_path(&name);
+            match storage.as_mut() {
+                Some(filesystem) => match filesystem.read(&path) {
+                    Ok(bytes) => match vm::Program::parse(&bytes) {
+                        Ok(program) => {
+                            // The program's own lines go into the window as they are produced,
+                            // and the report goes into `out` with the rest of the answer.
+                            let mut host = ProgramHost::new(run_line);
+                            let mut machine = vm::Machine::new();
+                            let result = machine.run(&program, &mut host, APP_BUDGET);
+                            host.flush();
+                            match result {
+                                Ok(vm::Outcome::Halted { steps }) => {
+                                    out.push(alloc::format!("{path}: halted after {steps} steps"))
+                                }
+                                Err(error) => {
+                                    out.push(alloc::format!("{path}: stopped: {error:?}"))
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            out.push(alloc::format!("? {path} is not a program: {error:?}"))
+                        }
+                    },
+                    Err(error) => out.push(alloc::format!("? {path}: {error:?}")),
+                },
+                None => out.push(alloc::string::String::from("no disk")),
             }
         }
         shell::Command::Quit => quit = true,

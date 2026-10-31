@@ -22,6 +22,7 @@
 // crate here lets the console's `Vec` and `String` be written once for both builds.
 extern crate alloc;
 
+pub mod acpi;
 pub mod apps;
 pub mod arena;
 pub mod canvas;

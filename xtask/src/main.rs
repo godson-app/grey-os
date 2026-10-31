@@ -61,7 +61,10 @@ const INPUT_OK: &str = "grey-os: input ok:";
 const INPUT_KEYS: [&str; 4] = ["g", "r", "e", "y"];
 /// The commands the harness types into the shell once it says it is listening (M8). `exit`
 /// ends the session, which is what lets the phase finish rather than wait for its timeout.
-const SHELL_COMMANDS: [&str; 3] = ["ls", "mem", "exit"];
+/// `cpus` and the two `run`s are M10: the first asks the kernel what the firmware said, the
+/// second runs a program off the disk, and the third asks for one that is not there, which has
+/// to be a message rather than a fault.
+const SHELL_COMMANDS: [&str; 6] = ["ls", "mem", "cpus", "run fib", "run nope", "exit"];
 /// Printed by the shell before it starts reading keys.
 const SHELL_LISTENING: &str = "grey-os: shell: listening";
 /// Printed when the shell's `exit` command ended the session.
@@ -76,6 +79,11 @@ const APP_HELLO: &str = "grey-os: app: hello from apps/hello.gvm";
 const APP_COUNT: &str = "grey-os: app: 1 2 3 4 5";
 const APP_FIB: &str = "grey-os: app: 0 1 1 2 3 5 8 13 21 34";
 const APP_HALTED: &str = "halted after";
+/// Printed by the firmware report (M10): the RSDP, what the MADT says, and how many CPUs the
+/// kernel actually started.
+const ACPI_RSDP: &str = "grey-os: acpi: rsdp at";
+const ACPI_MADT: &str = "grey-os: acpi: madt: 4 cpu(s), 4 enabled, ioapic at";
+const SMP_STARTED: &str = "grey-os: smp: 1 of 4 cpu(s) started";
 /// Printed by a normal boot once the keyboard has been configured and its handler installed
 /// (M6). The mouse's line follows it, but a machine without a pointer is allowed.
 const INPUT_READY: &str = "grey-os: input: keyboard on irq1";
@@ -313,6 +321,9 @@ fn test(options: &Options) -> Result<ExitCode> {
             GREYFS_WRITE,
             APPS_INSTALLED,
             &format!("{STORAGE_OK} 1"),
+            ACPI_RSDP,
+            ACPI_MADT,
+            SMP_STARTED,
             INPUT_READY,
             "grey-os: input ready:",
             THEME_READY,
@@ -334,6 +345,9 @@ fn test(options: &Options) -> Result<ExitCode> {
     println!(
         "pass: `{APPS_INSTALLED}`, then `{APP_COUNT}` and `{APP_FIB}` printed by the interpreter, \
          each program's `{APP_HALTED}` line and `{APPS_OK}` seen"
+    );
+    println!(
+        "pass: `{ACPI_RSDP}`, `{ACPI_MADT}` and `{SMP_STARTED}` seen on serial, so the cpu count came out of the madt"
     );
 
     storage_persistence(options)?;
@@ -481,13 +495,22 @@ fn input_path(options: &Options) -> Result<()> {
         "grey-os: shell: boot-count",
         "grey-os: shell: > mem",
         "grey-os: shell: heap:",
+        // M10: the shell asks the firmware report what the machine is, and runs a program the
+        // boot's storage bring-up wrote to the disk.
+        "grey-os: shell: > cpus",
+        "grey-os: shell: 4 cpu(s) in the firmware's tables, 4 enabled, 1 started",
+        "grey-os: shell: > run fib",
+        "grey-os: shell: 0 1 1 2 3 5 8 13 21 34",
+        "grey-os: shell: apps/fib.gvm: halted after",
+        "grey-os: shell: > run nope",
+        "grey-os: shell: ? apps/nope.gvm: NotFound",
     ] {
         if !log.contains(needle) {
             bail!("the shell never reported `{needle}`\n--- serial ---\n{log}");
         }
     }
     println!(
-        "pass: `ls`, `mem` and `exit` typed into the shell, its answers on serial and `{SHELL_EXIT}` seen"
+        "pass: `ls`, `mem`, `cpus`, `run fib`, `run nope` and `exit` typed into the shell, the answers and the program's output on serial, `{SHELL_EXIT}` seen"
     );
     Ok(())
 }
@@ -570,7 +593,7 @@ fn type_commands(socket: &Path) -> Result<()> {
     let (mut stream, mut reader) = monitor(socket)?;
     for command in SHELL_COMMANDS {
         for key in command.chars() {
-            qmp(&mut stream, &mut reader, &sendkey(&key.to_string()))?;
+            qmp(&mut stream, &mut reader, &sendkey(&key_name(key)))?;
             std::thread::sleep(Duration::from_millis(60));
         }
         qmp(&mut stream, &mut reader, &sendkey("ret"))?;
@@ -578,6 +601,21 @@ fn type_commands(socket: &Path) -> Result<()> {
         std::thread::sleep(Duration::from_millis(250));
     }
     Ok(())
+}
+
+/// QEMU's name for a character the monitor does not accept as itself.
+///
+/// `sendkey a` types an `a`; `sendkey ` types nothing, so the three characters this shell's
+/// commands need and the keyboard does not have a literal name for are spelled out.
+fn key_name(character: char) -> String {
+    let name = match character {
+        ' ' => "spc",
+        '/' => "slash",
+        '.' => "dot",
+        '-' => "minus",
+        other => return other.to_string(),
+    };
+    String::from(name)
 }
 
 /// The QMP command that sends one key through the machine's keyboard.
@@ -880,6 +918,10 @@ fn interpret(status: ExitStatus) -> Result<ExitCode> {
 fn boot_command(options: &Options, capture: bool) -> Result<Command> {
     let mut command = Command::new("qemu-system-x86_64");
     command.args(["-m", "512M"]);
+    // Four CPUs, of which the kernel starts exactly one (ADR-037). The number is not decoration:
+    // the boot log's ACPI line has to say four, and a kernel that could not read the MADT would
+    // say one - which is what makes the assertion evidence rather than a constant.
+    command.args(["-smp", "4"]);
     // Stop on a triple fault instead of reboot-looping forever.
     command.arg("-no-reboot");
     // Lets the kernel report a pass/fail status back to this process.
