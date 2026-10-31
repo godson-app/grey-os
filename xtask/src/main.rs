@@ -25,6 +25,27 @@ const IMAGE_DIR: &str = "target/grey-os";
 const UEFI_IMAGE: &str = "grey-os-uefi.img";
 const BIOS_IMAGE: &str = "grey-os-bios.img";
 
+/// The data disk `greyfs` lives on (M5). Created empty and never anywhere but under
+/// `target/`: the kernel formats it on first boot, which is what makes that boot's log
+/// line evidence that formatting works.
+const DISK_IMAGE: &str = "grey-os-disk.img";
+/// Its size: 4 MiB, 8192 sectors. Small enough that every transfer a boot makes is quick,
+/// large enough for the directory, the boot counter and, from M9, a few programs.
+const DISK_BYTES: u64 = 4 * 1024 * 1024;
+/// Printed once the ATA driver has identified the primary master.
+const ATA_DISK: &str = "grey-os: ata: primary master";
+/// Printed when the kernel found nothing on the disk and formatted it.
+const GREYFS_FORMATTED: &str = "grey-os: greyfs: no filesystem, formatted";
+/// Printed when the kernel mounted a filesystem that was already there. The generation
+/// number in the line is what proves an earlier boot wrote it.
+const GREYFS_MOUNTED: &str = "grey-os: greyfs: mounted generation";
+/// Printed after the filesystem's write was read back and compared.
+const GREYFS_WRITE: &str = "grey-os: greyfs: wrote /boot-count";
+/// The end of the storage bring-up. The number after it is the boot count the disk held,
+/// which is the whole persistence claim: `boot 1` means the counter was written, `boot 2`
+/// means a second boot read it back from the platter.
+const STORAGE_OK: &str = "grey-os: storage ok: boot";
+
 const USAGE: &str = "usage: cargo xtask <build|run|test> [--no-build] [--bios]";
 
 /// QEMU's `isa-debug-exit` reports `(value << 1) | 1`; the kernel sends 0x10.
@@ -222,6 +243,10 @@ fn run(options: &Options) -> Result<ExitCode> {
 /// not take effect would pass a test that only checked the clean boot, and a kernel that always
 /// panics would fail the first phase.
 fn test(options: &Options) -> Result<ExitCode> {
+    // A deterministic disk: the clean boot has to format, and the persistence phase that
+    // follows has to find what it wrote. Leaving an old counter behind would make the
+    // first `boot N` line depend on how many times `test` had run before.
+    wipe_disk()?;
     let (log, code) = boot_headless(options)?;
     expect(
         &log,
@@ -237,12 +262,19 @@ fn test(options: &Options) -> Result<ExitCode> {
             HEAP_TRIM,
             CONTAINERS,
             MAPPING_PROBE,
+            ATA_DISK,
+            GREYFS_FORMATTED,
+            GREYFS_WRITE,
+            &format!("{STORAGE_OK} 1"),
         ],
         EXIT_CLEAN,
     )?;
     println!(
         "pass: `{BOOT_OK}` and the memory bring-up lines seen on serial, qemu exited {EXIT_CLEAN}"
     );
+    println!("pass: `{ATA_DISK}` driven, `{GREYFS_FORMATTED}` on a blank disk and the counter written back");
+
+    storage_persistence(options)?;
 
     let phases = panic_path(options).and_then(|()| exception_paths(options));
     // Restore the image the other commands boot whether the phases passed or not:
@@ -280,7 +312,41 @@ fn panic_path(options: &Options) -> Result<()> {
     Ok(())
 }
 
-/// Boots one image per injected fault, asserting the report each handler has to produce.
+/// Boots the same disk a second time and asserts the filesystem came back.
+///
+/// This is the half of M5 that a single boot cannot show: written sectors are only a
+/// filesystem if the next mount reads them, and a kernel that silently re-formatted would
+/// pass every other assertion here. So the formatted line must be *absent*, the mount
+/// must name the generation the first boot left, and the counter must have moved on.
+fn storage_persistence(options: &Options) -> Result<()> {
+    println!("--- storage persistence: booting the disk the clean boot wrote");
+    let (log, code) = boot_headless(options)?;
+    expect(
+        &log,
+        code,
+        &[
+            BOOT_OK,
+            ATA_DISK,
+            GREYFS_MOUNTED,
+            GREYFS_WRITE,
+            &format!("{STORAGE_OK} 2"),
+            &format!("{GREYFS_MOUNTED} 1"),
+        ],
+        EXIT_CLEAN,
+    )?;
+    if log.contains(GREYFS_FORMATTED) {
+        bail!(
+            "the second boot formatted the disk again instead of mounting it, so nothing \
+             was persisted\n--- serial ---\n{log}"
+        );
+    }
+    println!(
+        "pass: `{GREYFS_MOUNTED} 1`, the counter read back as `boot 2` and no format on the \
+         second boot"
+    );
+    Ok(())
+}
+
 ///
 /// Each iteration rebuilds the kernel with [`EXCEPTION_TEST_ENV`] set to a different value, so
 /// what is booted is a kernel whose only job is that fault. The announcement line is asserted
@@ -397,17 +463,37 @@ fn boot_command(options: &Options, capture: bool) -> Result<Command> {
             &format!("format=raw,if=pflash,readonly=on,file={}", code.display()),
             "-drive",
             &format!("format=raw,if=pflash,file={}", vars.display()),
+            // The boot image goes on the secondary channel's master (index 2), leaving
+            // the primary master free for the data disk below. OVMF enumerates every
+            // block device and finds the ESP wherever it is.
             "-drive",
-            &format!("format=raw,file={}", image_path(UEFI_IMAGE).display()),
+            &format!(
+                "format=raw,if=ide,index=2,media=disk,file={}",
+                image_path(UEFI_IMAGE).display()
+            ),
         ]);
     } else {
         // BIOS: the firmware boots the raw disk directly, so no pflash drives.
         // Built but not covered by `test`; see ROADMAP.md.
         command.args([
             "-drive",
-            &format!("format=raw,file={}", image_path(BIOS_IMAGE).display()),
+            &format!(
+                "format=raw,if=ide,index=2,media=disk,file={}",
+                image_path(BIOS_IMAGE).display()
+            ),
         ]);
     }
+
+    // The data disk (M5): the primary master of the machine's first IDE channel, which is
+    // where `disk::Pio::probe` looks. `index=0` is the master, and `media=disk` stops QEMU
+    // from guessing a CD-ROM from the image's size.
+    command.args([
+        "-drive",
+        &format!(
+            "format=raw,if=ide,index=0,media=disk,file={}",
+            ensure_disk()?.display()
+        ),
+    ]);
 
     Ok(command)
 }
@@ -455,6 +541,40 @@ fn image_dir() -> PathBuf {
 
 fn image_path(name: &str) -> PathBuf {
     image_dir().join(name)
+}
+
+/// The data disk's path, creating it if it is not there.
+///
+/// A missing disk would make the kernel print "no disk" and carry on, which is a state the
+/// boot tests would then have to treat as a failure of the driver rather than of the
+/// harness. Creating it here keeps the two apart.
+fn ensure_disk() -> Result<PathBuf> {
+    fs::create_dir_all(image_dir())
+        .with_context(|| format!("failed to create {}", image_dir().display()))?;
+    let path = image_path(DISK_IMAGE);
+    if !path.exists() {
+        let file = fs::File::create(&path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        file.set_len(DISK_BYTES)
+            .with_context(|| format!("failed to size {}", path.display()))?;
+    }
+    Ok(path)
+}
+
+/// Throws the data disk away and creates a blank one.
+///
+/// Only ever the file under `target/`: the one rule this repository makes about disks is
+/// that nothing outside that directory is written.
+fn wipe_disk() -> Result<PathBuf> {
+    let path = image_path(DISK_IMAGE);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to remove {}", path.display()))
+        }
+    }
+    ensure_disk()
 }
 
 /// Comma-separated directory listing, so a failure can name what it did find.

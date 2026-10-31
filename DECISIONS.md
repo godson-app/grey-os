@@ -876,3 +876,73 @@ gone with the region guard. The tables a growth creates are never freed and a tr
 page-aligned top, both recorded as open. The arena's address is a constant, not a layout: M5 or the
 first user-space mapping is where that stops being a placeholder.
 
+
+## ADR-032: An ATA drive polled through its ports, and a filesystem the kernel formats
+
+**Status:** accepted, M5.
+
+**Context.** M5's theme is "storage: disk driver and filesystem", and the two halves constrain each
+other. A filesystem needs a device that can fail a transfer and report why; a driver is only worth
+having if something reads sectors it wrote. The machine has no PCI bus walk, no interrupts claimed
+beyond the timer, and no allocator when the boot starts, so the driver has to be one that can run on
+port I/O alone.
+
+**Decision.** The driver is the parallel-ATA interface in programmed-I/O mode, on the primary channel,
+polling its status register. It needs four registers to address a sector, one to hand the data over,
+and no descriptor rings, no DMA programming, no PCI enumeration and no interrupt handler - which is
+exactly the smallest thing that is still a disk. It claims the primary master and nothing else: the
+slave and the secondary channel are the same code with different constants and no test image that
+would exercise them, so probing them would add untested paths for the sake of a line in the log.
+
+The placement in QEMU is part of the decision. The boot image used to be QEMU's first IDE drive; it
+moves to the secondary channel's master (`if=ide,index=2`) so that the *data* disk can be the primary
+master (`index=0`), which is the drive the driver claims. OVMF enumerates block devices and finds the
+ESP wherever it is, so the boot does not care.
+
+`greyfs` is the filesystem, and its layout is deliberately one sector longer than the smallest thing
+that could work:
+
+| sector | contents |
+| ------ | -------- |
+| 0 | superblock: magic, version, sector size, device size, `next_free`, mount generation, FNV-1a seal |
+| 1-4 | the directory: 64 slots of 32 bytes, name (22), kind, start sector, length |
+| 5.. | file data, one contiguous extent per file, allocated at `next_free` |
+
+Three things about that are choices rather than accidents. The seal exists because a magic number
+alone cannot tell a filesystem from a sector that happens to begin with it, and the seal is what makes
+"blank disk" and "damaged filesystem" different answers - [`Filesystem::open`] formats only a sector
+of zeros, and refuses everything else. The directory is positional: slot *n* on disk is slot *n* in
+memory, so a removal is one zeroed slot instead of a rewrite, and a duplicate name is detectable at
+mount rather than at lookup. And the allocator is a single bump cursor, which is why replacing a file
+leaks its old extent and removing one leaks it entirely: without a free list, the honest statement
+about those sectors is that nothing points at them any more.
+
+A write is ordered data, then directory, then superblock. A crash in the middle leaves either a lost
+write (the directory has not caught up) or a mount that refuses the disk (an extent the superblock
+says is unallocated); the third order would leave a file pointing at sectors another file has since
+claimed, which is the only one of the three that loses data silently.
+
+**Where the format lives.** In the kernel, not in the harness. `xtask` creates the data image as a
+file of zeros and the kernel formats it on first boot, which means one implementation of the layout
+instead of two that have to be kept in step - the same argument that keeps the framebuffer's geometry
+out of `xtask`. The cost is that the first boot of a fresh image is the only one that exercises
+`format`, so `cargo xtask test` wipes the image before its clean boot and then boots it a second time
+to assert the *other* path: a mount that finds the filesystem, names its generation, and reads back a
+counter the first boot wrote. The counter (`/boot-count`) is the persistence proof, and the mount's
+`generation` field is the same claim from the superblock's side.
+
+**Consequences.** `disk.rs` holds the pure half - the drive/head byte, the capability word, the
+28-bit size, the big-endian model string, the extent rounding and the transfer bounds - under eight
+host tests, and the port half under `cfg(target_arch = "x86_64")` where it can only be exercised in
+QEMU; `fs.rs` holds all of `greyfs` behind the `Block` trait, under eighteen host tests that mount an
+array. `port.rs` is the kernel's first shared port-I/O module: `pic`, `serial` and `timer` keep their
+own `outb` for now, because changing three working drivers is not what M5 is for, and folding them in
+is a polish item. `main.rs` gains `storage()`, which probes, mounts or formats, writes the counter,
+reads it back and compares - and returns `None` with a reported line when no drive answers, because a
+machine without a disk still has to boot.
+
+**Open.** No free list, so extents leak on replace and remove. No directories, no permissions, no
+timestamps, no `fsck` beyond what a mount validates, and no write-cache flush: the driver waits for
+the controller to drop busy after the last word, which is not the same as `FLUSH CACHE`. The slave
+drive and the secondary channel are not probed. The directory is fixed at 64 slots.
+

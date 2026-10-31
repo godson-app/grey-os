@@ -25,8 +25,10 @@ extern crate alloc;
 pub mod arena;
 pub mod canvas;
 pub mod console;
+pub mod disk;
 pub mod font;
 pub mod frame;
+pub mod fs;
 pub mod gdt;
 pub mod heap;
 pub mod idt;
@@ -40,6 +42,8 @@ pub mod timer;
 pub mod display;
 #[cfg(target_arch = "x86_64")]
 pub mod framebuffer;
+#[cfg(target_arch = "x86_64")]
+pub mod port;
 #[cfg(target_arch = "x86_64")]
 pub mod qemu;
 #[cfg(target_arch = "x86_64")]

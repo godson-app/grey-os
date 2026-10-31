@@ -13,9 +13,19 @@ use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 use grey_os::{
-    arena, display, frame, framebuffer, gdt, halt_loop, heap, idt, memory, paging, pic, qemu,
-    serial, timer,
+    arena, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap, idt, memory, paging, pic,
+    qemu, serial, timer,
 };
+// `Block` has to be in scope for `drive.sectors()`: the trait is the interface, and the
+// concrete `Pio` type only implements it.
+use grey_os::disk::Block as _;
+
+/// The file the storage bring-up keeps a boot counter in. Written on every boot, which is
+/// how a second boot proves it read what the first one wrote.
+const BOOT_COUNT: &str = "boot-count";
+
+/// Where the storage bring-up starts its boot count when the file is not there yet.
+const FIRST_BOOT: u32 = 1;
 
 /// Where the arena's virtual span starts. Above the bootloader's physical window, which ends at
 /// `offset + 1 TiB`, and below the addresses the mapping probes use, so no address this boot
@@ -776,6 +786,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
+    // The first storage (M5): an ATA drive in PIO mode, and `greyfs` over it. This runs
+    // before the interrupts because every transfer here polls a status register; the
+    // filesystem needs the arena for its directory, which is why it cannot run earlier.
+    let _storage = storage();
+
     // Interrupts last, and in this order: the PIC is remapped before any line is unmasked,
     // the timer claims IRQ0 and installs its handler, and only then is `IF` set. Enabling
     // earlier would leave a window where a tick arrives on a vector with no handler behind it
@@ -1018,6 +1033,107 @@ fn probe_mapping(root: u64, offset: u64) -> MappingProbe {
         // A byte that did not arrive, or an entry that went empty while the walk still found it.
         _ => MappingProbe::Disagreed,
     }
+}
+
+/// Probes the primary ATA channel, mounts `greyfs` over it, and proves a write by reading
+/// it back through the filesystem and through the disk.
+///
+/// Returns `None` when no drive answers, which is a supported state: a machine without a
+/// disk still boots, and the log says so instead of failing. Every other failure is fatal,
+/// because "there is a disk but it cannot be read" is not a state any later milestone can
+/// work around.
+fn storage() -> Option<fs::Filesystem<disk::Pio>> {
+    // SAFETY: nothing else in this boot has touched the primary ATA channel, and that
+    // channel is the platform's own - the PC's first IDE controller, where QEMU's
+    // `-drive if=ide` puts the image.
+    let Some(drive) = (unsafe { disk::Pio::probe() }) else {
+        println!("grey-os: storage: no disk answered on the primary ata channel");
+        return None;
+    };
+    println!(
+        "grey-os: ata: primary master \"{}\", {} sectors of {} bytes",
+        drive.model(),
+        drive.sectors(),
+        disk::SECTOR_BYTES
+    );
+
+    let (mut filesystem, opened) = match fs::Filesystem::open(drive) {
+        Ok(pair) => pair,
+        Err(error) => fatal_storage(error),
+    };
+    // Reported before the write below, because this line is what says whether the disk was
+    // blank or held a filesystem an earlier boot left behind.
+    match opened {
+        fs::Opened::Formatted => println!(
+            "grey-os: greyfs: no filesystem, formatted {} sectors with {} directory slots",
+            filesystem.superblock().sectors,
+            fs::MAX_ENTRIES
+        ),
+        fs::Opened::Mounted => println!(
+            "grey-os: greyfs: mounted generation {}, {} file(s), {} of {} sectors in use",
+            filesystem.superblock().generation,
+            filesystem.count(),
+            filesystem.next_free(),
+            filesystem.superblock().sectors
+        ),
+    }
+
+    // The write path, and the only claim worth making about a filesystem: what came back
+    // is what went in. The counter is what makes the next boot's log line evidence rather
+    // than a repetition of this one.
+    let previous = match filesystem.read(BOOT_COUNT) {
+        Ok(bytes) => boot_number(&bytes),
+        Err(fs::FsError::NotFound) => 0,
+        Err(error) => fatal_storage(error),
+    };
+    let boot = previous.saturating_add(1).max(FIRST_BOOT);
+    let text = alloc::format!("grey-os boot {boot}\n");
+    let entry = match filesystem.write(BOOT_COUNT, text.as_bytes(), fs::Kind::File) {
+        Ok(entry) => entry,
+        Err(error) => fatal_storage(error),
+    };
+    let read_back = match filesystem.read(BOOT_COUNT) {
+        Ok(bytes) => bytes,
+        Err(error) => fatal_storage(error),
+    };
+    if read_back != text.as_bytes() {
+        println!("grey-os: FATAL: /{BOOT_COUNT} did not read back what was written");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    println!(
+        "grey-os: greyfs: wrote /{BOOT_COUNT} ({} bytes at sector {}), read back and compared",
+        entry.len, entry.start
+    );
+    println!(
+        "grey-os: storage ok: boot {boot} of this image, {} file(s), {} of {} sectors in use",
+        filesystem.count(),
+        filesystem.next_free(),
+        filesystem.superblock().sectors
+    );
+    Some(filesystem)
+}
+
+/// The number a `/boot-count` file holds, or zero if it holds something else.
+///
+/// A file this kernel did not write is not a reason to fail the boot: a counter that
+/// cannot be read starts again from one, and the log line above still says the mount
+/// worked.
+fn boot_number(bytes: &[u8]) -> u32 {
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return 0;
+    };
+    text.split_whitespace()
+        .last()
+        .and_then(|word| word.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Reports a filesystem that refused the disk, then stops: every later milestone reads
+/// files, so carrying on without storage would only move the failure further from its
+/// cause.
+fn fatal_storage(error: fs::FsError) -> ! {
+    println!("grey-os: FATAL: greyfs refused the disk: {error:?}");
+    qemu::exit_qemu(qemu::QemuExitCode::Failed)
 }
 
 /// Set once the panic path runs, so a panic inside it cannot recurse forever.

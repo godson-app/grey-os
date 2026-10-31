@@ -5,7 +5,7 @@ acceptance criteria are demonstrated by output, not by code existing: the proof 
 a `xtask test` run or a QEMU session whose serial log is pasted into the commit
 message. No milestone is started before the previous one is accepted.
 
-Scope for M0, M1, M2, M3 and M4 is agreed. M5 onward is stated as themes in dependency order:
+Scope for M0, M1, M2, M3, M4 and M5 is agreed. M6 onward is stated as themes in dependency order:
 the authoritative wording comes from the engineering brief and is transcribed here milestone by
 milestone, so that this file never claims more than was agreed.
 
@@ -18,7 +18,7 @@ milestone, so that this file never claims more than was agreed.
 | M2        | Interrupts, exceptions, timers               | **Done** - criteria met; PIC stays until an APIC (ADR-028) |
 | M3        | Physical and virtual memory management       | **Done** - criteria met; guard page armed (ADR-029)        |
 | M4        | Heap allocation and kernel data structures   | **Done** - criteria 1-5 met; stretch tree open (ADR-031)   |
-| M5        | Storage: disk driver and filesystem          | Not started                                                |
+| M5        | Storage: disk driver and filesystem          | **Done** - criteria 1-6 met; no free list yet (ADR-032)     |
 | M6        | Input: keyboard and pointer                  | Not started                                                |
 | M7        | Compositor, windows, theme                   | Not started                                                |
 | M8        | Shell and process model                      | Not started                                                |
@@ -410,7 +410,88 @@ back, the three refusals, `realloc` growing and shrinking, and the churn probe i
 the host. The write through a real arena page and the `invlpg` after it are left to the QEMU boot, as
 `mov cr3` was in M3.
 
-## M5 onward - provisional themes
+## M5 - Storage: disk driver and filesystem
+
+**Goal.** Make something outlive the boot. Everything the kernel has written so far - the console's
+grid, the arena's pages - is gone when the machine stops, and there is no way to hand a later
+milestone anything bigger than what fits in the image. M5 adds the first block device and the first
+filesystem: a driver that can fail a transfer and say why, and a format whose writes survive a power
+cut badly rather than silently.
+
+**Agreed shape** (ADR-032): parallel ATA in programmed-I/O mode on the primary channel, polled, with
+no interrupt and no DMA; `greyfs` over it, a flat format with a sealed superblock, a positional
+directory of 64 slots and one contiguous extent per file. The kernel formats a blank disk itself; the
+harness only creates the file.
+
+**Landed.**
+
+- [x] `disk.rs`: the ATA driver. Eight host tests for the parts that are arithmetic - the drive/head
+      byte that carries bits 24-27 of the block address, the capability word, the size in words 60
+      and 61, the byte-swapped model string, the 256-encoded-as-zero count register, extent rounding,
+      and a transfer-bounds check that agrees with the host tests. The port half is `x86_64`-only and
+      bounds every wait: 2,000,000 polls then `Timeout`, and `ERR`/`DF` become `DeviceFault` instead
+      of a wait for data that is not coming.
+- [x] `fs.rs`: `greyfs`, all of it host-testable behind the `Block` trait. Superblock with an FNV-1a
+      seal over its own fields; a mount that refuses a bad magic, a version or sector size it does
+      not read, a broken seal, a `next_free` outside the device, an extent inside the metadata, an
+      extent past `next_free`, a length the format cannot represent, or two entries with one name;
+      and `open`, which formats *only* a sector of zeros.
+- [x] Writes ordered data, then directory, then superblock, so the two ways a crash can leave the
+      disk are a lost write and a mount that refuses it - never a file pointing at live sectors.
+- [x] `port.rs`: `inb`, `outb`, `inw`, `outw`, `insw`, `outsw` and `io_wait`, each one `unsafe`
+      block with its promise written down, so the drivers after this one do not grow their own.
+- [x] `xtask` creates the data image under `target/` (4 MiB of zeros) and attaches it as the primary
+      master; the boot image moves to the secondary channel's master so the two do not collide.
+- [x] Boot proof, in this order: the drive identified by model and size, the format or the mount with
+      its generation, the counter written and read back and compared, and the count itself.
+- [x] `cargo xtask test` wipes the disk, asserts the clean boot's format, then boots the same disk a
+      second time and asserts a mount of generation 1, a counter that reads `boot 2`, and the
+      *absence* of the format line - a kernel that re-formatted would pass every other assertion.
+
+**Open.** No free list, so replacing a file leaks its extent and removing one leaks it entirely. No
+directories, permissions, timestamps or file growth in place. No write-cache flush: the driver waits
+for busy to drop, which is not `FLUSH CACHE`. The ATA slave and the secondary channel are not probed.
+The directory is fixed at 64 slots. `pic`, `serial` and `timer` still spell their own `outb`.
+
+**Acceptance criteria.**
+
+1. The boot log names the drive the driver found, with the model string and the sector count the
+   identify command reported.
+2. A blank disk is formatted and the log says so, including the number of directory slots.
+3. A file written through the filesystem reads back byte for byte, through the disk, and the log
+   reports the extent it landed in.
+4. A second boot of the same disk mounts the filesystem instead of formatting it, reports the
+   generation the first boot left, and reads back a counter the first boot wrote.
+5. Host tests cover the format's round trip, every refusal a mount can make, the name alphabet, a
+   full disk, a full directory, removal, replacement, and the seal's coverage.
+6. `cargo xtask test` asserts 1-4 on serial and stays green through the panic and fault phases.
+
+**Status against them.** All six met. What the clean boot prints, after M4's lines:
+
+```text
+grey-os: ata: primary master "QEMU HARDDISK", 8192 sectors of 512 bytes
+grey-os: greyfs: no filesystem, formatted 8192 sectors with 64 directory slots
+grey-os: greyfs: wrote /boot-count (15 bytes at sector 5), read back and compared
+grey-os: storage ok: boot 1 of this image, 1 file(s), 6 of 8192 sectors in use
+```
+
+and the second boot, which is the persistence phase of `cargo xtask test`:
+
+```text
+grey-os: ata: primary master "QEMU HARDDISK", 8192 sectors of 512 bytes
+grey-os: greyfs: mounted generation 1, 1 file(s), 6 of 8192 sectors in use
+grey-os: greyfs: wrote /boot-count (15 bytes at sector 6), read back and compared
+grey-os: storage ok: boot 2 of this image, 1 file(s), 7 of 8192 sectors in use
+```
+
+Criterion 2 is the second line: 64 slots is `fs::MAX_ENTRIES`, and the format wrote all four
+directory sectors. Criterion 3 is the third line's `read back and compared`, which is a `memcmp` of
+what `Filesystem::read` returned against the bytes that went in. Criterion 4 is the second block: the
+mount's generation is one because the first boot wrote generation zero, the counter read `boot 1` and
+is now `boot 2`, and the format line is absent - asserted, not merely not looked for. Criterion 5 is
+26 host tests, 8 in `disk` and 18 in `fs`. Tests: 162 on the host.
+
+## M6 onward - provisional themes
 
 The ordering above is dependency-driven and each theme is a milestone of its own.
 Detailed scope, acceptance criteria and verification are added when the milestone
