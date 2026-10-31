@@ -96,6 +96,9 @@ mod arch {
     /// The IRQ0 handler: one counter, one acknowledgement, and nothing else.
     extern "x86-interrupt" fn tick(_frame: InterruptFrame) {
         TICKS.fetch_add(1, Ordering::Relaxed);
+        // Sleeping tasks are woken here, in the handler, and nowhere else: a task that wants
+        // the CPU again says when, and the timer is the only thing that knows the time.
+        crate::scheduler::tick();
         pic::eoi(pic::TIMER);
     }
 

@@ -59,6 +59,15 @@ const INPUT_OK: &str = "grey-os: input ok:";
 /// The keys the harness types, in order. Each one has to appear in a `key: 'x'` line, so
 /// the word is the assertion.
 const INPUT_KEYS: [&str; 4] = ["g", "r", "e", "y"];
+/// The commands the harness types into the shell once it says it is listening (M8). `exit`
+/// ends the session, which is what lets the phase finish rather than wait for its timeout.
+const SHELL_COMMANDS: [&str; 3] = ["ls", "mem", "exit"];
+/// Printed by the shell before it starts reading keys.
+const SHELL_LISTENING: &str = "grey-os: shell: listening";
+/// Printed when the shell's `exit` command ended the session.
+const SHELL_EXIT: &str = "grey-os: shell: exit";
+/// Printed by the task demonstration (M8).
+const SCHED_OK: &str = "grey-os: sched ok:";
 /// Printed by a normal boot once the keyboard has been configured and its handler installed
 /// (M6). The mouse's line follows it, but a machine without a pointer is allowed.
 const INPUT_READY: &str = "grey-os: input: keyboard on irq1";
@@ -300,6 +309,7 @@ fn test(options: &Options) -> Result<ExitCode> {
             THEME_READY,
             DESKTOP_READY,
             COMPOSITOR_OK,
+            SCHED_OK,
         ],
         EXIT_CLEAN,
     )?;
@@ -363,6 +373,7 @@ fn input_path(options: &Options) -> Result<()> {
     let mut log = String::new();
     let mut typed = false;
     let mut captured = false;
+    let mut typed_shell = false;
     loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
@@ -384,6 +395,15 @@ fn input_path(options: &Options) -> Result<()> {
                     check_screenshot(&path)?;
                     println!("pass: `{}` and the panel holds a desktop", path.display());
                     captured = true;
+                }
+                // The shell is listening: type the commands the phase asserts on.
+                if !typed_shell && line.contains(SHELL_LISTENING) {
+                    println!(
+                        "typing `{}` into the shell through qmp",
+                        SHELL_COMMANDS.join(", ")
+                    );
+                    type_commands(&socket)?;
+                    typed_shell = true;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -433,6 +453,24 @@ fn input_path(options: &Options) -> Result<()> {
         bail!("the pointer never reported a packet\n--- serial ---\n{log}");
     }
     println!("pass: a pointer packet reached the guest and was decoded");
+    // The shell: what was typed has to come back out, and `exit` has to end the session.
+    if !typed_shell {
+        bail!("the kernel never reported `{SHELL_LISTENING}`\n--- serial ---\n{log}");
+    }
+    for needle in [
+        SHELL_EXIT,
+        "grey-os: shell: > ls",
+        "grey-os: shell: boot-count",
+        "grey-os: shell: > mem",
+        "grey-os: shell: heap:",
+    ] {
+        if !log.contains(needle) {
+            bail!("the shell never reported `{needle}`\n--- serial ---\n{log}");
+        }
+    }
+    println!(
+        "pass: `ls`, `mem` and `exit` typed into the shell, its answers on serial and `{SHELL_EXIT}` seen"
+    );
     Ok(())
 }
 
@@ -506,7 +544,34 @@ fn monitor(socket: &Path) -> Result<(UnixStream, BufReader<UnixStream>)> {
     Ok((stream, reader))
 }
 
-/// Asks QEMU to write the guest's framebuffer to `path` as a PPM.
+/// Types each shell command, terminated by Enter.
+///
+/// One connection for all of them: QEMU's monitor is happy to have several, but a keystroke
+/// per round trip keeps the ordering obvious.
+fn type_commands(socket: &Path) -> Result<()> {
+    let (mut stream, mut reader) = monitor(socket)?;
+    for command in SHELL_COMMANDS {
+        for key in command.chars() {
+            qmp(&mut stream, &mut reader, &sendkey(&key.to_string()))?;
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        qmp(&mut stream, &mut reader, &sendkey("ret"))?;
+        // Long enough for the command to run and its answer to be drawn.
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Ok(())
+}
+
+/// The QMP command that sends one key through the machine's keyboard.
+fn sendkey(name: &str) -> String {
+    // QMP has no `sendkey`: it lives in the human monitor, which QMP can relay. The relay is
+    // still a keystroke through the keyboard controller - the path a person's key takes - not
+    // a call into the kernel.
+    format!(
+        r#"{{"execute":"human-monitor-command","arguments":{{"command-line":"sendkey {name}"}}}}"#
+    )
+}
+
 fn screenshot(socket: &Path, path: &Path) -> Result<()> {
     let _ = fs::remove_file(path);
     let (mut stream, mut reader) = monitor(socket)?;

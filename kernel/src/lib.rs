@@ -38,6 +38,8 @@ pub mod memory;
 pub mod mouse;
 pub mod paging;
 pub mod pic;
+pub mod scheduler;
+pub mod shell;
 pub mod text;
 pub mod theme;
 pub mod timer;
@@ -66,5 +68,19 @@ pub fn halt_loop() -> ! {
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
+    }
+}
+
+/// Waits for one interrupt without leaving the function.
+///
+/// The scheduler's sleep loop and a finished task both want "wait here until something
+/// happens" without the divergence `halt_loop` has. With interrupts disabled this waits
+/// forever, which is the honest behaviour: nothing is going to happen.
+#[cfg(target_arch = "x86_64")]
+pub fn halt_once() {
+    // SAFETY: `hlt` pauses the CPU until the next interrupt. It touches no memory and leaves
+    // registers and flags alone.
+    unsafe {
+        core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
     }
 }

@@ -877,6 +877,66 @@ page-aligned top, both recorded as open. The arena's address is a constant, not 
 first user-space mapping is where that stops being a placeholder.
 
 
+## ADR-035: Cooperative tasks with real stacks, and a shell that is a parser plus a window
+
+**Status:** accepted, M8.
+
+**Context.** "Shell and process model" asks two different things of one milestone: a program that
+reads a line and does something, and a way to have more than one thing running. Neither needs user
+mode to be worth doing, and both are easier to prove before per-task address spaces exist.
+
+**Decision.** The process model is tasks, not processes: each has its own 32 KiB stack taken from the
+arena and its own saved context (`rbx`, `rbp`, `r12`-`r15`, `rsp`), and the scheduler is round robin
+over a fixed table of eight. Switching is cooperative - `yield_now` and `sleep_ticks` are the only
+places a switch happens, and the timer's handler only wakes sleepers. That is a deliberate limit
+rather than a simplification to be ashamed of: preemptive switching needs a full interrupt frame
+saved per task, and per-task page tables to be worth it, and neither exists yet.
+
+The switch is 22 instructions of assembly. `ret` is the trick: the new task's stack has a return
+address on it, so "load the other stack pointer and return" resumes the other task exactly where its
+own `call grey_os_switch` left off - or, for a task that has never run, in `task_entry`.
+
+The shell is three pieces. `shell::parse` turns a line into a `Command`, and `shell::Editor` turns
+keys into a line, both host-tested; `main.rs` executes a command against the filesystem, the desktop
+and the scheduler. The window is the shell's terminal, and every line that goes into it also goes to
+serial, because a harness can read a line and cannot read a pixel.
+
+**What building it taught.** Four things, three of which the boot log or a test caught:
+
+1. `yield_now` set every yielding task to `Ready`, including one that had just marked itself
+   `Finished`. The tasks finished their work and then ran again, forever: three tasks, six hundred
+   ticks, "0 of 4 tasks finished". The transition is now a named function, `after_yield`, with tests
+   that say a finished task stays finished and a sleeping one stays asleep.
+2. The entry point travelled in a global. Three `spawn`s in a row overwrote it before the first task
+   had run, so all three tasks started at the last one's entry - visible in the log as `worker: pass
+   1` three times. It travels in `r12` now, which the switch restores per task.
+3. The keyboard decoder had no mapping for return, escape, backspace or tab: they are scancodes
+   `0x1c`, `0x01`, `0x0e`, `0x0f`, and the character table leaves gaps there because they are not
+   characters. Nine letters of three shell commands arrived and none was ever submitted. The four are
+   named keys now, and the test that walks the whole table knows which gaps are meant to be empty.
+4. The pointer was being erased by whatever window was painted over it, and the boot kept no record
+   of where it was. Painting the pointer is now the last thing every frame does, and the panel is
+   repainted in full before the line that says the desktop is ready - because that line is the
+   harness's cue to photograph it.
+
+**Why the shell needs the harness.** A shell is a conversation, and a kernel cannot type into its own
+keyboard. The input phase of `cargo xtask test` types `ls`, `mem` and `exit` through QEMU's monitor
+once the kernel says the shell is listening, and asserts each answer on serial: the boot counter's
+line, the heap and frame numbers, and the `exit` that ends the session. The shell's own window gets
+those lines too, which is what the screenshot shows.
+
+**Consequences.** `scheduler::init` joins the boot after `idt::enable`, and the timer's handler now
+calls `scheduler::tick`. `desktop` moves into the arena and is published through a cell, because a
+task cannot borrow the boot's stack. The shell only exists in the acceptance build: a normal boot
+runs the tasks, shows the desktop and exits, because a session with nobody at the keyboard would
+otherwise wait for its timeout on every `cargo xtask test` phase.
+
+**Open.** Cooperative only: a task that does not yield never loses the CPU. No priorities, no
+per-task address spaces, no user mode, no signals and no way to kill a task. A finished task's stack
+is never freed, and a task cannot be created after `MAX_TASKS` exists. The shell has no quoting, no
+redirection, no pipes and no tab completion, and its history is in memory only.
+
+
 ## ADR-034: A theme is data, a window is a rect and some lines, and damage is a list
 
 **Status:** accepted, M7.

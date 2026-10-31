@@ -193,7 +193,9 @@ impl Decoder {
             }
             _ if released => None,
             _ if extended => named(code).map(|key| self.event(key)),
-            _ => char_for(code, self.shift, self.caps).map(|key| self.event(key)),
+            _ => plain_named(code)
+                .or_else(|| char_for(code, self.shift, self.caps))
+                .map(|key| self.event(key)),
         }
     }
 
@@ -203,6 +205,22 @@ impl Decoder {
             key,
             modifiers: self.modifiers(),
         }
+    }
+}
+
+/// The keys that have a scancode of their own rather than a character.
+///
+/// Set 1 puts return, escape, backspace and tab in the same low range as the letters, which is
+/// why the character table has gaps at 0x01, 0x0e, 0x0f and 0x1c. Leaving them as gaps is what
+/// made the shell receive nine characters and no return at all: the letters of three commands
+/// arrived and none of them was ever submitted.
+const fn plain_named(code: u8) -> Option<Key> {
+    match code {
+        0x01 => Some(Key::Escape),
+        0x0e => Some(Key::Backspace),
+        0x0f => Some(Key::Tab),
+        0x1c => Some(Key::Enter),
+        _ => None,
     }
 }
 
@@ -672,14 +690,50 @@ mod tests {
     }
 
     #[test]
+    fn return_escape_backspace_and_tab_have_names_of_their_own() {
+        // The four codes the character table leaves as gaps. A shell cannot be driven without
+        // return, which is what the missing mapping cost: nine letters arrived and no
+        // command was ever submitted.
+        assert_eq!(
+            decode(&[0x1c]).first().map(|event| event.key),
+            Some(Key::Enter)
+        );
+        assert_eq!(
+            decode(&[0x01]).first().map(|event| event.key),
+            Some(Key::Escape)
+        );
+        assert_eq!(
+            decode(&[0x0e]).first().map(|event| event.key),
+            Some(Key::Backspace)
+        );
+        assert_eq!(
+            decode(&[0x0f]).first().map(|event| event.key),
+            Some(Key::Tab)
+        );
+        // And their releases produce nothing, like every other key's.
+        for code in [0x9c, 0x81, 0x8e, 0x8f] {
+            assert!(decode(&[code]).is_empty(), "code {code:#04x}");
+        }
+    }
+
+    #[test]
     fn the_table_is_its_own_reference_for_every_printable_code() {
         // A code with a character must decode to that character with no modifiers; a code
-        // without one must produce nothing. This is the table checking itself.
+        // without one must produce nothing, unless it is one of the four named keys that share
+        // the low range. This is the table checking itself.
         for code in 0u8..0x80 {
             let (plain, _) = SET_1[code as usize];
             let events = decode(&[code]);
             match plain {
-                '\0' => assert!(events.is_empty(), "code {code:#04x} produced an event"),
+                '\0' => {
+                    let named = plain_named(code).is_some();
+                    assert_eq!(
+                        events.is_empty(),
+                        !named,
+                        "code {code:#04x} produced {:?}",
+                        events
+                    );
+                }
                 _ => {
                     assert_eq!(events.len(), 1, "code {code:#04x} produced no event");
                     assert_eq!(events[0].key, Key::Char(plain), "code {code:#04x}");

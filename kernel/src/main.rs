@@ -11,11 +11,15 @@ use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use grey_os::{
     arena, compositor, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap, idt, keyboard,
-    memory, mouse, paging, pic, qemu, serial, theme, timer, window,
+    memory, mouse, paging, pic, qemu, scheduler, serial, theme, timer, window,
 };
+// The shell only exists in the acceptance build: a normal boot has no way to type into it and
+// a kernel that waited for a command would hang the harness's clean boot.
+#[cfg(grey_os_input_test)]
+use grey_os::shell;
 // `Block` has to be in scope for `drive.sectors()`: the trait is the interface, and the
 // concrete `Pio` type only implements it.
 use grey_os::disk::Block as _;
@@ -789,7 +793,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // The first storage (M5): an ATA drive in PIO mode, and `greyfs` over it. This runs
     // before the interrupts because every transfer here polls a status register; the
     // filesystem needs the arena for its directory, which is why it cannot run earlier.
-    let storage = storage();
+    #[allow(unused_mut)]
+    let mut storage = storage();
 
     // Interrupts last, and in this order: the PIC is remapped before any line is unmasked,
     // the timer claims IRQ0 and installs its handler, and only then is `IF` set. Enabling
@@ -961,6 +966,82 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             desktop.draw_pointer(&mut canvas, pointer_x, pointer_y);
         }
     });
+    // M8: the process model and the shell. The scheduler starts with the boot task in slot
+    // zero; the three tasks below are the evidence that a switch really changes stacks, since
+    // each of them writes into a window while the boot task is the one that redraws it.
+    //
+    // SAFETY: the only call, after the timer is running, and before any task exists.
+    unsafe { scheduler::init() };
+    let tasks_window = desktop.windows.create(
+        "tasks",
+        alloc::vec![alloc::string::String::from("three tasks, 32 KiB stacks")],
+        460,
+        260,
+    );
+    let shell_window = desktop.windows.create(
+        "shell",
+        alloc::vec![alloc::string::String::from("grey-os shell. type help.")],
+        720,
+        380,
+    );
+    let _ = desktop.windows.move_to(tasks_window, 820, 60);
+    let _ = desktop.windows.move_to(shell_window, 80, 380);
+    TASKS_WINDOW.store(tasks_window, Ordering::Relaxed);
+
+    // The desktop moves into the arena so a task can draw into it: a task has its own stack
+    // and cannot borrow the boot's.
+    let desktop: &'static mut compositor::Compositor =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(desktop));
+    DESKTOP.set(desktop as *mut compositor::Compositor);
+
+    let counter = scheduler::spawn("counter", task_counter);
+    let sleeper = scheduler::spawn("sleeper", task_sleeper);
+    let worker = scheduler::spawn("worker", task_worker);
+    if counter.is_none() || sleeper.is_none() || worker.is_none() {
+        println!("grey-os: FATAL: the scheduler refused a task");
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    // The boot task takes part: it yields until every task has finished, redrawing what they
+    // wrote. That is what makes this a scheduler rather than three function calls.
+    let deadline = timer::ticks() + 600;
+    while scheduler::stats().finished < 3 && timer::ticks() < deadline {
+        scheduler::yield_now();
+        redraw(desktop);
+        timer::wait_ticks(1);
+    }
+    let finished = scheduler::stats();
+    if finished.finished < 3 {
+        println!(
+            "grey-os: FATAL: {} of {} tasks finished, {} switches, {} lines written",
+            finished.finished,
+            finished.tasks,
+            finished.switches,
+            TASK_LINES.load(Ordering::Relaxed)
+        );
+        qemu::exit_qemu(qemu::QemuExitCode::Failed);
+    }
+    println!(
+        "grey-os: sched ok: {} tasks ({} finished), {} switches, {} lines written by tasks, {} KiB per stack",
+        finished.tasks,
+        finished.finished,
+        finished.switches,
+        TASK_LINES.load(Ordering::Relaxed),
+        scheduler::stack_bytes(counter.unwrap_or(0)) / 1024
+    );
+
+    // The shell: the input run drives it with typed commands, and a normal boot lets it run
+    // for a second so the window is not empty. There is no way to end a session except
+    // `exit`, and a kernel that waited forever would hang the harness's clean boot, so the
+    // loop is bounded by ticks rather than open-ended.
+    #[cfg(grey_os_input_test)]
+    {
+        run_shell(&mut *desktop, shell_window, &mut storage);
+    }
+
+    // The panel is repainted in full *before* the line that says the desktop is ready: a
+    // harness photographs the panel the moment it reads that line, and a repaint after it
+    // would be a repaint nobody saw.
+    paint_all(desktop);
     // From here the panel belongs to the desktop; the boot log continues on serial.
     display::set_quiet(true);
     let overlapping = desktop
@@ -977,7 +1058,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .filter(|overlap| *overlap)
         .count();
     println!(
-        "grey-os: desktop: 3 windows on {}x{}, {} overlapping pair(s), focused #{}, {} drawn in the first frame",
+        "grey-os: desktop: {} windows on {}x{}, {} overlapping pair(s), focused #{}, {} drawn in the first frame",
+        desktop.windows.count(),
         panel.0,
         panel.1,
         overlapping,
@@ -1072,7 +1154,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     #[cfg(not(grey_os_panic_test))]
     {
         // The input run is the only one a harness looks at while it is still alive: it asks
-        // QEMU for a screenshot once it has seen the compositor's line, and a kernel that
+        // QEMU for a screenshot once it has seen the compositor's line, and a kernel that had
         // exited first would leave nothing to dump.
         #[cfg(grey_os_input_test)]
         timer::wait_ticks(50);
@@ -1286,6 +1368,428 @@ fn boot_number(bytes: &[u8]) -> u32 {
 /// Reports a filesystem that refused the disk, then stops: every later milestone reads
 /// files, so carrying on without storage would only move the failure further from its
 /// cause.
+/// The desktop, once it has moved into the arena so tasks can reach it.
+///
+/// A task has its own stack and cannot borrow the boot's, and the compositor is too big to
+/// copy. So the boot leaks it and publishes the address: every task that draws goes through
+/// [`with_desktop`], and the borrow it takes lasts for one function call inside a cooperative
+/// scheduler - a task cannot be switched away from in the middle of one.
+struct DesktopCell(UnsafeCell<*mut compositor::Compositor>);
+
+// SAFETY: the kernel is single-core and the only writers are the boot task and the tasks it
+// switches to, which never run at the same time.
+unsafe impl Sync for DesktopCell {}
+
+impl DesktopCell {
+    /// A cell with no desktop in it yet.
+    const fn new() -> Self {
+        Self(UnsafeCell::new(core::ptr::null_mut()))
+    }
+
+    /// Publishes the desktop. Called once, after the boot has drawn its first frame.
+    ///
+    /// Takes a raw pointer rather than a `&'static mut` so the boot task can keep using the
+    /// desktop it just published: a reference handed to a cell would be borrowed for the rest
+    /// of the function.
+    fn set(&self, desktop: *mut compositor::Compositor) {
+        // SAFETY: nothing reads the cell before this call, and this is the only write.
+        unsafe { *self.0.get() = desktop };
+    }
+}
+
+static DESKTOP: DesktopCell = DesktopCell::new();
+
+/// The window the tasks write into.
+static TASKS_WINDOW: AtomicU32 = AtomicU32::new(0);
+
+/// How many lines the tasks have written, for the report.
+static TASK_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// Runs `draw` against the desktop, or returns `None` if the boot has not published it yet.
+fn with_desktop<R>(draw: impl FnOnce(&mut compositor::Compositor) -> R) -> Option<R> {
+    // SAFETY: `set` ran before any task was spawned, so a non-null pointer is a live desktop
+    // that outlives the kernel, and the borrow ends when `draw` returns.
+    let pointer = unsafe { *DESKTOP.0.get() };
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: as above. A task's call runs to completion - the scheduler only switches when a
+    // task asks it to - so no two tasks hold this borrow at once.
+    Some(draw(unsafe { &mut *pointer }))
+}
+
+/// Paints the whole desktop and then the pointer.
+///
+/// Used when the panel has to be right rather than merely repaired: the first frame, and once
+/// more before an acceptance run ends, so the screenshot a harness takes is the desktop as it
+/// stands rather than whichever damage rect happened to be painted last.
+fn paint_all(desktop: &mut compositor::Compositor) {
+    let (x, y) = mouse::position();
+    framebuffer::with_screen(|screen| {
+        if let Some(mut canvas) = framebuffer::canvas(screen) {
+            desktop.draw_all(&mut canvas);
+            desktop.draw_pointer(&mut canvas, x, y);
+        }
+    });
+}
+
+/// Paints whatever the desktop says has changed, and then the pointer.
+///
+/// The pointer is drawn last because it sits above every window, and drawing it after the
+/// damage is what keeps it from being erased by the repaint of the window underneath it - a
+/// bug the screenshot check caught: the shell window covers the middle of the screen, and
+/// creating it erased the pointer the boot had already drawn.
+fn redraw(desktop: &mut compositor::Compositor) {
+    let (x, y) = mouse::position();
+    framebuffer::with_screen(|screen| {
+        if let Some(mut canvas) = framebuffer::canvas(screen) {
+            desktop.draw_damage(&mut canvas);
+            desktop.draw_pointer(&mut canvas, x, y);
+        }
+    });
+}
+
+/// Adds a line to the tasks window and damages it, so the next [`redraw`] paints it.
+///
+/// The line goes to serial as well: a task's output is the proof that it ran, and a proof
+/// that only exists as pixels is one the harness cannot read.
+fn task_line(line: alloc::string::String) {
+    TASK_LINES.fetch_add(1, Ordering::Relaxed);
+    serial::print_args(format_args!("grey-os: task: {line}"));
+    let window = TASKS_WINDOW.load(Ordering::Relaxed);
+    with_desktop(|desktop| {
+        if let Some(task_window) = desktop.windows.window_mut(window) {
+            task_window.push_line(line);
+            let rect = task_window.rect;
+            desktop.windows.damage(rect);
+        }
+    });
+}
+
+/// The first task: five counted steps, yielding between each.
+///
+/// It never returns before its last step, and the count is a line in the window rather than a
+/// number in a register, so a task that ran twice would be visible.
+fn task_counter() {
+    for step in 1..=5 {
+        task_line(alloc::format!("counter: step {step}"));
+        scheduler::yield_now();
+    }
+}
+
+/// The second task: sleeps, so the timer is what wakes it rather than another task's yield.
+fn task_sleeper() {
+    task_line(alloc::string::String::from("sleeper: asleep for 40 ticks"));
+    scheduler::sleep_ticks(40);
+    task_line(alloc::format!("sleeper: woke at tick {}", timer::ticks()));
+}
+
+/// The third task: yields three times without sleeping, which is the round-robin case.
+fn task_worker() {
+    for step in 1..=3 {
+        task_line(alloc::format!("worker: pass {step}"));
+        scheduler::yield_now();
+    }
+}
+/// How long the shell listens before the boot continues.
+///
+/// A session with no way to end the machine has to end something, and a kernel that waited
+/// forever would hang the harness's clean boot. The input run gets long enough for the
+/// harness to type; a normal boot gets a short demonstration.
+#[cfg(grey_os_input_test)]
+const SHELL_TICKS: u64 = 1200;
+
+/// The shell, driven by the keyboard's queue.
+///
+/// Typing goes through the editor, which is where the line and its history live; a submitted
+/// line is parsed, executed and answered in the window. The pointer's first job is here too:
+/// a click raises whatever is under it.
+#[cfg(grey_os_input_test)]
+fn run_shell(
+    desktop: &mut compositor::Compositor,
+    window: u32,
+    storage: &mut Option<fs::Filesystem<disk::Pio>>,
+) {
+    let mut editor = shell::Editor::new();
+    draw_prompt(desktop, window, &editor);
+    redraw(desktop);
+    println!("grey-os: shell: listening for commands");
+    let deadline = timer::ticks().saturating_add(SHELL_TICKS);
+    let mut seen_packets = mouse::packets();
+    while timer::ticks() < deadline {
+        let mut submitted = None;
+        while let Some(event) = keyboard::pop() {
+            match editor.handle(event.key) {
+                shell::Action::Submit(line) => submitted = Some(line),
+                shell::Action::Edited => draw_prompt(desktop, window, &editor),
+                shell::Action::Idle | shell::Action::Cancelled => {}
+            }
+        }
+        if mouse::packets() != seen_packets {
+            seen_packets = mouse::packets();
+            let (x, y) = mouse::position();
+            let raised = desktop.windows.click(x, y);
+            framebuffer::with_screen(|screen| {
+                if let Some(mut canvas) = framebuffer::canvas(screen) {
+                    desktop.draw_pointer(&mut canvas, x, y);
+                }
+            });
+            if let Some(id) = raised {
+                println!("grey-os: shell: click at {x},{y} raised window #{id}");
+            }
+        }
+        if let Some(line) = submitted {
+            shell_push(desktop, window, alloc::format!("> {line}"));
+            let keep_going = execute(desktop, window, storage, &line);
+            draw_prompt(desktop, window, &editor);
+            if !keep_going {
+                println!("grey-os: shell: exit");
+                break;
+            }
+        }
+        redraw(desktop);
+        timer::wait_ticks(1);
+    }
+    println!(
+        "grey-os: shell: session closed after {} ticks, {} key events since boot, {} dropped",
+        timer::ticks(),
+        keyboard::events(),
+        keyboard::dropped()
+    );
+}
+
+/// Replaces the prompt line with the editor's current text.
+///
+/// The prompt is always the last line of the shell window, which is what lets the history sit
+/// above it while a line is being typed.
+#[cfg(grey_os_input_test)]
+fn draw_prompt(desktop: &mut compositor::Compositor, window: u32, editor: &shell::Editor) {
+    let text = alloc::format!("> {}", editor.line());
+    if let Some(shell_window) = desktop.windows.window_mut(window) {
+        if shell_window
+            .lines
+            .last()
+            .is_some_and(|line| line.starts_with("> "))
+        {
+            if let Some(last) = shell_window.lines.last_mut() {
+                *last = text;
+            }
+        } else {
+            shell_window.lines.push(text);
+        }
+        shell_window.scroll = shell_window.lines.len().saturating_sub(1);
+        let rect = shell_window.rect;
+        desktop.windows.damage(rect);
+    }
+}
+
+/// Adds a line above the prompt and damages the window.
+///
+/// The line goes to serial too, for the same reason the tasks' do: a harness can read a line
+/// but not a pixel.
+#[cfg(grey_os_input_test)]
+fn shell_push(desktop: &mut compositor::Compositor, window: u32, text: alloc::string::String) {
+    serial::print_args(format_args!("grey-os: shell: {text}"));
+    if let Some(shell_window) = desktop.windows.window_mut(window) {
+        let prompt = if shell_window
+            .lines
+            .last()
+            .is_some_and(|line| line.starts_with("> "))
+        {
+            shell_window.lines.pop()
+        } else {
+            None
+        };
+        shell_window.lines.push(text);
+        if let Some(prompt) = prompt {
+            shell_window.lines.push(prompt);
+        }
+        shell_window.scroll = shell_window.lines.len().saturating_sub(1);
+        let rect = shell_window.rect;
+        desktop.windows.damage(rect);
+    }
+}
+
+/// Runs one command and returns whether the session should continue.
+///
+/// Everything a command prints is collected first and pushed afterwards: the desktop is
+/// borrowed mutably to push, so a command that iterates the desktop has to be done reading
+/// before the first line goes in.
+#[cfg(grey_os_input_test)]
+fn execute(
+    desktop: &mut compositor::Compositor,
+    window: u32,
+    storage: &mut Option<fs::Filesystem<disk::Pio>>,
+    line: &str,
+) -> bool {
+    let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let command = match shell::parse(line) {
+        Ok(None) => return true,
+        Ok(Some(command)) => command,
+        Err(error) => {
+            shell_push(desktop, window, alloc::format!("? {error:?}"));
+            return true;
+        }
+    };
+    let mut quit = false;
+    match command {
+        shell::Command::Help => {
+            for line in shell::HELP {
+                out.push(alloc::string::String::from(*line));
+            }
+        }
+        shell::Command::Echo(text) => out.push(text),
+        shell::Command::List => match storage.as_mut() {
+            Some(filesystem) => {
+                for entry in filesystem.list() {
+                    out.push(alloc::format!(
+                        "{} {} bytes at sector {}",
+                        entry.name,
+                        entry.len,
+                        entry.start
+                    ));
+                }
+                out.push(alloc::format!(
+                    "{} file(s), {} of {} sectors in use",
+                    filesystem.count(),
+                    filesystem.next_free(),
+                    filesystem.superblock().sectors
+                ));
+            }
+            None => out.push(alloc::string::String::from("no disk")),
+        },
+        shell::Command::Cat(name) => match storage.as_mut() {
+            Some(filesystem) => match filesystem.read(&name) {
+                Ok(bytes) => {
+                    let text = alloc::string::String::from_utf8_lossy(&bytes).into_owned();
+                    for line in text.lines() {
+                        out.push(alloc::string::String::from(line));
+                    }
+                }
+                Err(error) => out.push(alloc::format!("? {error:?}")),
+            },
+            None => out.push(alloc::string::String::from("no disk")),
+        },
+        shell::Command::Write {
+            name,
+            text: contents,
+        } => match storage.as_mut() {
+            Some(filesystem) => {
+                let mut bytes = alloc::string::String::from(contents);
+                bytes.push('\n');
+                match filesystem.write(&name, bytes.as_bytes(), fs::Kind::File) {
+                    Ok(entry) => out.push(alloc::format!(
+                        "wrote {} ({} bytes at sector {})",
+                        entry.name,
+                        entry.len,
+                        entry.start
+                    )),
+                    Err(error) => out.push(alloc::format!("? {error:?}")),
+                }
+            }
+            None => out.push(alloc::string::String::from("no disk")),
+        },
+        shell::Command::Remove(name) => match storage.as_mut() {
+            Some(filesystem) => match filesystem.remove(&name) {
+                Ok(entry) => out.push(alloc::format!("removed {}", entry.name)),
+                Err(error) => out.push(alloc::format!("? {error:?}")),
+            },
+            None => out.push(alloc::string::String::from("no disk")),
+        },
+        shell::Command::Memory => {
+            let arena = HEAP.stats();
+            out.push(alloc::format!(
+                "heap: {} bytes in use, {} pages mapped",
+                arena.bytes_in_use,
+                arena.pages
+            ));
+            match frame::FRAMES.stats() {
+                Some(frames) => out.push(alloc::format!(
+                    "frames: {} total, {} free, {} KiB bitmap",
+                    frames.frames,
+                    frames.free,
+                    frames.bitmap_bytes / 1024
+                )),
+                None => out.push(alloc::string::String::from("frames: not initialised")),
+            }
+        }
+        shell::Command::Ticks => {
+            let stats = scheduler::stats();
+            out.push(alloc::format!(
+                "{} ticks at {} Hz, {} switches, {} of {} tasks finished, running `{}`",
+                timer::ticks(),
+                TIMER_HZ,
+                stats.switches,
+                stats.finished,
+                stats.tasks,
+                scheduler::current_name()
+            ));
+        }
+        shell::Command::Tasks => {
+            let stats = scheduler::stats();
+            out.push(alloc::format!(
+                "{} tasks, {} switches, current slot {} (`{}`)",
+                stats.tasks,
+                stats.switches,
+                stats.current,
+                scheduler::current_name()
+            ));
+            for slot in 1..scheduler::MAX_TASKS {
+                if let Some(name) = scheduler::task_name(slot) {
+                    out.push(alloc::format!(
+                        "  #{slot} {name}, {} runs, {} KiB stack",
+                        scheduler::runs(slot),
+                        scheduler::stack_bytes(slot) / 1024
+                    ));
+                }
+            }
+        }
+        shell::Command::Windows => {
+            let focused = desktop.windows.focused();
+            let mut lines = alloc::vec::Vec::new();
+            for window in desktop.windows.iter() {
+                lines.push(alloc::format!(
+                    "#{} {} at {},{} {}x{}{}",
+                    window.id,
+                    window.title,
+                    window.rect.x,
+                    window.rect.y,
+                    window.rect.width,
+                    window.rect.height,
+                    if Some(window.id) == focused { " *" } else { "" }
+                ));
+            }
+            out.extend(lines);
+        }
+        shell::Command::Raise(id) => {
+            if desktop.windows.raise(id) {
+                out.push(alloc::format!("raised #{id}"));
+            } else {
+                out.push(alloc::format!("? no window #{id}"));
+            }
+        }
+        shell::Command::Close(id) => {
+            if desktop.windows.close(id) {
+                out.push(alloc::format!("closed #{id}"));
+            } else {
+                out.push(alloc::format!("? no window #{id}"));
+            }
+        }
+        shell::Command::Clear => {
+            if let Some(shell_window) = desktop.windows.window_mut(window) {
+                shell_window.set_lines(alloc::vec::Vec::new());
+                let rect = shell_window.rect;
+                desktop.windows.damage(rect);
+            }
+        }
+        shell::Command::Quit => quit = true,
+    }
+    for line in out {
+        shell_push(desktop, window, line);
+    }
+    !quit
+}
+
 fn fatal_storage(error: fs::FsError) -> ! {
     println!("grey-os: FATAL: greyfs refused the disk: {error:?}");
     qemu::exit_qemu(qemu::QemuExitCode::Failed)

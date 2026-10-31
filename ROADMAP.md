@@ -5,7 +5,7 @@ acceptance criteria are demonstrated by output, not by code existing: the proof 
 a `xtask test` run or a QEMU session whose serial log is pasted into the commit
 message. No milestone is started before the previous one is accepted.
 
-Scope for M0 to M6 is agreed. M7 onward is stated as themes in dependency order:
+Scope for M0 to M8 is agreed. M9 onward is stated as themes in dependency order:
 the authoritative wording comes from the engineering brief and is transcribed here milestone by
 milestone, so that this file never claims more than was agreed.
 
@@ -21,7 +21,7 @@ milestone, so that this file never claims more than was agreed.
 | M5        | Storage: disk driver and filesystem          | **Done** - criteria 1-6 met; no free list yet (ADR-032)     |
 | M6        | Input: keyboard and pointer                  | **Done** - criteria 1-5 met; no repeat or keymaps (ADR-033) |
 | M7        | Compositor, windows, theme                   | **Done** - criteria 1-5 met; TrueType still open (ADR-034) |
-| M8        | Shell and process model                      | Not started                                                |
+| M8        | Shell and process model                      | **Done** - criteria 1-5 met; cooperative (ADR-035)          |
 | M9        | Applications                                 | Not started                                                |
 | M10       | SMP, ports, polish                           | Not started                                                |
 
@@ -644,7 +644,96 @@ Criterion 3 is 23 host tests, eight in `compositor`, nine in `window` and six in
 host in total. Criterion 5 is every later line of the boot log still arriving on serial with the
 desktop on the panel, and the panic phase still painting its red screen.
 
-## M7 onward - provisional themes
+## M8 - Shell and process model
+
+**Goal.** More than one thing at a time, and a way to ask the machine to do something. Everything so
+far has been one boot sequence on one stack; M8 adds tasks with their own stacks and a switch between
+them, and a shell whose lines are typed into a window and whose commands reach the filesystem, the
+allocator and the window list.
+
+**Agreed shape** (ADR-035): cooperative round robin over eight fixed slots, each task with a 32 KiB
+stack from the arena and a saved context of the callee-saved registers; a parser and a line editor
+that live in the library and are host-tested; the executor in `main.rs`, which is the only part that
+needs a machine.
+
+**Landed.**
+
+- [x] `scheduler.rs`: `next_ready` as a pure function over a slice of states (round robin from the
+      slot after the current one, sleeping tasks passed over until their tick, the running task kept
+      as the fallback so a single runnable task does not thrash), `after_yield` as the state
+      transition, and five host tests that walk the awkward cases.
+- [x] The switch: `grey_os_switch`, 22 instructions that save and restore `rsp`, `rbx`, `rbp` and
+      `r12`-`r15`, and return into whatever the new stack's return address says. A new task's stack
+      is prepared with `task_entry` as that address and its own entry point in `r12`.
+- [x] `spawn`, `yield_now`, `sleep_ticks`, `finish`, `tick` and the report (`stats`, `task_name`,
+      `runs`, `stack_bytes`), with interrupts masked across every table access and the timer as the
+      only writer that runs unmasked.
+- [x] Three demonstration tasks - a counter that yields five times, a sleeper woken by the timer, and
+      a worker that yields three times - each writing a line into the tasks window and to serial
+      while the boot task is the one that redraws.
+- [x] `shell.rs`: a parser for fourteen commands with aliases and arguments, and an editor with a
+      cursor, a backspace that respects character boundaries, and history; 19 host tests.
+- [x] The shell window: a prompt line that is always last, output pushed above it, `clear`, `raise`,
+      `close`, `windows`, `tasks`, `mem`, `ls`, `cat`, `write`, `rm`, `echo`, `help` and `exit`, all
+      against the real filesystem, allocator and window list.
+- [x] Clicks: the pointer's first job, raising whatever is under it and reporting the id on serial.
+
+**Open.** Cooperative only - a task that never yields never gives up the CPU - with no priorities, no
+per-task address spaces, no user mode and no way to kill a task. A finished task's stack is never
+freed. The shell has no quoting, redirection, pipes or completion, and its history is in memory. The
+shell only exists in the acceptance build: a normal boot runs the tasks and exits.
+
+**Acceptance criteria.**
+
+1. The boot log reports how many tasks exist, how many finished, how many switches happened and how
+   many lines the tasks wrote - and every task's line appears, in an order only a scheduler could
+   produce.
+2. A task that sleeps is woken by the timer rather than by another task's yield, and the log shows
+   the tick it woke on.
+3. Commands typed into the machine reach the shell: `ls` lists the boot counter, `mem` reports the
+   heap and the frame allocator, and `exit` ends the session, each with its answer on serial.
+4. The document a command reads is the one the boot wrote: `ls` names `/boot-count`, the file the
+   storage bring-up wrote before the desktop existed.
+5. Host tests cover the scheduling policy, the parser and the editor, including the state transition
+   that lets a finished task come back.
+
+**Status against them.** All five met. The clean boot prints, after the theme's line:
+
+```text
+grey-os: task: counter: step 1
+grey-os: task: sleeper: asleep for 40 ticks
+grey-os: task: worker: pass 1
+grey-os: task: counter: step 2
+grey-os: task: worker: pass 2
+grey-os: task: counter: step 3
+grey-os: task: worker: pass 3
+grey-os: task: counter: step 4
+grey-os: task: counter: step 5
+grey-os: task: sleeper: woke at tick 1075
+grey-os: sched ok: 4 tasks (3 finished), 19 switches, 10 lines written by tasks, 32 KiB per stack
+```
+
+and the shell phase of `cargo xtask test`, which types into it:
+
+```text
+grey-os: shell: > ls
+grey-os: shell: boot-count 15 bytes at sector 10
+grey-os: shell: 1 file(s), 11 of 8192 sectors in use
+grey-os: shell: > mem
+grey-os: shell: heap: 108282 bytes in use, 31 pages mapped
+grey-os: shell: frames: 525288 total, 125696 free, 64 KiB bitmap
+grey-os: shell: > exit
+grey-os: shell: exit
+```
+
+Criterion 1 is the interleaving: the counter's steps are separated by the worker's and the sleeper's
+lines, which is what a switch looks like from outside. Criterion 2 is `woke at tick 1075` - the
+sleeper asked for forty ticks and got them, and only the timer can have woken it. Criterion 4 is
+`boot-count 15 bytes at sector 10`: that file was written by the storage bring-up long before the
+shell existed, and the shell read it through the filesystem rather than from a copy. Criterion 5 is 24
+host tests, five in `scheduler` and nineteen in `shell`; 223 on the host in total.
+
+## M9 onward - provisional themes
 
 The ordering above is dependency-driven and each theme is a milestone of its own.
 Detailed scope, acceptance criteria and verification are added when the milestone
