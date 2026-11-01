@@ -344,6 +344,101 @@ impl<'a> Canvas<'a> {
             ChannelOrder::Bgr => [color.b, color.g, color.r, alpha],
         }
     }
+
+    /// Blends `color` into the pixels of `rect` for which `coverage` is non-zero, clipped
+    /// to the surface.
+    ///
+    /// `coverage` is the "how much of this pixel is the shape" answer, in `0..=255`, and it
+    /// receives the pixel's *absolute* coordinates. That is the point of this method: a
+    /// caller may clip the *area* it paints to a damage rect without changing the *shape* it
+    /// is painting, so repainting one corner of a rounded window lands the corner exactly
+    /// where a full frame would.
+    ///
+    /// The fourth byte follows the coverage upwards and never downwards, so a surface built
+    /// from several opaque pieces keeps full alpha in the middle while its anti-aliased
+    /// outline stays translucent. On the firmware's own surface that byte is padding, and
+    /// letting it track coverage is harmless.
+    pub fn blend_where(&mut self, rect: Rect, color: Color, coverage: impl Fn(i32, i32) -> u8) {
+        let Some((x, y, width, height)) = rect.clip(self.geometry.width, self.geometry.height)
+        else {
+            return;
+        };
+        let encoded = self.encode(color, u8::MAX);
+        let stride_bytes = self.geometry.stride * BYTES_PER_PIXEL;
+        for row in 0..height {
+            let start = (y + row) * stride_bytes;
+            let line = &mut self.pixels[start..start + stride_bytes];
+            for column in 0..width {
+                let alpha = coverage((x + column) as i32, (y + row) as i32);
+                if alpha == 0 {
+                    continue;
+                }
+                let offset = (x + column) * BYTES_PER_PIXEL;
+                let pixel = &mut line[offset..offset + BYTES_PER_PIXEL];
+                if alpha == u8::MAX {
+                    pixel.copy_from_slice(&encoded);
+                } else {
+                    for (destination, source) in pixel.iter_mut().zip(encoded.iter()).take(3) {
+                        *destination = blend_channel(*destination, *source, alpha);
+                    }
+                    pixel[3] = pixel[3].max(alpha);
+                }
+            }
+        }
+    }
+
+    /// Blends `source` over this surface at the same coordinates, using the source's fourth
+    /// byte as per-pixel alpha, clipped to both surfaces.
+    ///
+    /// The destination is treated as opaque: this is the step that puts a window's own
+    /// pixels on the desktop, and a desktop that is not opaque is a different problem. Both
+    /// surfaces must agree on channel order - a byte-wise blend of the wrong order is a
+    /// red/blue swap, so it is refused rather than drawn wrong.
+    ///
+    /// Pixels the source does not cover (alpha zero) are left alone, which is what lets a
+    /// rounded window keep the desktop's pixels at its corners without a separate mask.
+    pub fn blend_surface(&mut self, source: &Canvas<'_>, rect: Rect) {
+        if self.order != source.order {
+            return;
+        }
+        let Some((x, y, width, height)) = rect.clip(self.geometry.width, self.geometry.height)
+        else {
+            return;
+        };
+        // Clip again against the source: reading past its last row would be out of bounds,
+        // and this is the only place in the module where two buffers are indexed at once.
+        let width = width.min(source.geometry.width.saturating_sub(x));
+        let height = height.min(source.geometry.height.saturating_sub(y));
+        if width == 0 || height == 0 {
+            return;
+        }
+        let destination_stride = self.geometry.stride * BYTES_PER_PIXEL;
+        let source_stride = source.geometry.stride * BYTES_PER_PIXEL;
+        let offset = x * BYTES_PER_PIXEL;
+        let count = width * BYTES_PER_PIXEL;
+        for row in 0..height {
+            let from = (y + row) * source_stride + offset;
+            let to = (y + row) * destination_stride + offset;
+            let source_row = &source.pixels[from..from + count];
+            let destination_row = &mut self.pixels[to..to + count];
+            for (src, dst) in source_row
+                .as_chunks::<BYTES_PER_PIXEL>()
+                .0
+                .iter()
+                .zip(destination_row.as_chunks_mut::<BYTES_PER_PIXEL>().0)
+            {
+                match src[3] {
+                    0 => {}
+                    u8::MAX => dst.copy_from_slice(src),
+                    alpha => {
+                        for (destination, source) in dst.iter_mut().zip(src.iter()).take(3) {
+                            *destination = blend_channel(*destination, *source, alpha);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Blends `src` over `dst` with `alpha`, rounding to nearest.
@@ -354,6 +449,153 @@ fn blend_channel(dst: u8, src: u8, alpha: u8) -> u8 {
     // which would darken anything blended at half alpha by one step.
     let blended = (u32::from(src) * alpha + u32::from(dst) * (max - alpha) + max / 2) / max;
     u8::try_from(blended).unwrap_or(u8::MAX)
+}
+
+/// The four corner radii of a rounded rectangle, clockwise from the top left.
+///
+/// One radius per corner rather than one for the whole shape: a title bar is rounded where
+/// it meets the window's outer edge and square where it meets the body below it, and that
+/// distinction is what lets a rounded window be assembled from plain rectangles without a
+/// notch appearing at the seam.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Corners {
+    pub top_left: u32,
+    pub top_right: u32,
+    pub bottom_right: u32,
+    pub bottom_left: u32,
+}
+
+impl Corners {
+    /// All four corners square.
+    pub const ZERO: Self = Self::new(0, 0, 0, 0);
+
+    pub const fn new(top_left: u32, top_right: u32, bottom_right: u32, bottom_left: u32) -> Self {
+        Self {
+            top_left,
+            top_right,
+            bottom_right,
+            bottom_left,
+        }
+    }
+
+    /// The same radius on all four corners, which is what a plain rounded rectangle wants.
+    pub const fn uniform(radius: u32) -> Self {
+        Self::new(radius, radius, radius, radius)
+    }
+
+    /// The same corners reduced so that no two of them overlap on a `width` by `height` rect.
+    ///
+    /// Without this a radius larger than half the shorter side would turn the coverage test
+    /// inside out and paint something that is not a rectangle at all. Reducing every corner by
+    /// the same limit keeps the shape symmetric and cannot make a pair of radii exceed an
+    /// edge: each is at most `min(width, height) / 2`, so a pair is at most `min(width,
+    /// height)`.
+    pub fn clamped(self, width: u32, height: u32) -> Self {
+        let limit = width.min(height) / 2;
+        Self {
+            top_left: self.top_left.min(limit),
+            top_right: self.top_right.min(limit),
+            bottom_right: self.bottom_right.min(limit),
+            bottom_left: self.bottom_left.min(limit),
+        }
+    }
+}
+
+/// How much of the pixel at `(x, y)` a rounded rectangle covers, in `0..=255`.
+///
+/// Sixteen samples per pixel, all in integer arithmetic, so a corner reaches the edge smoothly
+/// instead of stepping and neither floating point nor `libm` is needed on a machine that has
+/// neither. The radii are independent, so a shape can be round on its outer corners and square
+/// on an inner edge.
+///
+/// The common case is skipped: a pixel that cannot touch a corner is either wholly inside the
+/// straight edges (255) or straddles one of them, and only the pixels near a corner are
+/// sampled. That is what keeps filling a mostly rectangular window close to the cost of
+/// filling a rectangle.
+pub fn rounded_rect_coverage(rect: Rect, corners: Corners, x: i32, y: i32) -> u8 {
+    /// Samples across each pixel, in each direction.
+    const SAMPLES: i64 = 4;
+    /// Fixed-point units per pixel: two per sample, so a sample lands in the middle of one.
+    const UNITS: i64 = SAMPLES * 2;
+
+    let corners = corners.clamped(rect.width, rect.height);
+
+    let left = i64::from(rect.x) * UNITS;
+    let top = i64::from(rect.y) * UNITS;
+    let right = (i64::from(rect.x) + i64::from(rect.width)) * UNITS;
+    let bottom = (i64::from(rect.y) + i64::from(rect.height)) * UNITS;
+    let pixel_left = i64::from(x) * UNITS;
+    let pixel_top = i64::from(y) * UNITS;
+    let pixel_right = pixel_left + UNITS;
+    let pixel_bottom = pixel_top + UNITS;
+
+    // Wholly outside the bounding rectangle: nothing to sample.
+    if pixel_right <= left || pixel_left >= right || pixel_bottom <= top || pixel_top >= bottom {
+        return 0;
+    }
+
+    let top_left = i64::from(corners.top_left) * UNITS;
+    let top_right = i64::from(corners.top_right) * UNITS;
+    let bottom_right = i64::from(corners.bottom_right) * UNITS;
+    let bottom_left = i64::from(corners.bottom_left) * UNITS;
+
+    // Near a corner the outline is curved, so the pixel has to be sampled. Everywhere else it
+    // is bounded by straight edges, and a pixel wholly inside them is fully covered.
+    let near_corner = (pixel_left < left + top_left && pixel_top < top + top_left)
+        || (pixel_right > right - top_right && pixel_top < top + top_right)
+        || (pixel_right > right - bottom_right && pixel_bottom > bottom - bottom_right)
+        || (pixel_left < left + bottom_left && pixel_bottom > bottom - bottom_left);
+    if !near_corner
+        && pixel_left >= left
+        && pixel_right <= right
+        && pixel_top >= top
+        && pixel_bottom <= bottom
+    {
+        return u8::MAX;
+    }
+
+    let mut inside = 0i64;
+    for row in 0..SAMPLES {
+        let sample_y = pixel_top + (2 * row + 1);
+        for column in 0..SAMPLES {
+            let sample_x = pixel_left + (2 * column + 1);
+            if sample_x < left || sample_x >= right || sample_y < top || sample_y >= bottom {
+                continue;
+            }
+            let from_left = sample_x - left;
+            let from_top = sample_y - top;
+            let from_right = right - sample_x;
+            let from_bottom = bottom - sample_y;
+            let covered = if from_left < top_left && from_top < top_left {
+                within_circle(top_left, from_left, from_top)
+            } else if from_right < top_right && from_top < top_right {
+                within_circle(top_right, from_right, from_top)
+            } else if from_right < bottom_right && from_bottom < bottom_right {
+                within_circle(bottom_right, from_right, from_bottom)
+            } else if from_left < bottom_left && from_bottom < bottom_left {
+                within_circle(bottom_left, from_left, from_bottom)
+            } else {
+                true
+            };
+            if covered {
+                inside += 1;
+            }
+        }
+    }
+    // `SAMPLES * SAMPLES` samples, and `+ half` rounds to nearest rather than always down.
+    let samples = SAMPLES * SAMPLES;
+    u8::try_from((inside * 255 + samples / 2) / samples).unwrap_or(u8::MAX)
+}
+
+/// Whether a sample `from_x` from one edge and `from_y` from the other is inside a corner's
+/// quarter circle of `radius`.
+///
+/// The circle is centred `radius` in from both edges, so a sample near the true corner is
+/// outside it: that is exactly the pixel a rounded corner is there to take away.
+fn within_circle(radius: i64, from_x: i64, from_y: i64) -> bool {
+    let dx = radius - from_x;
+    let dy = radius - from_y;
+    dx * dx + dy * dy <= radius * radius
 }
 
 #[cfg(test)]
@@ -705,6 +947,158 @@ mod tests {
             // This canvas is Bgr, so a byte copy would swap red and blue. Nothing is copied.
             let mut destination = canvas(&mut pixels);
             destination.blit(&source, Rect::new(0, 0, 4, 3));
+        }
+        assert!(pixels.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn a_rounded_rect_leaves_its_corners_empty_and_fills_the_middle() {
+        let shape = Rect::new(0, 0, 20, 20);
+        let corners = Corners::uniform(8);
+        // The true corner is outside the quarter circle, so nothing lands there.
+        assert_eq!(rounded_rect_coverage(shape, corners, 0, 0), 0);
+        assert_eq!(rounded_rect_coverage(shape, corners, 19, 0), 0);
+        // The straight edges and the middle are fully covered.
+        assert_eq!(rounded_rect_coverage(shape, corners, 10, 10), u8::MAX);
+        assert_eq!(rounded_rect_coverage(shape, corners, 0, 10), u8::MAX);
+        assert_eq!(rounded_rect_coverage(shape, corners, 10, 0), u8::MAX);
+        // A pixel the arc cuts through is partly covered, which is the anti-aliasing.
+        let partial = rounded_rect_coverage(shape, corners, 2, 2);
+        assert!(partial > 0 && partial < u8::MAX, "{partial}");
+        // Outside the bounding rectangle there is no coverage at all.
+        assert_eq!(rounded_rect_coverage(shape, corners, 20, 10), 0);
+        assert_eq!(rounded_rect_coverage(shape, corners, 10, -1), 0);
+    }
+
+    #[test]
+    fn a_corner_radius_of_zero_is_an_ordinary_rectangle() {
+        let shape = Rect::new(-3, 5, 12, 9);
+        for (x, y, expected) in [
+            (-3, 5, u8::MAX),
+            (8, 13, u8::MAX),
+            (-4, 5, 0),
+            (9, 5, 0),
+            (-3, 14, 0),
+        ] {
+            assert_eq!(
+                rounded_rect_coverage(shape, Corners::ZERO, x, y),
+                expected,
+                "({x}, {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn per_corner_radii_round_one_corner_and_square_another() {
+        // The top corners are round, the bottom two are square: a title bar's shape.
+        let shape = Rect::new(0, 0, 20, 20);
+        let corners = Corners::new(8, 8, 0, 0);
+        assert_eq!(rounded_rect_coverage(shape, corners, 0, 0), 0);
+        assert_eq!(rounded_rect_coverage(shape, corners, 19, 0), 0);
+        assert_eq!(rounded_rect_coverage(shape, corners, 0, 19), u8::MAX);
+        assert_eq!(rounded_rect_coverage(shape, corners, 19, 19), u8::MAX);
+    }
+
+    #[test]
+    fn coverage_of_a_uniform_shape_is_the_same_from_opposite_corners() {
+        let shape = Rect::new(4, 6, 23, 17);
+        let corners = Corners::uniform(7);
+        for y in 0..17 {
+            for x in 0..23 {
+                assert_eq!(
+                    rounded_rect_coverage(shape, corners, 4 + x, 6 + y),
+                    rounded_rect_coverage(shape, corners, 4 + 22 - x, 6 + 16 - y),
+                    "({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_radius_larger_than_the_shape_is_clamped_rather_than_wrapping() {
+        // Half the shorter side is the largest a corner can be: beyond that the two arcs
+        // would cross and the shape would stop being a rectangle.
+        let corners = Corners::uniform(1000).clamped(10, 6);
+        assert_eq!(corners, Corners::uniform(3));
+        let shape = Rect::new(0, 0, 10, 6);
+        assert_eq!(rounded_rect_coverage(shape, corners, 5, 3), u8::MAX);
+        assert_eq!(rounded_rect_coverage(shape, corners, 0, 0), 0);
+    }
+
+    #[test]
+    fn blend_where_mixes_the_colour_and_tracks_the_alpha_it_was_given() {
+        let mut pixels = blank();
+        {
+            let mut canvas = canvas(&mut pixels);
+            canvas.blend_where(Rect::new(1, 1, 1, 1), Color::WHITE, |_, _| 128);
+        }
+        // Half of white over black is 128 in every colour channel and in alpha, because
+        // `blend_where` treats the fourth byte as the coverage it just painted.
+        assert_eq!(pixel(&pixels, 1, 1), [128; BYTES_PER_PIXEL]);
+        // The neighbours are untouched.
+        assert_eq!(pixel(&pixels, 0, 1), [0; BYTES_PER_PIXEL]);
+        assert_eq!(pixel(&pixels, 2, 1), [0; BYTES_PER_PIXEL]);
+    }
+
+    #[test]
+    fn blend_where_clips_the_area_without_moving_the_shape() {
+        // A coverage function that names the left half of the surface, drawn into a rect
+        // that is already clipped to the right half: nothing is painted.
+        let mut pixels = blank();
+        {
+            let mut canvas = canvas(&mut pixels);
+            canvas.blend_where(Rect::new(2, 0, 2, 3), Color::WHITE, |x, _| {
+                if x < 2 {
+                    u8::MAX
+                } else {
+                    0
+                }
+            });
+        }
+        assert!(pixels.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn blend_surface_uses_the_source_alpha_and_leaves_a_transparent_pixel_alone() {
+        // A source with one opaque pixel, one half-covered pixel and one untouched pixel.
+        let mut source_pixels = blank();
+        {
+            let mut source = canvas(&mut source_pixels);
+            source.fill_rect(Rect::new(0, 0, 1, 1), Color::WHITE);
+            source.blend_where(Rect::new(1, 0, 1, 1), Color::WHITE, |_, _| 128);
+        }
+        let mut pixels = blank();
+        {
+            let source = canvas(&mut source_pixels);
+            let mut destination = canvas(&mut pixels);
+            destination.fill(Color::BLACK);
+            destination.blend_surface(&source, Rect::new(0, 0, 4, 3));
+        }
+        // An opaque source pixel copies over; a transparent one leaves the black body alone.
+        assert_eq!(pixel(&pixels, 0, 0), [u8::MAX; BYTES_PER_PIXEL]);
+        assert_eq!(pixel(&pixels, 2, 0), [0, 0, 0, u8::MAX]);
+        // A half-covered source pixel is half of white over black.
+        assert_eq!(
+            pixel(&pixels, 1, 0),
+            [64, 64, 64, u8::MAX],
+            "the fourth byte belongs to the destination"
+        );
+    }
+
+    #[test]
+    fn blending_a_surface_in_the_other_channel_order_is_refused() {
+        let mut source_pixels = blank();
+        {
+            let mut source =
+                Canvas::new(&mut source_pixels, GEOMETRY, ChannelOrder::Rgb).expect("fits");
+            source.fill_rect(Rect::new(0, 0, 4, 3), Color::WHITE);
+        }
+        let mut pixels = blank();
+        {
+            let source =
+                Canvas::new(&mut source_pixels, GEOMETRY, ChannelOrder::Rgb).expect("fits");
+            let mut destination = canvas(&mut pixels);
+            destination.blend_surface(&source, Rect::new(0, 0, 4, 3));
         }
         assert!(pixels.iter().all(|byte| *byte == 0));
     }

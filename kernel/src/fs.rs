@@ -6,22 +6,30 @@
 //! | ------- | ----------------------------------------------------------------- |
 //! | 0       | superblock                                                        |
 //! | 1..=4   | the directory: 4 sectors x 16 entries x 32 bytes = 64 slots        |
-//! | 5..     | file data, one contiguous run per file, allocated at `next_free`   |
+//! | 5..     | file data, one contiguous run per file, in the lowest free run     |
 //!
 //! Everything is little-endian, and every multi-byte field is written and read by one
 //! function per structure so the two cannot drift. The superblock ends in a seal (FNV-1a
 //! over the bytes before it), because a magic number alone cannot tell a filesystem from a
 //! disk whose first sector happens to start with the right eight bytes.
 //!
+//! # Where free space lives
+//!
+//! Nowhere: it is *derived*. The directory is the record of what is allocated, so mounting
+//! reads the entries and builds a mark of the sectors they claim; removing a file zeroes its
+//! slot, and the next mount - or the next write, from the copy in memory - sees those sectors
+//! free. There is no free-list sector to go stale, to be lost in a crash between two writes,
+//! or to disagree with the directory about which sectors belong to whom.
+//!
 //! # What this filesystem is not
 //!
 //! There are no directories: `apps/hello.gvm` is a name, not a path, and the slash is
 //! allowed purely so names read naturally. There are no permissions, no timestamps, no
-//! hard links and no journalling. A file is one extent, so replacing it leaks the old run
-//! until a free-space pass exists, and removing it leaks its run entirely. Each of those
-//! is a deliberate "not yet" rather than an oversight: what has to be true first is that
-//! the format survives a round trip through a real disk, and that every one of these
-//! refusals has a test.
+//! hard links and no journalling. A file is one extent, so a disk with many small holes can
+//! refuse a large file while having room for it in total - the refusal says which - and a file
+//! cannot grow in place. Each of those is a deliberate "not yet" rather than an oversight:
+//! what has to be true first is that the format survives a round trip through a real disk,
+//! and that every one of these refusals has a test.
 //!
 //! # What is where
 //!
@@ -305,6 +313,107 @@ pub enum Opened {
     Mounted,
 }
 
+/// Which sectors are spoken for, one bit each, lowest sector first.
+///
+/// The map is **derived, not stored**. It is rebuilt from the directory at every mount, so the
+/// directory is the only record of what is allocated and there is no second structure to fall
+/// out of step with it - which is also why the format has no free-list sector to lose in a
+/// crash between two writes. What it costs is a kilobyte of memory for the 4 MiB image and one
+/// pass over the directory to rebuild.
+struct SectorMap {
+    /// One bit per sector of the device. The metadata's bits are set from the start, so no
+    /// allocation can ever land on the superblock or the directory.
+    bits: Vec<u8>,
+    /// The device size, so the spare bits at the end of the last byte are never handed out.
+    sectors: u64,
+}
+
+impl SectorMap {
+    /// A map with the metadata marked and every data sector free.
+    fn new(sectors: u64) -> Self {
+        let mut map = Self {
+            bits: alloc::vec![0u8; (sectors as usize).div_ceil(8)],
+            sectors,
+        };
+        map.mark(0, DATA_FIRST_SECTOR.min(sectors));
+        map
+    }
+
+    /// Whether `sector` holds something.
+    fn is_used(&self, sector: u64) -> bool {
+        if sector >= self.sectors {
+            return true;
+        }
+        let byte = self.bits[(sector / 8) as usize];
+        byte & (1 << (sector % 8)) != 0
+    }
+
+    /// Marks `count` sectors from `start` as used, returning whether they were all free.
+    ///
+    /// A `false` answer means two files claim one sector, which a mount turns into a refusal:
+    /// the second file's bytes are the first file's bytes, and reading either would give the
+    /// wrong answer.
+    fn mark(&mut self, start: u64, count: u64) -> bool {
+        let mut free = true;
+        for sector in start..start.saturating_add(count) {
+            if self.is_used(sector) {
+                free = false;
+                continue;
+            }
+            self.bits[(sector / 8) as usize] |= 1 << (sector % 8);
+        }
+        free
+    }
+
+    /// Gives `count` sectors from `start` back.
+    fn clear(&mut self, start: u64, count: u64) {
+        for sector in start..start.saturating_add(count) {
+            if sector >= self.sectors {
+                return;
+            }
+            self.bits[(sector / 8) as usize] &= !(1 << (sector % 8));
+        }
+    }
+
+    /// The first run of `count` free sectors, or `None` when the device has no such run.
+    ///
+    /// First fit, from the bottom: files stay near the front of the device, and a run that a
+    /// file used to occupy is the first place the next file tries. `count == 0` is answered
+    /// with the first data sector, because an empty file occupies nothing and its extent is
+    /// never read.
+    fn first_fit(&self, count: u64) -> Option<u64> {
+        if count == 0 {
+            return Some(DATA_FIRST_SECTOR);
+        }
+        let mut start = DATA_FIRST_SECTOR;
+        let mut run = 0;
+        while start + run < self.sectors {
+            if self.is_used(start + run) {
+                start += run + 1;
+                run = 0;
+                continue;
+            }
+            run += 1;
+            if run == count {
+                return Some(start);
+            }
+        }
+        None
+    }
+
+    /// Sectors in use, metadata included.
+    fn used(&self) -> u64 {
+        (0..self.sectors)
+            .filter(|sector| self.is_used(*sector))
+            .count() as u64
+    }
+
+    /// Sectors a new file could still use.
+    fn free(&self) -> u64 {
+        self.sectors - self.used()
+    }
+}
+
 /// A mounted `greyfs`.
 ///
 /// The superblock and the directory are cached in memory and written back on every change:
@@ -318,6 +427,9 @@ pub struct Filesystem<D: Block> {
     /// front is what makes a removal a single zeroed slot instead of a rewrite of the
     /// whole directory.
     slots: Vec<Option<Entry>>,
+    /// What the directory says is allocated, kept in step with `slots` in the same methods
+    /// that write them.
+    map: SectorMap,
 }
 
 impl<D: Block> Filesystem<D> {
@@ -343,10 +455,12 @@ impl<D: Block> Filesystem<D> {
             generation: 0,
         };
         disk.write(SUPERBLOCK_SECTOR, &superblock.encode())?;
+        let map = SectorMap::new(disk.sectors());
         Ok(Self {
             disk,
             superblock,
             slots: alloc::vec![None; MAX_ENTRIES],
+            map,
         })
     }
 
@@ -376,11 +490,12 @@ impl<D: Block> Filesystem<D> {
         let mut superblock = Superblock::decode(&sector)?;
         superblock.generation = superblock.generation.wrapping_add(1);
         disk.write(SUPERBLOCK_SECTOR, &superblock.encode())?;
-        let slots = Self::load_directory(&mut disk, &superblock)?;
+        let (slots, map) = Self::load_directory(&mut disk, &superblock)?;
         Ok(Self {
             disk,
             superblock,
             slots,
+            map,
         })
     }
 
@@ -388,15 +503,21 @@ impl<D: Block> Filesystem<D> {
     ///
     /// Every check here is one a corrupt sector would trip: an extent that starts inside
     /// the metadata, an extent that runs into the unallocated region, a length that cannot
-    /// be represented, or two entries with one name. A mount that carried on past any of
-    /// them would hand out a file whose bytes belong to another.
+    /// be represented, two entries with one name, or two extents that overlap. A mount that
+    /// carried on past any of them would hand out a file whose bytes belong to another.
+    ///
+    /// The allocation map is built here, from the same entries this validates, so the map
+    /// and the directory cannot disagree about what is allocated - there is one input and one
+    /// pass over it. The overlap check is the map's: marking an extent fails when a sector is
+    /// already marked, and metadata is marked before the first entry is read.
     fn load_directory(
         disk: &mut D,
         superblock: &Superblock,
-    ) -> Result<Vec<Option<Entry>>, FsError> {
+    ) -> Result<(Vec<Option<Entry>>, SectorMap), FsError> {
         let mut buffer = alloc::vec![0u8; DIR_SECTORS as usize * SECTOR_BYTES];
         disk.read(DIR_FIRST_SECTOR, &mut buffer)?;
         let mut slots: Vec<Option<Entry>> = alloc::vec![None; MAX_ENTRIES];
+        let mut map = SectorMap::new(superblock.sectors);
         for (index, slot) in buffer.as_chunks::<ENTRY_BYTES>().0.iter().enumerate() {
             let Some(entry) = Entry::decode(slot)? else {
                 continue;
@@ -419,9 +540,12 @@ impl<D: Block> Filesystem<D> {
             if slots.iter().flatten().any(|other| other.name == entry.name) {
                 return Err(FsError::Corrupt("two entries share a name"));
             }
+            if !map.mark(entry.start, entry.sectors()) {
+                return Err(FsError::Corrupt("two entries share a sector"));
+            }
             slots[index] = Some(entry);
         }
-        Ok(slots)
+        Ok((slots, map))
     }
 }
 
@@ -453,16 +577,26 @@ impl<D: Block> Filesystem<D> {
         self.superblock
     }
 
-    /// The first sector that has never been written: the whole allocator's state.
+    /// The highest sector ever handed out, which is what the superblock records.
+    ///
+    /// This is no longer where an allocation starts: a freed run below it comes first. What it
+    /// still does is catch a directory that outran the superblock, because an extent above it is
+    /// a mount refusal rather than a file whose sectors are somebody else's.
     pub fn next_free(&self) -> u64 {
         self.superblock.next_free
     }
 
-    /// The sectors a new extent could still use.
+    /// Sectors a new extent could still use.
+    ///
+    /// The count includes freed runs below the high-water mark, which is the difference this
+    /// milestone makes: `sectors - next_free` was an answer that only ever went down.
     pub fn free_sectors(&self) -> u64 {
-        self.superblock
-            .sectors
-            .saturating_sub(self.superblock.next_free)
+        self.map.free()
+    }
+
+    /// Sectors in use, metadata included: what the boot log reports.
+    pub fn sectors_used(&self) -> u64 {
+        self.map.used()
     }
 
     /// Reads a file's bytes.
@@ -481,53 +615,93 @@ impl<D: Block> Filesystem<D> {
 
     /// Writes `bytes` to `name`, creating it or replacing it, and returns the entry.
     ///
-    /// The order is data, then directory, then superblock. A crash between the first two
-    /// leaves a file whose extent `next_free` will hand out again - a lost write. A crash
-    /// between the last two leaves the directory claiming an extent the superblock says is
-    /// unallocated, which the next mount refuses. Both are better than the third order,
-    /// where a crash leaves a file pointing at sectors that another file has claimed.
+    /// The order is data, then directory, then superblock, and the superblock is written only
+    /// when the file grew past the high-water mark. A crash before the directory write leaves
+    /// the old entry live and the new extent unreferenced - a lost write, and the space it used
+    /// is free again on the next mount. A crash between the last two leaves the directory
+    /// claiming an extent the superblock says has never been used, which the next mount
+    /// refuses. Both are better than the other order, where a crash leaves a file pointing at
+    /// sectors that another file has claimed.
     ///
-    /// Replacing a file leaks its old extent. That is the honest cost of having no free
-    /// list: the milestone that adds one has to add the invariant with it.
+    /// Replacing a file allocates its new extent *before* the old one is released, so the old
+    /// run cannot be handed to the new entry by accident; once the directory names the new
+    /// extent the old run is free, and the next write is what claims it.
     pub fn write(&mut self, name: &str, bytes: &[u8], kind: Kind) -> Result<Entry, FsError> {
         check_name(name)?;
         let sectors = sectors_for(bytes.len());
-        let start = self.superblock.next_free;
-        let end = match start.checked_add(sectors) {
-            Some(end) if end <= self.superblock.sectors => end,
-            _ => return Err(FsError::NoSpace("the device has no room for this file")),
-        };
+        let start = self.allocate(sectors)?;
+        let end = start + sectors;
         if end > u32::MAX as u64 {
+            self.map.clear(start, sectors);
             return Err(FsError::NoSpace("the extent does not fit in 32 bits"));
         }
         let slot = match self.find(name) {
             Some(index) => index,
             None => match self.slots.iter().position(Option::is_none) {
                 Some(index) => index,
-                None => return Err(FsError::NoSpace("the directory has no free slot")),
+                None => {
+                    self.map.clear(start, sectors);
+                    return Err(FsError::NoSpace("the directory has no free slot"));
+                }
             },
         };
         if sectors > 0 {
             let mut padded = alloc::vec![0u8; sectors as usize * SECTOR_BYTES];
             padded[..bytes.len()].copy_from_slice(bytes);
-            self.disk.write(start, &padded)?;
+            if let Err(error) = self.disk.write(start, &padded) {
+                self.map.clear(start, sectors);
+                return Err(error.into());
+            }
         }
+        let replaced = self.slots[slot].clone();
         let entry = Entry {
             name: String::from(name),
             kind,
             start,
             len: bytes.len() as u64,
         };
-        self.store_entry(slot, &entry)?;
-        self.superblock.next_free = end;
-        self.store_superblock()?;
+        if let Err(error) = self.store_entry(slot, &entry) {
+            self.map.clear(start, sectors);
+            return Err(error);
+        }
+        if let Some(old) = replaced {
+            self.map.clear(old.start, old.sectors());
+        }
+        if end > self.superblock.next_free {
+            self.superblock.next_free = end;
+            self.store_superblock()?;
+        }
         Ok(entry)
+    }
+
+    /// Finds and marks a run of `sectors` sectors for a new extent.
+    ///
+    /// A freed run is preferred to the high-water mark, so a file that is replaced lands in
+    /// the space its predecessor gave up instead of growing the device's used prefix for ever.
+    /// A file is one extent, so a disk with many small holes can refuse a large file while
+    /// still having room for it - the error says which of the two happened.
+    fn allocate(&mut self, sectors: u64) -> Result<u64, FsError> {
+        let Some(start) = self.map.first_fit(sectors) else {
+            return Err(match self.map.free() >= sectors {
+                true => FsError::NoSpace("the device has no contiguous run that long"),
+                false => FsError::NoSpace("the device has no room for this file"),
+            });
+        };
+        if !self.map.mark(start, sectors) {
+            // Not reachable through `first_fit`, which only returns free runs. It is checked
+            // rather than assumed because the alternative is two files on one sector.
+            return Err(FsError::Corrupt(
+                "the allocation map handed out a used sector",
+            ));
+        }
+        Ok(start)
     }
 
     /// Removes a name and returns what it described.
     ///
-    /// The extent is not reclaimed: without a free list, the only safe statement about
-    /// those sectors is that nothing points at them any more.
+    /// The extent is reclaimed: the directory slot is what allocated it, so zeroing the slot
+    /// is what frees it, and the next write may use the space. The map is derived from the
+    /// directory at every mount, which is why there is nothing else to write here.
     pub fn remove(&mut self, name: &str) -> Result<Entry, FsError> {
         let slot = self.find(name).ok_or(FsError::NotFound)?;
         let entry = self.slots[slot].clone().ok_or(FsError::NotFound)?;
@@ -538,6 +712,7 @@ impl<D: Block> Filesystem<D> {
         buffer[offset..offset + ENTRY_BYTES].fill(0);
         self.disk.write(sector, &buffer)?;
         self.slots[slot] = None;
+        self.map.clear(entry.start, entry.sectors());
         Ok(entry)
     }
 
@@ -679,6 +854,120 @@ mod tests {
         assert_ne!(first.start, second.start);
         assert_eq!(fs.count(), 1);
         assert_eq!(fs.read("log").expect("read"), b"second".to_vec());
+    }
+
+    #[test]
+    fn a_removed_files_sectors_are_handed_out_again() {
+        let mut fs = formatted(512);
+        let removed = fs.write("a", b"one", Kind::File).expect("write a");
+        let used = fs.sectors_used();
+        fs.write("b", b"two", Kind::File).expect("write b");
+        assert_eq!(fs.sectors_used(), used + 1);
+        fs.remove("a").expect("remove");
+        assert_eq!(fs.sectors_used(), used);
+        let again = fs.write("c", b"three", Kind::File).expect("write c");
+        // The run `a` gave up is the lowest free one, so it is where `c` lands. That is the
+        // whole claim: the space came back instead of being lost until the disk filled.
+        assert_eq!(again.start, removed.start);
+        assert_eq!(fs.sectors_used(), used + 1);
+    }
+
+    #[test]
+    fn rewriting_a_file_does_not_grow_the_device() {
+        let mut fs = formatted(512);
+        fs.write("count", b"0", Kind::File).expect("write");
+        let used = fs.sectors_used();
+        for value in 1..50u8 {
+            let text = [b'0' + value % 10];
+            fs.write("count", &text, Kind::File).expect("rewrite");
+            // A replacement releases its old run once the directory names the new one, so the
+            // count is constant. The allocator this replaced walked one sector further into
+            // the device on every boot, which is exactly the leak the boot counter would find
+            // after five hundred boots rather than fifty.
+            assert_eq!(fs.sectors_used(), used, "rewrite {value} grew the device");
+        }
+        // Two sectors take turns; the high-water mark stays where the second write put it.
+        assert_eq!(fs.next_free(), DATA_FIRST_SECTOR + 2);
+        let mut fs = Filesystem::mount(fs.into_disk()).expect("mount");
+        assert_eq!(fs.sectors_used(), used);
+        assert_eq!(fs.read("count").expect("read"), b"9".to_vec());
+    }
+
+    #[test]
+    fn a_hole_too_small_for_the_file_is_refused_with_its_own_reason() {
+        // Five data sectors filled one file each, then two non-adjacent ones removed: two
+        // sectors are free but no two are next to each other, and a file is one extent. The
+        // refusal has to say that, because "no room" would be a lie about a disk with room.
+        let mut fs = formatted(MIN_SECTORS + 5);
+        for name in ["p", "q", "r", "s", "t"] {
+            fs.write(name, b"x", Kind::File).expect("write");
+        }
+        fs.remove("q").expect("remove q");
+        fs.remove("s").expect("remove s");
+        assert_eq!(fs.free_sectors(), 2);
+        let pair = vec![0u8; 2 * SECTOR_BYTES];
+        assert_eq!(
+            fs.write("pair", &pair, Kind::File),
+            Err(FsError::NoSpace(
+                "the device has no contiguous run that long"
+            ))
+        );
+        assert_eq!(fs.count(), 3);
+        // One sector still fits, and it takes the lowest hole rather than the end.
+        let one = fs.write("one", b"y", Kind::File).expect("one sector fits");
+        assert_eq!(one.start, DATA_FIRST_SECTOR + 1);
+        assert_eq!(fs.count(), 4);
+    }
+
+    #[test]
+    fn the_map_a_mount_builds_agrees_with_the_directory() {
+        let mut fs = formatted(512);
+        fs.write("keep", b"one", Kind::File).expect("write keep");
+        fs.write("drop", b"two", Kind::File).expect("write drop");
+        let dropped = fs.remove("drop").expect("remove");
+        let used = fs.sectors_used();
+        let mut fs = Filesystem::mount(fs.into_disk()).expect("mount");
+        // Free space is derived at mount, so the sectors `drop` gave up are free again without
+        // anything having been written to record it - and a write goes straight into them.
+        assert_eq!(fs.free_sectors(), 512 - used);
+        let reused = fs.write("new", b"three", Kind::File).expect("write new");
+        assert_eq!(reused.start, dropped.start);
+        assert_eq!(fs.sectors_used(), used + 1);
+    }
+
+    #[test]
+    fn two_extents_over_a_shared_sector_are_refused() {
+        let mut disk = MemDisk::new(512);
+        let superblock = Superblock {
+            version: VERSION,
+            sector_bytes: SECTOR_BYTES as u32,
+            sectors: 512,
+            next_free: DATA_FIRST_SECTOR + 3,
+            generation: 0,
+        };
+        disk.sector_mut(SUPERBLOCK_SECTOR)
+            .copy_from_slice(&superblock.encode());
+        let one = Entry {
+            name: String::from("one"),
+            kind: Kind::File,
+            start: DATA_FIRST_SECTOR,
+            len: 700,
+        };
+        let two = Entry {
+            name: String::from("two"),
+            kind: Kind::File,
+            start: DATA_FIRST_SECTOR + 1,
+            len: 700,
+        };
+        let sector = disk.sector_mut(DIR_FIRST_SECTOR);
+        sector[..ENTRY_BYTES].copy_from_slice(&one.encode());
+        sector[ENTRY_BYTES..ENTRY_BYTES * 2].copy_from_slice(&two.encode());
+        // Both extents are two sectors and both are below `next_free`, so the only thing wrong
+        // with them is that they overlap: without the refusal, `two` would read `one`'s bytes.
+        assert_eq!(
+            Filesystem::mount(disk).err(),
+            Some(FsError::Corrupt("two entries share a sector"))
+        );
     }
 
     #[test]

@@ -13,9 +13,9 @@ use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use grey_os::{
-    acpi, apps, arena, compositor, disk, display, frame, framebuffer, fs, gdt, halt_loop, heap,
-    idt, keyboard, memory, mouse, paging, pic, qemu, scheduler, serial, sync, theme, timer,
-    usermode, vm, window,
+    acpi, apps, arena, canvas, compositor, disk, display, frame, framebuffer, fs, gdt, halt_loop,
+    heap, idt, keyboard, memory, mouse, paging, pic, presenter, qemu, scheduler, serial, sync,
+    theme, timer, usermode, vm, window,
 };
 // The shell only exists in the builds that can type into it: the acceptance run, whose keys
 // come from the harness, and a preview, whose keys come from the person at the keyboard. A
@@ -958,12 +958,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let _ = desktop.windows.move_to(log_window, 40, 40);
     let _ = desktop.windows.move_to(about, 340, 250);
     let _ = desktop.windows.move_to(system, 800, 430);
-    let mut drawn = 0usize;
+    // M13: the frame is built in memory and copied onto the panel. Allocating it here rather
+    // than before the windows exist keeps the failure case simple: a panel with no buffer
+    // paints exactly the way it did before this milestone, and the log says which happened.
+    let mut buffer_bytes = None;
     framebuffer::with_screen(|screen| {
-        if let Some(mut canvas) = framebuffer::canvas(screen) {
-            drawn = desktop.draw_all(&mut canvas);
+        if let Some((geometry, order)) = framebuffer::layout(screen) {
+            buffer_bytes = install_presenter(geometry, order);
         }
     });
+    match buffer_bytes {
+        // The size the frame costs, next to the theme's measurements: a panel big enough that
+        // the copy is worth measuring is the case this line exists for. It is printed *before*
+        // the first frame, because a `println!` after it repaints the log's grid - which is the
+        // whole panel - over the desktop (ADR-041).
+        Some(bytes) => println!(
+            "grey-os: compositor: desktop composited in a {} KiB back buffer",
+            bytes / 1024
+        ),
+        None => println!("grey-os: compositor: no back buffer, painting straight onto the panel"),
+    }
+    let (pointer_x, pointer_y) = mouse::position();
+    let drawn = paint_all(&mut desktop);
     // The panel belongs to the desktop from this frame on, not from the end of the boot. A
     // preview keeps the shell running for as long as somebody is looking at it, and every
     // `println!` between here and the end of the boot would otherwise repaint the boot log
@@ -977,18 +993,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let _ = desktop.windows.raise(log_window);
     let _ = desktop.windows.move_to(system, 760, 380);
     let pending = desktop.windows.pending();
-    let mut damage = 0usize;
-    framebuffer::with_screen(|screen| {
-        if let Some(mut canvas) = framebuffer::canvas(screen) {
-            damage = desktop.draw_damage(&mut canvas).len();
-        }
-    });
-    let (pointer_x, pointer_y) = mouse::position();
-    framebuffer::with_screen(|screen| {
-        if let Some(mut canvas) = framebuffer::canvas(screen) {
-            desktop.draw_pointer(&mut canvas, pointer_x, pointer_y);
-        }
-    });
+    let damage = redraw(&mut desktop);
     // M8: the process model and the shell. The scheduler starts with the boot task in slot
     // zero; the three tasks below are the evidence that a switch really changes stacks, since
     // each of them writes into a window while the boot task is the one that redraws it.
@@ -1471,7 +1476,7 @@ fn storage() -> Option<fs::Filesystem<disk::Pio>> {
             "grey-os: greyfs: mounted generation {}, {} file(s), {} of {} sectors in use",
             filesystem.superblock().generation,
             filesystem.count(),
-            filesystem.next_free(),
+            filesystem.sectors_used(),
             filesystem.superblock().sectors
         ),
     }
@@ -1513,7 +1518,7 @@ fn storage() -> Option<fs::Filesystem<disk::Pio>> {
     println!(
         "grey-os: storage ok: boot {boot} of this image, {} file(s), {} of {} sectors in use",
         filesystem.count(),
-        filesystem.next_free(),
+        filesystem.sectors_used(),
         filesystem.superblock().sectors
     );
     Some(filesystem)
@@ -1571,6 +1576,44 @@ fn boot_number(bytes: &[u8]) -> u32 {
 static DESKTOP: sync::InterruptMutex<*mut compositor::Compositor> =
     sync::InterruptMutex::new(core::ptr::null_mut());
 
+/// The frame builder: the back buffer the desktop is composited in, and where the pointer was
+/// drawn last.
+///
+/// Published the way the desktop is, and for the same reason: a task's redraw runs on that
+/// task's own stack, so the buffer cannot live in the boot's. Leaked, so the pointer stays good
+/// for the rest of the run.
+static PRESENTER: sync::InterruptMutex<*mut presenter::Presenter> =
+    sync::InterruptMutex::new(core::ptr::null_mut());
+
+/// Runs `draw` against the presenter, or returns `None` if the boot has not published one.
+fn with_presenter<R>(draw: impl FnOnce(&mut presenter::Presenter) -> R) -> Option<R> {
+    let pointer = *PRESENTER.lock();
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: `install_presenter` leaks the buffer and publishes it before any task is
+    // spawned, so a non-null value is live and never replaced. A task's call runs to
+    // completion - the scheduler only switches when a task asks it to - so no two callers hold
+    // this borrow at once.
+    Some(draw(unsafe { &mut *pointer }))
+}
+
+/// Allocates the presenter for a panel with `geometry` and `order`, publishes it, and returns
+/// the size of its back buffer in bytes.
+///
+/// `None` means the allocation failed. That is not fatal: every draw falls back to painting the
+/// panel directly, which is correct and slower, and the boot log says which of the two
+/// happened. The buffer has to have the panel's size and channel order because the copy onto
+/// the panel is a row copy (ADR-042).
+fn install_presenter(geometry: canvas::Geometry, order: canvas::ChannelOrder) -> Option<usize> {
+    let buffer = presenter::Presenter::new(geometry.width as u32, geometry.height as u32, order)?;
+    let bytes = buffer.back_buffer_bytes();
+    let installed: &'static mut presenter::Presenter =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(buffer));
+    *PRESENTER.lock() = installed as *mut presenter::Presenter;
+    Some(bytes)
+}
+
 /// The window the tasks write into.
 static TASKS_WINDOW: AtomicU32 = AtomicU32::new(0);
 
@@ -1619,30 +1662,65 @@ fn with_desktop<R>(draw: impl FnOnce(&mut compositor::Compositor) -> R) -> Optio
 /// Used when the panel has to be right rather than merely repaired: the first frame, and once
 /// more before an acceptance run ends, so the screenshot a harness takes is the desktop as it
 /// stands rather than whichever damage rect happened to be painted last.
-fn paint_all(desktop: &mut compositor::Compositor) {
-    let (x, y) = mouse::position();
+/// Paints the whole desktop and the pointer, and returns how many windows it drew.
+///
+/// Used when the panel has to be right rather than merely repaired: the first frame, and once
+/// more before an acceptance run ends, so the screenshot a harness takes is the desktop as it
+/// stands rather than whichever damage rect happened to be painted last.
+///
+/// The frame is built in the presenter's back buffer and copied onto the panel. With no
+/// buffer - one whose allocation failed - this paints the panel directly, which is what every
+/// frame did before M13.
+fn paint_all(desktop: &mut compositor::Compositor) -> usize {
+    let pointer = mouse::position();
+    let mut drawn = None;
     framebuffer::with_screen(|screen| {
-        if let Some(mut canvas) = framebuffer::canvas(screen) {
-            desktop.draw_all(&mut canvas);
-            desktop.draw_pointer(&mut canvas, x, y);
+        if let Some(mut panel) = framebuffer::canvas(screen) {
+            drawn = Some(
+                match with_presenter(|presenter| presenter.paint_all(desktop, &mut panel, pointer))
+                {
+                    Some(windows) => windows,
+                    None => {
+                        let windows = desktop.draw_all(&mut panel);
+                        desktop.draw_pointer(&mut panel, pointer.0, pointer.1);
+                        windows
+                    }
+                },
+            );
         }
     });
+    drawn.unwrap_or(0)
 }
 
-/// Paints whatever the desktop says has changed, and then the pointer.
+/// Paints whatever the desktop says has changed, and then the pointer, and returns how many
+/// damage rects it repainted.
 ///
 /// The pointer is drawn last because it sits above every window, and drawing it after the
 /// damage is what keeps it from being erased by the repaint of the window underneath it - a
 /// bug the screenshot check caught: the shell window covers the middle of the screen, and
-/// creating it erased the pointer the boot had already drawn.
-fn redraw(desktop: &mut compositor::Compositor) {
-    let (x, y) = mouse::position();
+/// creating it erased the pointer the boot had already drawn. The presenter keeps that order
+/// and adds the other half: the rect the pointer has left is copied from the buffer, so a
+/// pointer that moves is erased in the same frame that draws it.
+fn redraw(desktop: &mut compositor::Compositor) -> usize {
+    let pointer = mouse::position();
+    let mut painted = None;
     framebuffer::with_screen(|screen| {
-        if let Some(mut canvas) = framebuffer::canvas(screen) {
-            desktop.draw_damage(&mut canvas);
-            desktop.draw_pointer(&mut canvas, x, y);
+        if let Some(mut panel) = framebuffer::canvas(screen) {
+            painted = Some(
+                match with_presenter(|presenter| {
+                    presenter.paint_damage(desktop, &mut panel, pointer)
+                }) {
+                    Some(rects) => rects,
+                    None => {
+                        let rects = desktop.draw_damage(&mut panel).len();
+                        desktop.draw_pointer(&mut panel, pointer.0, pointer.1);
+                        rects
+                    }
+                },
+            );
         }
     });
+    painted.unwrap_or(0)
 }
 
 /// Adds a line to the tasks window and damages it, so the next [`redraw`] paints it.
@@ -2082,7 +2160,7 @@ fn execute(
                 out.push(alloc::format!(
                     "{} file(s), {} of {} sectors in use",
                     filesystem.count(),
-                    filesystem.next_free(),
+                    filesystem.sectors_used(),
                     filesystem.superblock().sectors
                 ));
             }

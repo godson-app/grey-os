@@ -71,6 +71,27 @@ const INPUT_KEYS: [&str; 4] = ["g", "r", "e", "y"];
 /// second runs a program off the disk, and the third asks for one that is not there, which has
 /// to be a message rather than a fault.
 const SHELL_COMMANDS: [&str; 6] = ["ls", "mem", "cpus", "run fib", "run nope", "exit"];
+/// How long the guest has to stay silent after `shell: listening` before the harness types.
+///
+/// The line is printed before the last of the frame that shows the prompt, and that frame is
+/// painted with interrupts masked - `PRESENTER` and `DESKTOP` are interrupt mutexes, so IRQ1 is
+/// not serviced while a frame is being built. A keystroke that arrives inside that window is
+/// lost in the controller's own buffer, before the kernel's queue exists, and the run then
+/// fails on a command the guest never saw. Under TCG a full 1280x800 frame takes long enough to
+/// swallow the first two commands; on hardware it is milliseconds. Waiting for silence makes
+/// the phase independent of how fast the emulator is: nothing else prints between `listening`
+/// and the harness's first keystroke.
+const SHELL_SETTLE: Duration = Duration::from_millis(500);
+/// How long a typed command has to come back before it is typed again.
+///
+/// A keystroke can be lost between the monitor and the guest - the controller's buffer is one
+/// byte, and QEMU's queue behind it is short - so the phase does not assume a command it sent
+/// was received. It waits for the guest to echo the line, and types it again if the echo never
+/// comes. Every retry is printed, so a lost keystroke is a visible line in the log rather than a
+/// phase that fails a minute later on a command nobody saw.
+const SHELL_ECHO_TIMEOUT: Duration = Duration::from_millis(2000);
+/// How many times one command may be typed before the phase gives up on it.
+const SHELL_TRIES: u32 = 3;
 /// Printed by the shell before it starts reading keys.
 const SHELL_LISTENING: &str = "grey-os: shell: listening";
 /// Printed when the shell's `exit` command ended the session.
@@ -571,9 +592,20 @@ fn input_path(options: &Options) -> Result<()> {
     let mut typed = false;
     let mut captured = false;
     let mut typed_shell = false;
+    // When the shell said it was listening, and when the guest last said anything at all: the
+    // first command is typed only once `SHELL_SETTLE` has passed with no new output, so the frame
+    // that follows `listening` - painted with interrupts masked - is finished first.
+    let mut shell_listening = false;
+    let mut last_output = Instant::now();
+    // The commands still to send, and the one waiting for its echo. Typing is driven from the
+    // line reader rather than done in one burst, because whether a keystroke arrives is not
+    // something the host can take for granted.
+    let mut pending: Vec<&str> = SHELL_COMMANDS.to_vec();
+    let mut awaiting: Option<(&str, Instant, u32)> = None;
     loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
+                last_output = Instant::now();
                 log.push_str(&line);
                 log.push('\n');
                 if !typed && line.contains(INPUT_LISTENING) {
@@ -593,17 +625,52 @@ fn input_path(options: &Options) -> Result<()> {
                     println!("pass: `{}` and the panel holds a desktop", path.display());
                     captured = true;
                 }
-                // The shell is listening: type the commands the phase asserts on.
-                if !typed_shell && line.contains(SHELL_LISTENING) {
-                    println!(
-                        "typing `{}` into the shell through qmp",
-                        SHELL_COMMANDS.join(", ")
-                    );
-                    type_commands(&socket)?;
-                    typed_shell = true;
+                // The shell echoes a submitted line as `> <line>` before it runs it, so that is
+                // the acknowledgement that the keystrokes arrived.
+                if let Some((command, _, _)) = awaiting {
+                    if line.contains(&format!("grey-os: shell: > {command}")) {
+                        awaiting = None;
+                        pending.remove(0);
+                    }
+                }
+                if line.contains(SHELL_LISTENING) {
+                    shell_listening = true;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if shell_listening && last_output.elapsed() >= SHELL_SETTLE {
+                    match awaiting {
+                        // Nothing outstanding: type the next command.
+                        None => {
+                            if let Some(command) = pending.first().copied() {
+                                println!("typing `{command}` into the shell through qmp");
+                                type_line_commands(&socket, &[command])?;
+                                awaiting = Some((command, Instant::now(), 1));
+                            }
+                        }
+                        // Typed but not echoed: the guest never saw it, so type it again.
+                        Some((command, typed_at, tries)) => {
+                            if typed_at.elapsed() >= SHELL_ECHO_TIMEOUT {
+                                if tries >= SHELL_TRIES {
+                                    bail!(
+                                        "the shell never echoed `> {command}` after {tries} \
+                                         attempts, so the keystrokes for it are not reaching the \
+                                         guest\n--- serial ---\n{log}"
+                                    );
+                                }
+                                println!(
+                                    "`{command}` was not echoed; typing it again (attempt {})",
+                                    tries + 1
+                                );
+                                type_line_commands(&socket, &[command])?;
+                                awaiting = Some((command, Instant::now(), tries + 1));
+                            }
+                        }
+                    }
+                    if pending.is_empty() && awaiting.is_none() {
+                        typed_shell = true;
+                    }
+                }
                 if started.elapsed() > TEST_TIMEOUT {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -852,10 +919,11 @@ fn monitor(socket: &Path) -> Result<(UnixStream, BufReader<UnixStream>)> {
 ///
 /// One connection for all of them: QEMU's monitor is happy to have several, but a keystroke
 /// per round trip keeps the ordering obvious.
-fn type_commands(socket: &Path) -> Result<()> {
+/// Types `lines` into the guest, one at a time, on a monitor connection of its own.
+fn type_line_commands(socket: &Path, lines: &[&str]) -> Result<()> {
     let (mut stream, mut reader) = monitor(socket)?;
-    for command in SHELL_COMMANDS {
-        type_line(&mut stream, &mut reader, command)?;
+    for line in lines {
+        type_line(&mut stream, &mut reader, line)?;
         // Long enough for the command to run and its answer to be drawn.
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -1020,10 +1088,72 @@ fn check_screenshot(path: &Path) -> Result<()> {
     if pointer_pixels == 0 {
         bail!("the pointer is not on the panel: no pixel is {POINTER_COLOUR:?}");
     }
+    // M13 rounds the chrome, so a corner has to arrive as a fade rather than as a staircase.
+    check_rounded_corner(path)?;
     println!(
         "pass: {width}x{height} screenshot, {} distinct colours, {pointer_pixels} pointer pixels, saved to {}",
         distinct.len(),
         path.display()
+    );
+    Ok(())
+}
+
+/// Checks that a window's corner is blended, which is what tells rounded chrome from a square
+/// one drawn in a rounded-looking colour.
+///
+/// The desktop is a single colour, so the topmost leftmost pixel that is not it is the corner
+/// of the window nearest the panel's own top left. A frame drawn without antialiasing puts
+/// exactly three colours inside that corner: the desktop, then the frame's edge, then the
+/// body - one hard step from one to the next. Coverage-blended corners instead leave a run of
+/// intermediate colours between them, because a corner pixel is partly inside the shape. Five
+/// distinct colours in a 6x6 square is that run, with room for the pointer not being there at
+/// all; a staircase has three and fails.
+fn check_rounded_corner(path: &Path) -> Result<()> {
+    /// How wide a corner the blend is looked for in. The theme's corner radius is smaller
+    /// than this, and a diagonal fade has to cross it a column at a time.
+    const CORNER: usize = 6;
+    let (width, height, pixels) = read_panel(path)?;
+    let pixel = |x: usize, y: usize| -> [u8; 3] {
+        let index = (y * width + x) * 3;
+        [pixels[index], pixels[index + 1], pixels[index + 2]]
+    };
+    let mut corner = None;
+    'find: for y in 0..height {
+        for x in 0..width {
+            if pixel(x, y) != DESKTOP_COLOUR {
+                corner = Some((x, y));
+                break 'find;
+            }
+        }
+    }
+    let Some((x, y)) = corner else {
+        bail!(
+            "{} is entirely {DESKTOP_COLOUR:?}, so no window was composited onto it",
+            path.display()
+        );
+    };
+    let mut colours = std::collections::HashSet::new();
+    for row in y..(y + CORNER).min(height) {
+        for column in x..(x + CORNER).min(width) {
+            colours.insert(pixel(column, row));
+        }
+    }
+    if colours.contains(&POINTER_COLOUR) {
+        bail!(
+            "the first non-desktop pixel at {x},{y} is the pointer, not a window's corner, so \
+             this check measured the wrong thing"
+        );
+    }
+    if colours.len() < 5 {
+        bail!(
+            "the {CORNER}x{CORNER} corner at {x},{y} holds {} distinct colours ({colours:?}), so \
+             the corner was cut rather than blended",
+            colours.len()
+        );
+    }
+    println!(
+        "pass: the corner at {x},{y} fades through {} colours between the desktop and the frame",
+        colours.len() - 1
     );
     Ok(())
 }

@@ -44,6 +44,12 @@ pub struct Theme {
     pub title_height: u32,
     /// The border's thickness in pixels.
     pub border_width: u32,
+    /// The radius of a window's outer corners, in pixels.
+    ///
+    /// The corners are cut from the *outside* of the frame, so the border keeps its thickness
+    /// through the curve and the title bar's own corners are this minus
+    /// [`border_width`](Self::border_width).
+    pub corner_radius: u32,
     /// Space between the border and the text.
     pub padding: u32,
     /// How far each new window is offset from the one before it.
@@ -70,6 +76,7 @@ pub const GREY: Theme = Theme {
     pointer_edge: Color::new(0x10, 0x14, 0x18),
     title_height: 30,
     border_width: 2,
+    corner_radius: 10,
     padding: 8,
     cascade: 36,
     text_scale: 2,
@@ -185,5 +192,14 @@ mod tests {
         // window's width, or the second one is off the panel.
         assert!(GREY.cascade > 0);
         assert!(GREY.cascade < 64);
+    }
+
+    #[test]
+    fn the_corner_radius_fits_inside_the_chrome_it_is_cut_from() {
+        // At least the border, so the curve does not vanish under the edge colour, and no
+        // more than half the title bar's inner height, so the two top corners cannot meet in
+        // the middle and turn the title bar into a lens.
+        assert!(GREY.corner_radius >= GREY.border_width);
+        assert!(GREY.corner_radius <= GREY.title_height / 2 + GREY.border_width);
     }
 }

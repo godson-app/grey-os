@@ -1464,3 +1464,127 @@ last, the shell raises a window only when the left button goes down, and a host 
 **Open.** A window that is closed rather than exited is still only stated here. QMP can quit a
 guest, but it cannot click the window's close button, so that half of the exit-code rule has no
 test.
+
+## ADR-042: A back buffer, and coverage asked about absolute pixels
+
+**Status:** accepted, M13.
+
+**Context.** Every frame since M7 was painted straight into the firmware's framebuffer. That was
+sound while a shape was a rectangle: filling one, or repainting a damage rect, writes every pixel it
+covers, so what was there before cannot matter. Rounding a corner ends that. An anti-aliased edge is
+a *blend*, and a blend reads the destination - so the same corner painted as one rect and painted as
+two tiles blended against different bytes and came out different colours. The property the
+compositor had been built on, that an incremental frame is the frame a whole repaint would have
+painted, was about to become false for exactly the pixels that were new.
+
+**Decision.** Two things, and they only work together.
+
+A panel-sized `Surface` in ordinary memory - `presenter::Presenter` - holds the desktop and its
+windows; the panel is written by blitting the rects that changed. The destination a blend reads is
+therefore this frame's desktop rather than the last frame's remains, and an incremental frame and a
+whole one start from the same bytes. The pointer is drawn onto the panel *after* the blits and never
+into the buffer: a pointer in the buffer is a pointer a damage repaint cannot erase, because the
+repaint would restore the buffer's own pixels over it. The rect the pointer has left is blitted from
+the buffer, so a pointer that moves is erased by the frame that draws it. `pointer_rect` became
+public for that, so the footprint has one definition rather than two.
+
+The coverage function, `canvas::rounded_rect_coverage`, is asked about each pixel's **absolute**
+position, and the clip narrows the *area* painted and never the shape. That is the other half of the
+invariant: a damage rect covering one corner asks the same question about the same pixel that a whole
+repaint asks, so it gets the same answer. Coverage is sixteen samples a pixel in integer arithmetic,
+with a fast path that returns opaque immediately away from the corners; nothing here needs floating
+point, and the kernel has no `libm` to call if it did.
+
+**Consequences.** Four MiB of ordinary memory at 1280x800, leaked for the life of the run like the
+console's buffer and the desktop itself, and the largest allocation the kernel makes. A failed
+allocation is not fatal: `paint_all` and `redraw` fall back to painting the panel directly - correct
+and slower, exactly what every frame did before this - and the boot log says which of the two
+happened. The panel is written once per damage rect instead of once per pixel, and a whole frame is
+one blit.
+
+The tests changed shape with the decision. A colour spot check cannot see a corner that is one
+shade off in one tile, so the two tests that hold this milestone compare whole panels byte for byte:
+four damage tiles against one frame (`compositor`), and a frame built through the buffer against a
+frame painted straight onto a panel, after a raise, a move and a pointer move (`presenter`). The
+risk this leaves is the one that shape of test always leaves - it proves the two paths agree, not
+that either is right - which is why `theme` also asserts the radius fits inside the chrome it is cut
+from.
+
+**Open.** Per-window surfaces are the next step and the reason the buffer went in first: translucency,
+a real shadow and per-window damage all need a window's pixels somewhere other than the panel, and
+`Canvas::blend_surface` assumes an opaque destination, which is true for the desktop and false for a
+stack of translucent windows. Fades need a frame clock driving repaints, which a boot that paints
+once and exits does not have. And none of this is measured on real hardware: the expectation that a
+rounded edge is cheap is still an expectation.
+
+**Amended (M13 close-out).** The boot *has* now been verified, and the claim above - that the machine
+this was written on produced no serial output for a build known to boot - was about the `--bios` image,
+not about the milestone: on an x86_64 guest on Apple silicon that image's guest halts before the
+kernel writes a byte (QEMU at 0.7% CPU, no serial), while the UEFI image boots, exits cleanly and is
+what `cargo xtask test` runs. On the verified boot the rounded corners are visible in the screenshot
+the harness checks, and the check now requires the blend rather than trusting it: the corner of the
+topmost window must fade through at least five colours between the desktop colour and the frame's.
+The boot also priced the frame, roughly: a whole frame is built with IRQ1 masked for its duration,
+which under TCG is long enough to lose keystrokes typed into the shell the instant it says it is
+listening. That is a bound, not a profile, and it is the reason the harness types one command at a
+time and waits for the echo instead of sending six and hoping.
+
+
+## ADR-043: Free space is derived from the directory, not stored in a sector
+
+**Status:** accepted, M5 (closing an item M5 left open).
+
+**Context.** `greyfs` allocated with a bump pointer: `next_free` in the superblock, raised after every
+write, never lowered. That was enough to prove the format survived a round trip through a real disk,
+and it leaks by construction - replacing a file abandons its old extent, removing one abandons it
+entirely. The visible consequence is the boot counter: one sector lost per boot, which fills a 4 MiB
+device in about eight thousand boots and is invisible in every test shorter than that. M5 wrote the
+leak down as open rather than pretending the allocator was finished, and ROADMAP.md calls fixing it
+the smallest of the outstanding jobs.
+
+The obvious fix is a free list on disk - a bitmap sector, or a run list in the superblock. Both add a
+second record of what is allocated, and a second record of anything is a second thing to lose. The
+crash argument that makes the rest of this filesystem safe is that a write is ordered *data, then
+directory, then superblock*, and that the two reachable states after a crash are "a lost write" and "a
+mount that refuses the disk". A free-list sector would have to be updated inside the same window as
+the directory, which gives a crash a way to leave the free list and the directory disagreeing about
+the same sectors - and, since the free list is what a write trusts, a way to hand out a sector that a
+file is still using.
+
+**Decision.** Free space is not stored. The directory *is* the allocation record: mounting reads the
+entries and marks the sectors each one claims in an in-memory map (`SectorMap`), metadata first. A
+write asks that map for the lowest run of free sectors big enough, writes the data, then the directory
+entry, then - only if the file grew past the high-water mark - the superblock. A removal zeroes the
+slot and clears the run in the map. The next mount rebuilds the same map from the same directory and
+reaches the same answer, so nothing has to be repaired after a crash and there is no second structure
+to fall out of step.
+
+**Consequences.** The leak is gone: the boot counter now alternates between two sectors instead of
+walking the device, and a test rewrites one file fifty times and asserts the sector count never moves.
+Replacing a file allocates the new extent *before* releasing the old one, so the old run cannot be
+handed to the new entry by accident, and a crash between the data write and the directory write leaves
+the previous file intact with the new space free - strictly better than the leak it replaced.
+
+`next_free` stays in the superblock, demoted from allocator state to a high-water mark, and is read by
+exactly one check: an extent above it means the directory outran the superblock, which a mount refuses.
+That keeps the format at version 1, so a disk written by an older build still mounts and reuses space.
+
+The map costs one bit per device sector - a kilobyte for the 4 MiB image - and one pass over 64
+directory slots at mount. Allocation is a first-fit scan, which is O(sectors) per write: 8192
+comparisons on the image this kernel actually formats. That is the whole reason a bitmap is affordable
+here, and it is also the reason this decision does not scale to a large device unchanged - the map is
+per-sector, not per-run.
+
+Three refusals come with it. Two entries claiming one sector are now caught at mount ("two entries
+share a sector"), where before an overlapping extent that stayed below `next_free` mounted happily and
+gave one file another's bytes. A file that does not fit *contiguously* is told so - "the device has no
+contiguous run that long" - rather than being told the disk is full when it is not, because a
+contiguous-extent format with holes has two different reasons to say no. And a write into a hole does
+not touch the superblock at all, so the common case is two transfers and has no second crash window.
+
+**Open.** No compaction: fragmentation is bounded by the largest free run, and a file cannot grow in
+place - a bigger file is a new extent and the old one is released. The boot log's "sectors in use" is
+now derived from the directory rather than read from `next_free`, which is why its values changed
+while its meaning did not. And the map is rebuilt by reading the directory, so a directory sector
+damaged in a way that keeps its entries decodable is what free space believes; the seal covers the
+superblock, not the directory.

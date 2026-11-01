@@ -19,7 +19,7 @@ milestone, so that this file never claims more than was agreed.
 | M2        | Interrupts, exceptions, timers               | **Done** - criteria met; PIC stays until an APIC (ADR-028) |
 | M3        | Physical and virtual memory management       | **Done** - criteria met; guard page armed (ADR-029)        |
 | M4        | Heap allocation and kernel data structures   | **Done** - criteria 1-5 met; stretch tree open (ADR-031)   |
-| M5        | Storage: disk driver and filesystem          | **Done** - criteria 1-6 met; no free list yet (ADR-032)     |
+| M5        | Storage: disk driver and filesystem          | **Done** - criteria 1-6 met; free space derived (ADR-043)  |
 | M6        | Input: keyboard and pointer                  | **Done** - criteria 1-5 met; no repeat or keymaps (ADR-033) |
 | M7        | Compositor, windows, theme                   | **Done** - criteria 1-5 met; TrueType still open (ADR-034) |
 | M8        | Shell and process model                      | **Done** - criteria 1-5 met; cooperative (ADR-035)          |
@@ -27,6 +27,7 @@ milestone, so that this file never claims more than was agreed.
 | M10       | SMP, ports, polish                           | **Done** - criteria 1-5 met; APs not started (ADR-037)     |
 | M11       | Hardening before the next primitive          | **Done** - one lock type, one CI command (ADR-038)         |
 | M12       | User mode: ring 3, a syscall gate            | **Done** - 3 programs run, 1 killed by the CPU (ADR-040)   |
+| M13       | Raster foundation: rounded chrome, back buffer | **Done** - blended corners on a real panel (ADR-042)      |
 
 ## M0 - Boot, serial diagnostics, diagnosable panics
 
@@ -445,6 +446,13 @@ harness only creates the file.
       and `open`, which formats *only* a sector of zeros.
 - [x] Writes ordered data, then directory, then superblock, so the two ways a crash can leave the
       disk are a lost write and a mount that refuses it - never a file pointing at live sectors.
+- [x] The free list (ADR-043): free space is derived from the directory rather than stored, so a
+      removal returns its extent and a replacement's old run comes back to the next write. The map is
+      one bit per sector, rebuilt from the 64 slots at every mount, and allocation is first fit from
+      the bottom - a write into a hole does not touch the superblock at all. `next_free` survives as
+      a high-water mark that only the mount reads, which is what keeps the format at version 1.
+- [x] The refusal the map adds: two entries claiming one sector are caught at mount. Before it, an
+      overlapping extent below `next_free` mounted happily and one file read another's bytes.
 - [x] `port.rs`: `inb`, `outb`, `inw`, `outw`, `insw`, `outsw` and `io_wait`, each one `unsafe`
       block with its promise written down, so the drivers after this one do not grow their own.
 - [x] `xtask` creates the data image under `target/` (4 MiB of zeros) and attaches it as the primary
@@ -455,10 +463,11 @@ harness only creates the file.
       second time and asserts a mount of generation 1, a counter that reads `boot 2`, and the
       *absence* of the format line - a kernel that re-formatted would pass every other assertion.
 
-**Open.** No free list, so replacing a file leaks its extent and removing one leaks it entirely. No
-directories, permissions, timestamps or file growth in place. No write-cache flush: the driver waits
-for busy to drop, which is not `FLUSH CACHE`. The ATA slave and the secondary channel are not probed.
-The directory is fixed at 64 slots. `pic`, `serial` and `timer` still spell their own `outb`.
+**Open.** No compaction, so a fragmented disk can refuse a file that would fit if its free sectors were
+contiguous - and the refusal says which of the two happened. No directories, permissions, timestamps
+or file growth in place. No write-cache flush: the driver waits for busy to drop, which is not
+`FLUSH CACHE`. The ATA slave and the secondary channel are not probed. The directory is fixed at 64
+slots. `pic`, `serial` and `timer` still spell their own `outb`.
 
 **Acceptance criteria.**
 
@@ -479,16 +488,16 @@ The directory is fixed at 64 slots. `pic`, `serial` and `timer` still spell thei
 grey-os: ata: primary master "QEMU HARDDISK", 8192 sectors of 512 bytes
 grey-os: greyfs: no filesystem, formatted 8192 sectors with 64 directory slots
 grey-os: greyfs: wrote /boot-count (15 bytes at sector 5), read back and compared
-grey-os: storage ok: boot 1 of this image, 1 file(s), 6 of 8192 sectors in use
+grey-os: storage ok: boot 1 of this image, 4 file(s), 9 of 8192 sectors in use
 ```
 
 and the second boot, which is the persistence phase of `cargo xtask test`:
 
 ```text
 grey-os: ata: primary master "QEMU HARDDISK", 8192 sectors of 512 bytes
-grey-os: greyfs: mounted generation 1, 1 file(s), 6 of 8192 sectors in use
-grey-os: greyfs: wrote /boot-count (15 bytes at sector 6), read back and compared
-grey-os: storage ok: boot 2 of this image, 1 file(s), 7 of 8192 sectors in use
+grey-os: greyfs: mounted generation 1, 4 file(s), 9 of 8192 sectors in use
+grey-os: greyfs: wrote /boot-count (15 bytes at sector 9), read back and compared
+grey-os: storage ok: boot 2 of this image, 4 file(s), 9 of 8192 sectors in use
 ```
 
 Criterion 2 is the second line: 64 slots is `fs::MAX_ENTRIES`, and the format wrote all four
@@ -496,7 +505,13 @@ directory sectors. Criterion 3 is the third line's `read back and compared`, whi
 what `Filesystem::read` returned against the bytes that went in. Criterion 4 is the second block: the
 mount's generation is one because the first boot wrote generation zero, the counter read `boot 1` and
 is now `boot 2`, and the format line is absent - asserted, not merely not looked for. Criterion 5 is
-26 host tests, 8 in `disk` and 18 in `fs`. Tests: 162 on the host.
+31 host tests, 8 in `disk` and 23 in `fs`. Tests: 299 on the host.
+
+The sector numbers in the second block are the free list working (ADR-043). The counter is allocated
+sector 9 because sector 5 is still held by the entry being replaced at that moment, and the count stays
+at 9 because the old extent goes back to the map as soon as the directory names the new one. Before
+the free list the same two boots read `6 of 8192` and `7 of 8192`: one sector further into the device
+per boot, for ever.
 
 ## M6 - Input: keyboard and pointer
 
@@ -976,7 +991,76 @@ switch away from a running program. There is no user-space toolchain - the three
 assembly blobs in the kernel's read-only data - no `fork`, no file system in the syscall ABI, and two
 arguments per call. ADR-040 records each of those as the next milestone's work rather than a gap.
 
-## After M10 - what is not done
+## M13 - Raster foundation
+
+The desktop could fill rectangles and draw strings, and a window was a rectangle with square
+corners. M13 is the layer under that: a panel-sized buffer in ordinary memory that a frame is built
+in, and a coverage function that lets a shape have an edge which is neither a rectangle nor a
+staircase - without either of those costing the property the compositor was built on, that a frame
+painted as damage rects is the frame a whole repaint would have painted.
+
+**Delivered.**
+
+1. `canvas`: `Corners` (a radius per corner), `rounded_rect_coverage` - sixteen samples per pixel,
+   integer arithmetic only, no floating point and no `libm` - and `Canvas::blend_where`, which asks
+   the coverage function about each pixel's *absolute* position inside the area being painted.
+2. `surface`: an owned offscreen `Surface`, so a drawing operation no longer needs a borrow of the
+   panel, plus `blend_surface`/`composite_onto` for source-over between two of them.
+3. `theme`: `corner_radius`, with its constraints as a test - at least the border, so the curve
+   cannot vanish under the edge colour, and no more than half the title bar, so the two top corners
+   cannot meet in the middle.
+4. `compositor`: the frame, the border, the title bar and the body are four rounded shapes whose
+   radii nest - `radius`, then `radius - border` - and the title bar and body are square where they
+   meet, so the seam between them is a straight line instead of a notch.
+5. `presenter`: the back buffer. A frame is built in it and blitted onto the panel in whole rows;
+   the pointer is drawn onto the panel afterwards, never into the buffer, and the rect it has left
+   is blitted from the buffer - so a pointer that moves is erased by the same frame that draws it.
+
+**Acceptance.** `cargo test --package kernel --lib` holds the claims that matter, and the two that
+carry the milestone are whole-panel byte comparisons rather than colour spot checks: a damage rect
+over a corner paints what a whole frame paints (`compositor`, four tiles versus one frame), and a
+frame built through the back buffer is the picture painted straight onto a panel - including one
+painted as damage after a raise, a move and a pointer move (`presenter`). A third test says the
+corner is *blended* and not merely cut: inside the frame's own border band - which nothing but the
+outer shape paints - there is at least one pixel that is neither the desktop nor the edge colour,
+which a staircase cannot produce. All green with the rest of the suite.
+
+`cargo xtask test` now covers the same claim on a real panel, and this is what closed the milestone.
+The screenshot the input phase takes is checked for a fourth thing: the topmost leftmost pixel that is
+not the desktop is a window's corner, and the 6x6 square at it has to hold at least five distinct
+colours - the run of partial coverage between the desktop and the frame - where a square corner would
+hold three (desktop, edge, body) and fail. It passes with seven, and the boot reports the panel it was
+looking at:
+
+```text
+pass: the corner at 46,40 fades through 7 colours between the desktop and the frame
+pass: 1280x800 screenshot, 56 distinct colours, 77 pointer pixels, saved to target/grey-os/desktop.ppm
+grey-os: compositor: desktop composited in a 4000 KiB back buffer
+grey-os: compositor ok: 4 damage rects merged into 2, pointer drawn at 640,400, 8 frame(s)
+```
+
+**What verifying it cost.** The boot was verified on the UEFI image, which is the one `cargo xtask
+test` boots. The earlier `--bios` image is the one that produces no serial output on an x86_64 guest
+on Apple Silicon: QEMU sits at 0.7% CPU on it, so its guest is halted before the kernel writes a byte,
+and that says nothing about this milestone - the same kernel boots and exits cleanly under OVMF. So
+`--bios` is the outstanding item, not M13.
+
+The first thing the verified boot found was a real cost, and it is the only measurement of a frame
+this milestone has. A frame is built while `PRESENTER`'s interrupt mutex is held, so IRQ1 is not
+serviced for the length of one; under TCG that is long enough that keystrokes typed into the shell
+immediately after `shell: listening` are lost in the keyboard controller's own buffer, before the
+kernel's queue exists. The shell phase now waits for the guest to go silent and types one command at a
+time, waiting for the echo and re-typing - visibly - if it never comes. That is a harness fix over an
+emulation-speed symptom, and it is deliberately not a claim that the frame is cheap: on hardware the
+same window is milliseconds, which is still long enough to lose a keystroke from a fast typist, and the
+fix for that is a paint that does not mask interrupts for a whole frame, not a longer pause.
+
+**Not done, and stated as open.** Per-window offscreen surfaces, drop shadows, fade animations and a
+pointer that is itself a surface are all next, all want this buffer to exist first, and none of them
+changes a pixel until there is something translucent to composite. `blend_where` walks the pixels of a
+rounded edge and its cost is still not a number from real hardware - the finding above is a bound on
+how long a whole frame takes, not a profile of the edge. And `blend_surface` still assumes an opaque
+destination, which is true for the desktop and false for a stack of translucent windows.
 
 The brief's list ends at M10, so this section is no longer a transcription of agreed scope: it is the
 `Open` list of the ten ADRs, gathered in dependency order. Nothing here is agreed and nothing here
@@ -988,8 +1072,9 @@ there, and what everything after this assumes, is preemption (a full interrupt f
 per-CPU state) - a program that can be switched away from rather than only entered - and a loader
 that reads an image the kernel did not write. Then an APIC and IOAPIC driver, which makes the PIC and
 its five ignored source overrides a thing of the past; then a real TCP/IP stack or a USB stack, both
-of which need DMA and a device model this kernel does not have. Storage is one extent per file with
-no free-space reuse, and fixing that is a smaller job than any of the above.
+of which need DMA and a device model this kernel does not have. Storage is one contiguous extent per
+file in a fixed 64-slot directory: free space is reused now (ADR-043), but there is no compaction and
+no growth in place, and a direct-mapped cache is what a second read of the same file would need.
 
 Two items already have a home when their milestone opens: TrueType rasterisation, with the face
 question it drags along, belongs to M7 (ADR-027); and the framebuffer's physical span, which would
@@ -1001,11 +1086,19 @@ make ADR-021's heap guard bite, is now part of M3 above.
 | ------------------------ | ----------------------------------------------------------------- |
 | QEMU UEFI (OVMF), x86_64 | Primary target. Boots, logs, exits cleanly.                       |
 | QEMU UEFI, 1280x800      | What OVMF actually selects; the kernel logs whatever it is given. |
-| QEMU BIOS (SeaBIOS)      | Boots to the kernel, which refuses VBE's 24-bit surface (ADR-009). |
+| QEMU BIOS (SeaBIOS)      | Boots under SeaBIOS, refusing VBE's 24-bit surface (ADR-009) -    |
+|                          | except on x86_64-on-Apple-silicon, where the guest halts there.    |
 | Real x86_64 hardware     | **Not ready.** The UEFI image boots from the root of a FAT32      |
 
-stick with secure boot disabled, but with no filesystem or storage driver there is
-nothing to persist and no installer. Deferred until M5. |
+stick with secure boot disabled, and since M5 there is a filesystem and an ATA PIO driver, so
+data does persist on a machine whose controller answers that interface. What is missing is an
+installer, and a way to boot from a stick this repository writes.
+
+One target is not exercised by `cargo xtask test`, which boots the UEFI image: `run --bios` produces
+**no serial output at all** on an x86_64 guest on Apple silicon (QEMU 11.1.2, TCG) and its process sits
+at 0.7% CPU, so the guest is halted rather than slow, before the kernel's first byte. The same kernel,
+on the same drives, boots and exits cleanly under OVMF - so the fault is in the image's BIOS path and
+not in the kernel, and it is not yet diagnosed.
 
 A dual-boot machine's existing bootloader and partitions must survive every step:
 no tool in this repository writes to a disk other than an image file under `target/`.

@@ -24,7 +24,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::canvas::{Canvas, Color, Rect};
+use crate::canvas::{rounded_rect_coverage, Canvas, Color, Corners, Rect};
 use crate::text;
 use crate::theme::Theme;
 use crate::window::{Window, Windows};
@@ -123,7 +123,11 @@ impl Compositor {
 
 /// The rect a pointer at `(x, y)` covers: sixteen rows tall, and as wide as the widest of
 /// them plus the outline.
-fn pointer_rect(x: i32, y: i32) -> Rect {
+///
+/// Public because a back buffer erases the pointer by blitting this rect from the desktop it
+/// holds, and the presenter has to name the same footprint the drawing code uses - a second
+/// copy of the arithmetic is a second thing to forget to change.
+pub fn pointer_rect(x: i32, y: i32) -> Rect {
     const HEIGHT: i32 = 16;
     Rect::new(x, y, (HEIGHT * 2 / 3) as u32 + 2, HEIGHT as u32)
 }
@@ -155,23 +159,35 @@ impl Compositor {
         let theme = self.theme;
         let frame = window.rect;
         let border = theme.border_width;
+        let radius = theme.corner_radius;
         let edge = if focused {
             theme.edge_focused
         } else {
             theme.edge
         };
-        fill(canvas, frame, edge, clip);
+        // The corners come off the outside of the frame, so the border keeps its thickness all
+        // the way round the curve.
+        blend_shape(canvas, frame, Corners::uniform(radius), edge, clip);
 
-        // The title bar sits inside the border.
-        let title_bar = Rect::new(
+        // Everything inside the border, with its corners a border-width tighter than the
+        // frame's: that is what nests the title bar and body inside the curve instead of
+        // letting them cut across it.
+        let inner = Rect::new(
             frame.x + border as i32,
             frame.y + border as i32,
             frame.width.saturating_sub(border * 2).max(1),
-            theme.title_height,
+            frame.height.saturating_sub(border * 2).max(1),
         );
-        fill(
+        let inner_radius = radius.saturating_sub(border);
+
+        // The title bar is round at the top, where it meets the frame, and square at the
+        // bottom, where it meets the body. Square-on-square is what keeps the seam between
+        // them a straight line with no notch in the middle of the window.
+        let title_bar = Rect::new(inner.x, inner.y, inner.width, theme.title_height);
+        blend_shape(
             canvas,
             title_bar,
+            Corners::new(inner_radius, inner_radius, 0, 0),
             if focused {
                 theme.title_focused
             } else {
@@ -196,17 +212,21 @@ impl Compositor {
             clip,
         );
 
-        // The body fills what is left inside the border, below the title bar.
+        // The body fills what is left inside the border, below the title bar: square at the
+        // top where the title bar meets it, round at the bottom for the frame's curve.
         let body = Rect::new(
-            frame.x + border as i32,
+            inner.x,
             title_bar.y + title_bar.height as i32,
-            frame.width.saturating_sub(border * 2).max(1),
-            frame
-                .height
-                .saturating_sub(theme.title_height + border * 2)
-                .max(1),
+            inner.width,
+            inner.height.saturating_sub(theme.title_height).max(1),
         );
-        fill(canvas, body, theme.window, clip);
+        blend_shape(
+            canvas,
+            body,
+            Corners::new(0, 0, inner_radius, inner_radius),
+            theme.window,
+            clip,
+        );
 
         let (columns, rows) = theme.body_cells(frame.width, frame.height);
         let text_x = body.x + theme.padding as i32;
@@ -244,6 +264,31 @@ fn fill(canvas: &mut Canvas<'_>, rect: Rect, color: Color, clip: Option<Rect>) {
         None => rect,
     };
     canvas.fill_rect(rect, color);
+}
+
+/// Fills `shape` with `color` through a rounded-rectangle coverage function, clipped to `clip`.
+///
+/// The clip narrows the *area* painted, never the shape: the coverage function is asked about
+/// each pixel's absolute position, so a damage rect covering only one corner still lands the
+/// same arc a full repaint would have. That is what keeps an incremental frame identical to a
+/// whole one.
+fn blend_shape(
+    canvas: &mut Canvas<'_>,
+    shape: Rect,
+    corners: Corners,
+    color: Color,
+    clip: Option<Rect>,
+) {
+    let area = match clip {
+        Some(clip) => match intersection(shape, clip) {
+            Some(inside) => inside,
+            None => return,
+        },
+        None => shape,
+    };
+    canvas.blend_where(area, color, |x, y| {
+        rounded_rect_coverage(shape, corners, x, y)
+    });
 }
 
 /// Draws `text` at `(x, y)`, stopping at the clip's right edge when there is one.
@@ -365,24 +410,68 @@ mod tests {
         let frame = desktop.windows.window(id).expect("window").rect;
         desktop.draw_all(&mut surface.canvas());
 
-        // The outermost pixel of the frame is the edge, and it is the focused colour because
-        // a new window has focus.
+        // The corners are rounded: the true corner of the frame is desktop, because the quarter
+        // circle cuts it away, which is the difference between this and a square frame.
         assert_eq!(
             surface.pixel(frame.x as usize, frame.y as usize),
-            GREY.edge_focused
+            GREY.desktop
         );
+        // The middle of the left edge is the edge colour, and it is the focused colour because
+        // a new window has focus.
+        let edge_y = frame.y as usize + frame.height as usize / 2;
+        assert_eq!(surface.pixel(frame.x as usize, edge_y), GREY.edge_focused);
         // Inside the edge and inside the title bar.
         let title_x = frame.x as usize + GREY.border_width as usize + 4;
         let title_y = frame.y as usize + GREY.border_width as usize + 4;
         assert_eq!(surface.pixel(title_x, title_y), GREY.title_focused);
-        // The bottom of the body, below the last line of text, is the window's own colour.
-        let body_x = frame.x as usize + frame.width as usize - 4;
+        // The bottom of the body, below the last line of text and clear of the rounded
+        // corners, is the window's own colour.
+        let body_x = frame.x as usize + frame.width as usize / 2;
         let body_y = frame.y as usize + frame.height as usize - 4;
         assert_eq!(surface.pixel(body_x, body_y), GREY.window);
+        // Between the outer curve and the title bar's own curve the frame's edge shows through:
+        // the border is the same thickness around the corner as it is along the sides.
+        assert_eq!(
+            surface.pixel(frame.x as usize + 3, frame.y as usize + 3),
+            GREY.edge_focused
+        );
         // The pixel just outside the frame is still the desktop.
         assert_eq!(
             surface.pixel(frame.x as usize + frame.width as usize, frame.y as usize),
             GREY.desktop
+        );
+    }
+
+    #[test]
+    fn the_rounded_corner_is_blended_rather_than_a_staircase() {
+        // A corner rounded by skipping whole pixels would leave every pixel of it either the
+        // desktop or the edge colour: the arc would be a staircase. Coverage is sixteen samples
+        // a pixel, so the frame's own border band has to hold at least one pixel that is a blend
+        // of the two. The band is what makes the claim unambiguous: the inner rectangle starts a
+        // border further in, so nothing else paints there.
+        let (mut desktop, mut surface) = compositor();
+        let id = desktop.create("log", lines("hello"), 200, 150);
+        let frame = desktop.windows.window(id).expect("window").rect;
+        desktop.draw_all(&mut surface.canvas());
+
+        let (radius, border) = (GREY.corner_radius, GREY.border_width);
+        let mut blended = 0;
+        for dy in 0..radius {
+            for dx in 0..radius {
+                if dx >= border && dy >= border {
+                    continue;
+                }
+                let x = frame.x as usize + dx as usize;
+                let y = frame.y as usize + dy as usize;
+                let colour = surface.pixel(x, y);
+                if colour != GREY.desktop && colour != GREY.edge_focused {
+                    blended += 1;
+                }
+            }
+        }
+        assert!(
+            blended > 0,
+            "every pixel of the corner is the desktop or the edge, so the arc is a staircase"
         );
     }
 
@@ -443,7 +532,37 @@ mod tests {
         // Two rects that do not overlap.
         assert_eq!(damage.len(), 2, "{damage:?}");
         assert_eq!(surface.pixel(15, 15), GREY.desktop);
-        assert_eq!(surface.pixel(200, 150), GREY.edge_focused);
+        // The middle of the window's left edge, away from the rounded corners. The window is
+        // 120 tall and was moved to y = 150, so its left edge runs to y = 210.
+        assert_eq!(surface.pixel(200, 210), GREY.edge_focused);
+    }
+
+    #[test]
+    fn a_damage_rect_over_a_corner_paints_what_a_whole_frame_would() {
+        // The same rounded frame painted twice: once in one call, once in four clipped calls
+        // that tile it. Because the coverage function is asked about absolute pixels rather
+        // than positions inside the clip, the two surfaces must agree byte for byte, including
+        // the anti-aliased arc. This is the invariant that lets damage rectangles exist.
+        let shape = Rect::new(10, 10, 40, 40);
+        let corners = Corners::uniform(10);
+        let mut whole = Surface::new(60, 60);
+        blend_shape(&mut whole.canvas(), shape, corners, Color::WHITE, None);
+        let mut tiled = Surface::new(60, 60);
+        for clip in [
+            Rect::new(10, 10, 20, 20),
+            Rect::new(30, 10, 20, 20),
+            Rect::new(10, 30, 20, 20),
+            Rect::new(30, 30, 20, 20),
+        ] {
+            blend_shape(
+                &mut tiled.canvas(),
+                shape,
+                corners,
+                Color::WHITE,
+                Some(clip),
+            );
+        }
+        assert_eq!(whole.pixels, tiled.pixels);
     }
 
     #[test]
@@ -522,14 +641,14 @@ mod tests {
         let id = desktop.create("log", lines(&"x".repeat(120)), 120, 120);
         let frame = desktop.windows.window(id).expect("window").rect;
         desktop.draw_all(&mut surface.canvas());
-        // The last pixel of the frame is still the frame's colour, not a glyph from the line
-        // that ran past it.
+        // The right edge of the frame, halfway down and clear of the rounded corners, is still
+        // the frame's colour, not a glyph from the line that ran past it.
         let x = frame.x as usize + frame.width as usize - 1;
-        let y = frame.y as usize + frame.height as usize - 1;
-        let pixel = surface.pixel(x, y);
-        assert!(
-            pixel == GREY.edge_focused || pixel == GREY.window,
-            "a clipped line painted {pixel:?} over the frame"
+        let y = frame.y as usize + frame.height as usize / 2;
+        assert_eq!(
+            surface.pixel(x, y),
+            GREY.edge_focused,
+            "a clipped line painted over the frame"
         );
     }
 }

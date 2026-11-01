@@ -18,14 +18,14 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 
 ## Current state
 
-Twelve milestones, each with its own record in `DECISIONS.md` and its acceptance run in `ROADMAP.md`.
+Thirteen milestones, each with its own record in `DECISIONS.md` and its acceptance run in `ROADMAP.md`.
 
 - [x] **M0** Boot, serial diagnostics, diagnosable panics: UEFI through the `bootloader` crate, COM1 at 115200 8N1, a panic handler that reports to serial and paints the panel (ADR-023)
 - [x] **M1** Display, text and an on-screen boot log: the 8x8 font at an integer scale, a character grid, and a back buffer the panel only receives repaints of (ADR-024, ADR-025, ADR-026)
 - [x] **M2** Interrupts, exceptions and the timer: GDT/TSS, IDT, the 8259s remapped, the PIT at 100 Hz, and five injected faults with their own reports (ADR-028)
 - [x] **M3** Physical and virtual memory: a page-table walker, a frame allocator over a bitmap, the kernel's own `CR3`, and a heap guard that is never armed because nothing maps past the arena (ADR-029, ADR-030)
 - [x] **M4** Heap allocation: an arena of frames, free lists per size class, checked frees, `Vec`/`String` on top (ADR-031)
-- [x] **M5** Storage: an ATA drive polled through its ports, and `greyfs` - a format with a sealed superblock, a directory and one extent per file (ADR-032)
+- [x] **M5** Storage: an ATA drive polled through its ports, and `greyfs` - a format with a sealed superblock, a directory, one extent per file and free space derived from the directory rather than stored (ADR-032, ADR-043)
 - [x] **M6** Input: the 8042 carrying both the keyboard and the pointer, named scancodes, three-byte PS/2 packets (ADR-033)
 - [x] **M7** Compositor, windows and theme: a theme made of numbers, windows in list order, damage as a list of rects, a pointer drawn last (ADR-034)
 - [x] **M8** Shell and process model: cooperative round-robin over eight slots with real 32 KiB stacks, a parser and a line editor, and a shell over the real filesystem (ADR-035)
@@ -33,6 +33,7 @@ Twelve milestones, each with its own record in `DECISIONS.md` and its acceptance
 - [x] **M10** What the machine is: ACPI read for the CPU count, the IOAPIC and the interrupt overrides, a `cpus` command, `run` for programs, and a README that matches (ADR-037)
 - [x] **M11** Hardening before the next primitive: one `InterruptMutex` in place of seven ad-hoc `unsafe impl Sync`s, a `cargo xtask ci` that runs every gate, a release profile that aborts instead of unwinding, and a headless harness that no longer hangs on an inherited stdin (ADR-038)
 - [x] **M12** User mode: ring 3 through the user selectors and `TSS.RSP0`, a page table per program shared at the top level, `int 0x80` as the one DPL 3 gate with write/exit/sleep, and a fault in a program that kills the program rather than the kernel (ADR-040)
+- [x] **M13** Raster foundation: a panel-sized back buffer in ordinary memory that the presenter blits in whole rows, sixteen-sample coverage for corners that blend instead of stepping, and a harness that checks the blend on a real panel (ADR-042)
 
 Not there yet, in the order they matter: preemption of ring 3, ELF loading, a user-space toolchain,
 application processors, an APIC/IOAPIC driver, networking.
@@ -180,9 +181,12 @@ desktop own the screen while the log continues on serial.
 M5 puts a disk behind the ports: an ATA drive driven by polling its status register, and `greyfs`
 over it, with a superblock sealed by an FNV-1a hash, a directory of 64 entries and file data above
 it. The boot writes `/boot-count` and reads it straight back, so the next boot's `boot 2` is
-evidence about the disk rather than about this boot. A file is one extent: replacing or removing one
-leaks its sectors until a free-space pass exists, which is written down rather than hidden. See
-ADR-032.
+evidence about the disk rather than about this boot. A file is one extent, and free space is derived
+from the directory rather than stored, so removing a file gives its sectors back - the counter
+overwrites its own old extent and the used count stays put instead of growing by a sector a boot. The
+map is rebuilt at every mount, which is why a crash needs no repair pass, and the mount refuses a
+directory whose extents overlap. There is still no compaction and no growth in place. See ADR-032 and
+ADR-043.
 
 M6 makes the inputs work. The 8042 carries both devices - the keyboard on IRQ1 with translation on
 so set 1 scancodes arrive, the pointer on IRQ12 through the cascade - and the kernel keeps a queue of
@@ -215,6 +219,15 @@ started` because that is the truth, and ADR-037 lists what starting them would n
 are a `cpus` command, and `run fib` loads `apps/fib.gvm` from the disk and interprets it in the
 shell's window.
 
+M13 is the layer under the drawing: a panel-sized buffer in ordinary memory that a frame is built in,
+so a repaint blends against the buffer's pixels rather than whatever the panel happened to hold. A
+corner is sixteen samples of coverage per pixel, integer arithmetic only, and the edge colour is
+blended in by that fraction - a shape can have an edge which is neither a rectangle nor a staircase.
+The frame a damage repaint paints is still byte-for-byte the frame a whole repaint paints, and
+`cargo xtask test` now asserts the blend on the real panel rather than trusting it: the first pixel
+that is not the desktop is a window's corner, and the 6x6 square there must hold at least five
+colours between the desktop and the frame, which a square corner cannot. See ADR-042.
+
 Because the kernel exits through QEMU's `isa-debug-exit` device, the QEMU window closes as soon as
 boot finishes and `cargo run` exits with status 0. The preview above is the exception: its shell
 waits for a command, so the window stays until `exit` or a closed window. A panic prints its message
@@ -245,9 +258,10 @@ than waiting forever. It runs fourteen phases over one deterministic disk:
    back the counter as `boot 2`.
 3. **The input path**, which rebuilds the kernel with `GREY_OS_INPUT_TEST=1` and drives a running
    guest through QEMU's monitor and QMP socket: four keys typed and each asserted on serial, a
-   relative pointer movement decoded, a screenshot taken and checked for the desktop's colour and
-   the pointer's pixels, and five commands typed into the shell - `ls`, `mem`, `cpus`, `run fib`,
-   `run nope` - with each answer and `exit` asserted.
+   relative pointer movement decoded, a screenshot taken and checked for the desktop's colour, the
+   pointer's pixels and the blend at the first window's corner - five distinct colours or more across
+   a 6x6 square, which a square corner cannot produce - and five commands typed into the shell - `ls`,
+   `mem`, `cpus`, `run fib`, `run nope` - with each answer and `exit` asserted.
 4. **The preview**, rebuilt with `GREY_OS_INTERACTIVE=1`, which is the kernel a person types into:
    the panel is photographed the moment the shell says it is listening and has to still hold the
    desktop - the boot log paints on serial only once the first frame is up, so a band of the shell
@@ -263,10 +277,10 @@ than waiting forever. It runs fourteen phases over one deterministic disk:
 
 The images are then rebuilt without the flags, so a phase that failed leaves nothing behind that
 would make the next `cargo xtask run` baffling. `--no-build` skips the nested `cargo build` for
-`build` and `run`; `test` refuses it, since the flags have to be compiled in. `--bios` boots the BIOS
-image instead (built, never verified - see `ROADMAP.md`). `--interactive` is `run`'s alone and, like
-the failure flags, is compiled in: it builds the preview kernel and refuses `--no-build` for the same
-reason `test` does.
+`build` and `run`; `test` refuses it, since the flags have to be compiled in. `--bios` boots the
+BIOS image instead, which builds but whose guest halts before the kernel writes a byte on Apple
+silicon (see `ROADMAP.md`). `--interactive` is `run`'s alone and, like the failure flags, is
+compiled in: it builds the preview kernel and refuses `--no-build` for the same reason `test` does.
 
 To watch the panic path yourself, including the red panel:
 
@@ -331,15 +345,17 @@ grey-os/
     └── src/
         ├── main.rs        # entry point, boot sequence, tasks, shell executor, panic handler
         ├── lib.rs         # module list: what the host tests can reach
-        ├── canvas.rs      # geometry, one Colour, fill/blend/scroll/blit
+        ├── canvas.rs      # geometry, one Colour, fill/blend/scroll/blit, coverage (ADR-042)
         ├── font.rs        # public-domain 8x8 bitmaps, printable ASCII (ADR-024)
         ├── text.rs        # glyph drawing at an integer scale, metrics
         ├── console.rs     # character grid: cursor, wrapping, scrolling (ADR-025)
         ├── display.rs     # console instance, back buffer, panel repaint, panic screen
         ├── framebuffer.rs # boot-info framebuffer -> Canvas adapter
-        ├── theme.rs       # the theme as numbers: colours, padding, title height (ADR-034)
+        ├── surface.rs     # an owned offscreen buffer, source-over between two of them (ADR-042)
+        ├── theme.rs       # the theme as numbers: colours, padding, title height, corner radius (ADR-034, ADR-042)
         ├── window.rs      # one window: a rect, a title and lines
-        ├── compositor.rs  # the desktop: window list, focus, damage rects, pointer
+        ├── compositor.rs  # the desktop: window list, focus, damage rects, rounded shapes, pointer (ADR-034, ADR-042)
+        ├── presenter.rs   # the frame: the back buffer, damage into it, the pointer on the panel (ADR-042)
         ├── memory.rs      # memory map, the bootstrap region's selection
         ├── sync.rs        # the one interior-mutability cell and its interrupt guard (ADR-038)
         ├── heap.rs        # bump allocator: the bootstrap only (ADR-021, ADR-031)
@@ -352,7 +368,7 @@ grey-os/
         ├── timer.rs       # the PIT at 100 Hz and its tick counter (ADR-028)
         ├── port.rs        # `in`/`out`, documented once instead of once per driver
         ├── disk.rs        # the ATA drive in PIO mode, sectors and `Block` (ADR-032)
-        ├── fs.rs          # `greyfs`: superblock, directory, extents, the seal (ADR-032)
+        ├── fs.rs          # `greyfs`: superblock, directory, extents, the seal, the free map (ADR-032, ADR-043)
         ├── keyboard.rs    # the 8042's keyboard: set 1 scancodes to named keys (ADR-033)
         ├── mouse.rs       # the 8042's pointer: three-byte packets (ADR-033)
         ├── scheduler.rs   # eight slots, 32 KiB stacks, the cooperative switch (ADR-035)
@@ -360,6 +376,7 @@ grey-os/
         ├── vm.rs          # `GVM1`: the program format and the stack machine (ADR-036)
         ├── apps.rs        # the three programs the kernel writes to the disk (ADR-036)
         ├── acpi.rs        # RSDP, root table and MADT: what the machine is (ADR-037)
+        ├── usermode.rs    # ring 3 contexts, the DPL 3 gate, per-program page tables (ADR-040)
         ├── serial.rs      # COM1 console
         └── qemu.rs        # exit codes through `isa-debug-exit`
 ```
