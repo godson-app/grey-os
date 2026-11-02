@@ -1588,3 +1588,74 @@ now derived from the directory rather than read from `next_free`, which is why i
 while its meaning did not. And the map is rebuilt by reading the directory, so a directory sector
 damaged in a way that keeps its entries decodable is what free space believes; the seal covers the
 superblock, not the directory.
+
+## ADR-044: The desktop shell is furniture, a state machine and a column of widgets
+
+**Status:** accepted, M14.
+
+**Context.** Since M7 the screen held a list of windows, a pointer drawn last, and nothing else. A
+window was a rectangle with a title bar whose buttons were painted but not pressable - no code mapped
+a point onto them - and the space around the windows was flat theme colour. Three things were missing
+and they are not the same thing: the *furniture* (what the desktop is made of), the *pointer's
+meaning* (what a press does), and the *content* (what a window is made of). M7's compositor owned all
+three by default, which is why it had grown past a thousand lines and why the drawing code and the
+hit-testing code were the same functions reading the same rects twice.
+
+The tempting shape was one `Desktop` type that owned everything and answered everything. It would have
+put the wall and the window list in one struct, made every test of furniture carry a window list, and
+given the pointer loop a method for each of its four transitions. The shape that was chosen is the
+one the kernel already uses elsewhere: small modules that own one question each, and geometry that
+comes from the theme so there is only ever one answer.
+
+**Decision.** Three modules, one per question, and the compositor keeps only what is drawing.
+
+*Furniture* is `desk`. It is a value: the panel's height, the dock's, the launcher's tiles, computed
+from the theme when the desktop is created. It paints itself and answers `hit` - a launcher index, a
+dock window id, the panel, or the wallpaper - and it knows nothing about drawing order or focus. A
+`Desk` cannot be pressed; it can only be asked what a point is.
+
+*The pointer's meaning* is `wm::Session`, a state machine with four transitions: `press`, `moved`,
+`release`, and the classification `target` that all three share. `press` classifies the point against
+the same `theme.title_rect`/`close_rect`/`edge` rects the compositor paints from, raises whatever it
+landed on, and takes a `Grab`: a title bar with the offset inside the frame, an edge with the frame it
+started from, or nothing. The grab is the whole reason this is a state machine rather than a callback:
+a title bar that only followed the pointer while the pointer was inside the frame would be a title bar
+nobody could drag, and a resize that recomputed from the current rect each packet would creep.
+
+*Content* is `ui`. A window's body is a column of widgets - heading, label, separator, button - laid
+out top-down into the body's size, with rows that do not fit dropped rather than clipped, so every
+rect a window holds is inside the rectangle it will be painted in. The column's coordinates are
+content space: `(0, 0)` is the *body's* corner, the padding is inside the rows, and there is exactly
+one function that maps content space onto the screen (`ui::paint_at`) and one that maps a press back
+into it (`wm::target`). A button carries `Action::Command(u8)` rather than a closure, because the
+number has to survive being stored in a window and pressed by a loop that owns nothing else; what the
+number means belongs to whoever built the content, so `main` maps `0` to "read the machine again" and
+the toolkit never learns what a machine is.
+
+**Consequences.** The compositor dropped the classification it used to do and kept only the painting,
+and the drawing order became the rule for reading a press: windows first, furniture second. That is
+not arbitrary - the furniture lies outside `Theme::work_area`, so no window can be painted over it,
+while windows are painted *after* the launcher, so a window can be over a launcher tile. The first
+implementation had it backwards and would have raised a launcher tile's window when the press was on
+the window standing on it.
+
+A window's content is lines *or* widgets, never both. The compositor paints the lines from the body's
+corner and the column from the same corner, so two kinds of content in one window would occupy the same
+pixels; `Windows::set_widgets` clears the lines when it sets a column, which is where the rule lives
+rather than in a comment. The single content origin is what the compositor test pins: it paints a
+button and then asserts that the window list classifies the same pixel as `Target::Command`, so a
+padding added on one side only fails the suite instead of producing a button that cannot be pressed.
+
+Hover is a level, not an edge. The pointer's loop calls `ui::point` on the window under the pointer
+every packet, with the button's state, and repaints only when `point` says something changed - so a
+button's appearance is a function of where the pointer is and whether it is held, and nothing has to
+remember which widget was lit last except the loop's `hovered` id, which exists so that leaving a
+window can tell the widgets it left.
+
+**Open.** The cosmetic and functional gaps are listed in ROADMAP.md under M14 and are the honest
+consequences of this split: no keyboard focus inside a window (the shell's editor is not a widget), no
+widget kinds beyond four, no scrolling content, and a dock derived from the window list rather than
+from applications. The `Anim`ation type is a function of the clock but only the title bar's focus fade
+uses it; nothing else in the shell moves yet, so the cost of a fade per frame is still unmeasured on
+real hardware.
+

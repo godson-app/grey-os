@@ -18,7 +18,7 @@ A hobby operating system written in Rust for x86_64, booting via UEFI.
 
 ## Current state
 
-Thirteen milestones, each with its own record in `DECISIONS.md` and its acceptance run in `ROADMAP.md`.
+Fourteen milestones, each with its own record in `DECISIONS.md` and its acceptance run in `ROADMAP.md`.
 
 - [x] **M0** Boot, serial diagnostics, diagnosable panics: UEFI through the `bootloader` crate, COM1 at 115200 8N1, a panic handler that reports to serial and paints the panel (ADR-023)
 - [x] **M1** Display, text and an on-screen boot log: the 8x8 font at an integer scale, a character grid, and a back buffer the panel only receives repaints of (ADR-024, ADR-025, ADR-026)
@@ -34,6 +34,7 @@ Thirteen milestones, each with its own record in `DECISIONS.md` and its acceptan
 - [x] **M11** Hardening before the next primitive: one `InterruptMutex` in place of seven ad-hoc `unsafe impl Sync`s, a `cargo xtask ci` that runs every gate, a release profile that aborts instead of unwinding, and a headless harness that no longer hangs on an inherited stdin (ADR-038)
 - [x] **M12** User mode: ring 3 through the user selectors and `TSS.RSP0`, a page table per program shared at the top level, `int 0x80` as the one DPL 3 gate with write/exit/sleep, and a fault in a program that kills the program rather than the kernel (ADR-040)
 - [x] **M13** Raster foundation: a panel-sized back buffer in ordinary memory that the presenter blits in whole rows, sixteen-sample coverage for corners that blend instead of stepping, and a harness that checks the blend on a real panel (ADR-042)
+- [x] **M14** The desktop shell: wallpaper, launcher, panel and dock drawn from the theme, a pointer that presses and drags through a state machine with a grab, window content as widgets with hover and commands, and a harness that clicks (ADR-044)
 
 Not there yet, in the order they matter: preemption of ring 3, ELF loading, a user-space toolchain,
 application processors, an APIC/IOAPIC driver, networking.
@@ -135,7 +136,7 @@ grey-os: user> tick from ring 3
 grey-os: user ok: count exited 3, 7 syscalls, 51 bytes, 15 ticks in ring 3
 grey-os: user: #PF page fault at rip 0x4000000100a: error 0x6, address 0x100000000, killed
 grey-os: user ok: fault exited 142, 0 syscalls, 0 bytes, 0 ticks in ring 3
-grey-os: desktop: 6 windows on 1280x800, 7 overlapping pair(s), focused #6, 3 drawn in the first frame
+grey-os: desktop: 6 windows on 1280x800, 7 overlapping pair(s), focused #5, 3 drawn in the first frame
 grey-os: compositor ok: 4 damage rects merged into 2, pointer drawn at 640,400, 10 frame(s)
 grey-os: boot ok
 ```
@@ -225,8 +226,26 @@ corner is sixteen samples of coverage per pixel, integer arithmetic only, and th
 blended in by that fraction - a shape can have an edge which is neither a rectangle nor a staircase.
 The frame a damage repaint paints is still byte-for-byte the frame a whole repaint paints, and
 `cargo xtask test` now asserts the blend on the real panel rather than trusting it: the first pixel
-that is not the desktop is a window's corner, and the 6x6 square there must hold at least five
-colours between the desktop and the frame, which a square corner cannot. See ADR-042.
+below the shell's panel that is not wallpaper is a window's corner, and the 6x6 square there must
+hold at least five colours between the wallpaper and the frame, which a square corner cannot. See
+ADR-042.
+
+M14 is the shell the windows sit in. `desk` paints the wallpaper's grid, four launcher tiles, the
+panel along the top and the dock along the bottom, all from the theme's numbers, and answers what a
+point means; `wm` is the pointer's state machine, where a press classifies a point against the same
+theme rects the compositor draws from, raises what it landed on and takes a grab - a title bar to
+move, an edge to resize - that the following movements apply and the release ends, which is what
+lets a title bar follow a pointer that has left the window. `ui` makes a window's content a column
+of widgets with one origin that the paint and the hit test both read, and the `system` window is the
+one that has them: a heading, three facts read from the frame allocator, the arena and the disk, and
+a button that reads them again. A press on that button is a number the content builder chose, which
+the shell runs - `ui` never learns what a machine is. Hover is a level rather than an edge, so the
+pointer's loop points whatever window is under it every packet and repaints only what changed. The
+acceptance run now clicks: QEMU's monitor sends the button down, a movement and the button up, one
+step at a time, and the shell's own lines - `press at 665,390 on window #5`, `moving window #5`,
+`released window #5` - are the acknowledgements, because the emulated mouse accumulates state into a
+single packet and a burst of events would be one packet at the destination with no drag at all. See
+ADR-044.
 
 Because the kernel exits through QEMU's `isa-debug-exit` device, the QEMU window closes as soon as
 boot finishes and `cargo run` exits with status 0. The preview above is the exception: its shell
@@ -260,8 +279,9 @@ than waiting forever. It runs fourteen phases over one deterministic disk:
    guest through QEMU's monitor and QMP socket: four keys typed and each asserted on serial, a
    relative pointer movement decoded, a screenshot taken and checked for the desktop's colour, the
    pointer's pixels and the blend at the first window's corner - five distinct colours or more across
-   a 6x6 square, which a square corner cannot produce - and five commands typed into the shell - `ls`,
-   `mem`, `cpus`, `run fib`, `run nope` - with each answer and `exit` asserted.
+   a 6x6 square, which a square corner cannot produce - a click whose press, drag and release are
+   each asserted from the shell's own lines, and five commands typed into the shell - `ls`, `mem`,
+   `cpus`, `run fib`, `run nope` - with each answer and `exit` asserted.
 4. **The preview**, rebuilt with `GREY_OS_INTERACTIVE=1`, which is the kernel a person types into:
    the panel is photographed the moment the shell says it is listening and has to still hold the
    desktop - the boot log paints on serial only once the first frame is up, so a band of the shell
@@ -353,8 +373,12 @@ grey-os/
         ├── framebuffer.rs # boot-info framebuffer -> Canvas adapter
         ├── surface.rs     # an owned offscreen buffer, source-over between two of them (ADR-042)
         ├── theme.rs       # the theme as numbers: colours, padding, title height, corner radius (ADR-034, ADR-042)
-        ├── window.rs      # one window: a rect, a title and lines
+        ├── window.rs      # one window: a rect, a title, lines or widgets (ADR-044)
         ├── compositor.rs  # the desktop: window list, focus, damage rects, rounded shapes, pointer (ADR-034, ADR-042)
+        ├── desk.rs        # the furniture: wallpaper grid, launcher tiles, panel and dock, what a point means (ADR-044)
+        ├── wm.rs          # the pointer's state machine: press, grab, drag, resize, release (ADR-044)
+        ├── ui.rs          # a window's content as widgets: column, hit test, hover, paint (ADR-044)
+        ├── anim.rs        # a fade as a function of the clock, so the same tick draws the same frame (ADR-042)
         ├── presenter.rs   # the frame: the back buffer, damage into it, the pointer on the panel (ADR-042)
         ├── memory.rs      # memory map, the bootstrap region's selection
         ├── sync.rs        # the one interior-mutability cell and its interrupt guard (ADR-038)

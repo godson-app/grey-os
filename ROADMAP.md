@@ -28,6 +28,7 @@ milestone, so that this file never claims more than was agreed.
 | M11       | Hardening before the next primitive          | **Done** - one lock type, one CI command (ADR-038)         |
 | M12       | User mode: ring 3, a syscall gate            | **Done** - 3 programs run, 1 killed by the CPU (ADR-040)   |
 | M13       | Raster foundation: rounded chrome, back buffer | **Done** - blended corners on a real panel (ADR-042)      |
+| M14       | Desktop shell: furniture, pointer, widgets   | **Done** - an injected click presses and drags (ADR-044)  |
 
 ## M0 - Boot, serial diagnostics, diagnosable panics
 
@@ -1026,15 +1027,15 @@ outer shape paints - there is at least one pixel that is neither the desktop nor
 which a staircase cannot produce. All green with the rest of the suite.
 
 `cargo xtask test` now covers the same claim on a real panel, and this is what closed the milestone.
-The screenshot the input phase takes is checked for a fourth thing: the topmost leftmost pixel that is
-not the desktop is a window's corner, and the 6x6 square at it has to hold at least five distinct
-colours - the run of partial coverage between the desktop and the frame - where a square corner would
-hold three (desktop, edge, body) and fail. It passes with seven, and the boot reports the panel it was
-looking at:
+The screenshot the input phase takes is checked for a fourth thing: the topmost leftmost pixel below
+the shell's panel that is not wallpaper is a window's corner, and the 6x6 square at it has to hold at
+least five distinct colours - the run of partial coverage between the wallpaper and the frame - where a
+square corner would hold three (wallpaper, edge, body) and fail. It passes with seven, and the boot
+reports the panel it was looking at:
 
 ```text
-pass: the corner at 46,40 fades through 7 colours between the desktop and the frame
-pass: 1280x800 screenshot, 56 distinct colours, 77 pointer pixels, saved to target/grey-os/desktop.ppm
+pass: the corner at 46,40 fades through 7 colours between the wallpaper and the frame
+pass: 1280x800 screenshot, 108 distinct colours, 77 pointer pixels, saved to target/grey-os/desktop.ppm
 grey-os: compositor: desktop composited in a 4000 KiB back buffer
 grey-os: compositor ok: 4 damage rects merged into 2, pointer drawn at 640,400, 8 frame(s)
 ```
@@ -1061,6 +1062,71 @@ changes a pixel until there is something translucent to composite. `blend_where`
 rounded edge and its cost is still not a number from real hardware - the finding above is a bound on
 how long a whole frame takes, not a profile of the edge. And `blend_surface` still assumes an opaque
 destination, which is true for the desktop and false for a stack of translucent windows.
+
+## M14 - The desktop shell
+
+M7 drew windows and M13 gave them a proper edge, and between them the screen was a list of rectangles
+with a pointer on top: no furniture, and no way to press anything. M14 is the layer that makes it a
+desktop - wallpaper, launcher, a panel and a dock; a press that means something and a drag that keeps
+meaning it after the pointer has left the window; and window content that is more than lines of text.
+
+**Delivered.**
+
+1. `desk`: the furniture, laid out from the theme's numbers - a wallpaper grid, four launcher tiles, the
+   panel across the top, the dock along the bottom - and `Desk::hit`, which answers what a point means:
+   a launcher tile, a dock tile, the panel, or the wallpaper.
+2. `wm`: the pointer's state machine. `Session::press` classifies a point against the same theme rects
+   the compositor draws from, raises what it landed on, and takes a `Grab` - a title bar to move, an
+   edge to resize, nothing for a body. `moved` applies the grab and `release` ends it, so a title bar
+   follows a pointer out of its own frame and a resize stops at the minimum the title bar needs.
+3. `ui`: a window's content as a column of widgets - heading, label, separator, button - with one
+   content space that `paint_at` and `hit` both read, a `point` that sets one widget's state per
+   pointer position, and buttons that carry a number instead of a closure.
+4. `window`/`compositor`: a window's content is lines *or* widgets, `set_widgets` replaces one with the
+   other, and the compositor paints the column from the body's corner - the same origin the window
+   list hit tests from, which is the invariant a test pins.
+5. `main`: the `system` window is built by `system_content` and rebuilt by the button it carries, so
+   the boot's numbers and the refreshed ones are one function's output; the shell's pointer loop asks
+   the window list first and the furniture second, dispatches `Target::Command`, and points whatever
+   window is under the pointer at it on every packet.
+
+**Acceptance.** `cargo test --package kernel --lib` carries the claims: the grab arithmetic (a title
+bar moves a window by exactly the pointer's delta, an edge resizes from that edge only, a drag past the
+panel stops at it), the furniture's rects, the widget column's layout and the equality of what is
+painted and what is hit, and one compositor test that paints a button and then asserts the *same*
+pixel is `Target::Command` for the window list - so a padding added on one side only fails.
+
+`cargo xtask test` clicks. The input phase already typed keys through QEMU's monitor; it now sends the
+left button down, a relative movement and the button up, and asserts the shell's own lines for each:
+`press at 665,390 on window #5`, `moving window #5 to 705,410`, `released window #5`. The steps are
+acknowledged one at a time rather than sent as a burst, and that is the finding this milestone paid
+for: the emulated mouse accumulates motion and button state into a three-byte packet, so the first
+version - three events 150 ms apart - reached the guest as one packet at the *destination*, printed a
+press at 705,410 and produced no drag at all.
+
+```text
+pass: a click through qmp was classified as `grey-os: shell: press at 665,390 on window #5`,
+      `grey-os: shell: moving window #` followed on the movement and `grey-os: shell: released
+      window #` on the release
+pass: 1280x800 screenshot, 121 distinct colours, 77 pointer pixels, saved to target/grey-os/desktop.ppm
+```
+
+**What verifying it cost.** Two findings, and neither of them was available to a host test. The click
+coalescing above was the first, and a failing run found it. The second was found by reading the order
+the code asked its questions in: `main`'s `press` asked `desk.hit` before the window list, on the
+theory that the furniture is on top. It is not - `desk`'s furniture lies *outside*
+`Theme::work_area`, so no window can be over it, and the windows are painted *after* the launcher, so
+a window can be over a launcher tile - and a press on the tile a window was standing on would have
+raised the launcher's window instead of the one under the pointer, with a grab the pointer never
+asked for. The order is the drawing order's: windows first, furniture second.
+
+**Not done, and stated as open.** No window has anything but text, except `system`, and the toolkit's
+`Kind` list is four long: no text field, no list, no scrollbar, no toggles. There is no keyboard focus
+*inside* a window - the shell's editor is the only text input, and it is not a widget - so `Tab` moves
+nothing and a button cannot be reached without a pointer. The dock is drawn from the window list rather
+than from a list of applications, so minimising the last copy of a thing is how it disappears. And the
+furniture's own layout is a constant: the launcher is four tiles because `desk::LAUNCHER` is four
+names, not because anything lays a menu out.
 
 The brief's list ends at M10, so this section is no longer a transcription of agreed scope: it is the
 `Open` list of the ten ADRs, gathered in dependency order. Nothing here is agreed and nothing here

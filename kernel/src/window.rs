@@ -26,6 +26,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::canvas::Rect;
+use crate::ui::Widget;
 
 /// One window: where it is, what it says, and how far its text is scrolled.
 #[derive(Clone, Debug)]
@@ -40,6 +41,16 @@ pub struct Window {
     pub lines: Vec<String>,
     /// How many lines have been scrolled off the top.
     pub scroll: usize,
+    /// The window's interactive content, when it has any. Empty means the window is a text
+    /// window and its body is [`Self::lines`].
+    pub widgets: Vec<Widget>,
+    /// Whether the window is in the dock rather than on the screen. A minimised window keeps
+    /// its identity, its content and its place in the list; it is simply not drawn, not hit,
+    /// and not in line to be focused by a click.
+    pub minimised: bool,
+    /// Where the window was before it was maximised, so restoring puts it back rather than
+    /// leaving it at the work area's edge. `None` means it is not maximised.
+    pub restore: Option<Rect>,
 }
 
 impl Window {
@@ -79,6 +90,12 @@ pub struct Windows {
     /// The panel, for placement, clamping and clipping.
     width: u32,
     height: u32,
+    /// The area windows may occupy: the panel minus the top panel and the dock. Placement,
+    /// dragging and maximising all clamp to it, so no window can hide under either bar.
+    work: Rect,
+    /// The smallest a window may be resized to, so its own title bar still fits.
+    min_width: u32,
+    min_height: u32,
 }
 
 impl Windows {
@@ -93,7 +110,39 @@ impl Windows {
             cascade,
             width,
             height,
+            work: Rect::new(0, 0, width, height),
+            min_width: 200,
+            min_height: 120,
         }
+    }
+
+    /// Sets the smallest a window may be resized to, and returns whether it changed.
+    pub fn set_min_size(&mut self, width: u32, height: u32) -> bool {
+        if width == 0 || height == 0 || (width, height) == (self.min_width, self.min_height) {
+            return false;
+        }
+        self.min_width = width;
+        self.min_height = height;
+        true
+    }
+
+    /// Narrows the area windows may occupy - the panel minus its top bar and its dock - and
+    /// returns whether it changed.
+    ///
+    /// Called once, by whoever builds the desktop, before any window exists. Everything that
+    /// places or clamps a window reads it, which is what keeps a drag from sliding a title bar
+    /// under the top panel where it can no longer be grabbed.
+    pub fn set_work_area(&mut self, work: Rect) -> bool {
+        if work.width == 0 || work.height == 0 || work == self.work {
+            return false;
+        }
+        self.work = work;
+        true
+    }
+
+    /// The area windows may occupy.
+    pub fn work_area(&self) -> Rect {
+        self.work
     }
 
     /// The panel this desktop was built for.
@@ -135,15 +184,18 @@ impl Windows {
 
     /// Creates a window at the next cascade position, in front, and focuses it.
     ///
-    /// The position wraps after five steps and is clamped so the frame stays on the panel: a
-    /// window placed off the right or bottom edge is a window nobody can find.
+    /// The position wraps after five steps and is clamped so the frame stays inside the work
+    /// area: a window placed off the right or bottom edge, or under the top panel where its
+    /// title bar cannot be grabbed, is a window nobody can find.
     pub fn create(&mut self, title: &str, lines: Vec<String>, width: u32, height: u32) -> u32 {
         let step = self.step;
         self.step = (self.step + 1) % 5;
+        let work = self.work;
         let width = width.min(self.width);
         let height = height.min(self.height);
-        let x = (24 + step * self.cascade).min(self.width.saturating_sub(width) as i32);
-        let y = (24 + step * self.cascade).min(self.height.saturating_sub(height) as i32);
+        let offset = 24 + step * self.cascade;
+        let x = (work.x + offset).min(work.x + work.width.saturating_sub(width) as i32);
+        let y = (work.y + offset).min(work.y + work.height.saturating_sub(height) as i32);
         let id = self.next_id;
         self.next_id += 1;
         let window = Window {
@@ -152,12 +204,32 @@ impl Windows {
             rect: Rect::new(x.max(0), y.max(0), width, height),
             lines,
             scroll: 0,
+            widgets: Vec::new(),
+            minimised: false,
+            restore: None,
         };
         let frame = window.rect;
         self.windows.push(window);
         self.refocus(id);
         self.damage.push(frame);
         id
+    }
+
+    /// Replaces a window's content with a column of widgets, and damages the body it changed.
+    ///
+    /// The lines go with it: a window's content is text *or* widgets, and a window that kept
+    /// both would have two things claiming the same rectangle - the compositor paints the lines
+    /// and the column from the same corner. Returns whether the window existed.
+    pub fn set_widgets(&mut self, id: u32, widgets: Vec<Widget>) -> bool {
+        let Some(window) = self.window_mut(id) else {
+            return false;
+        };
+        window.widgets = widgets;
+        window.lines.clear();
+        window.scroll = 0;
+        let frame = window.rect;
+        self.damage(frame);
+        true
     }
 
     /// Moves focus to `id` and damages the window that had it.
@@ -192,9 +264,12 @@ impl Windows {
     }
 
     /// The topmost window under `(x, y)`, without changing anything.
+    ///
+    /// A minimised window is not under anything: it is not drawn, so a click where it used to
+    /// be belongs to whatever is drawn there now.
     pub fn hit(&self, x: i32, y: i32) -> Option<u32> {
         self.iter_front_to_back()
-            .find(|window| window.contains(x, y))
+            .find(|window| !window.minimised && window.contains(x, y))
             .map(|window| window.id)
     }
 
@@ -207,22 +282,133 @@ impl Windows {
 
     /// Moves a window to `(x, y)` and damages both where it was and where it went.
     ///
-    /// The frame is clamped so that at least the title bar stays on the panel: a window dragged
-    /// past the edge has to remain findable and draggable.
+    /// The frame is clamped so that at least the title bar stays inside the work area: a
+    /// window dragged past an edge has to remain findable and draggable, and one whose title
+    /// bar slid under the top panel cannot be picked up again.
     pub fn move_to(&mut self, id: u32, x: i32, y: i32) -> bool {
-        let (width, height) = (self.width, self.height);
+        let work = self.work;
         let Some(window) = self.window_mut(id) else {
             return false;
         };
         let old = window.rect;
-        let max_x = width.saturating_sub(48) as i32;
-        let max_y = height.saturating_sub(24) as i32;
-        window.rect.x = x.clamp(-(window.rect.width as i32 - 48).max(0), max_x);
-        window.rect.y = y.clamp(0, max_y);
+        let max_x = (work.x + work.width as i32).saturating_sub(48);
+        let max_y = (work.y + work.height as i32).saturating_sub(24);
+        let min_x = (work.x - (window.rect.width as i32 - 48)).min(max_x);
+        window.rect.x = x.clamp(min_x, max_x);
+        window.rect.y = y.clamp(work.y, max_y);
         let new = window.rect;
         self.damage.push(old);
         self.damage.push(new);
         true
+    }
+
+    /// Resizes a window to `width` by `height` at `(x, y)`, clamped to the work area and to
+    /// the smallest a window may be.
+    ///
+    /// One call for a whole edge or corner: a resize that moved x but not the width would be a
+    /// window that slid instead of growing, so the two cannot be set separately.
+    pub fn resize_to(&mut self, id: u32, x: i32, y: i32, width: u32, height: u32) -> bool {
+        let (work, min_width, min_height) = (self.work, self.min_width, self.min_height);
+        let Some(window) = self.window_mut(id) else {
+            return false;
+        };
+        let old = window.rect;
+        let width = width.clamp(min_width, work.width.max(min_width));
+        let height = height.clamp(min_height, work.height.max(min_height));
+        let x = x.clamp(work.x, work.x + (work.width as i32 - width as i32).max(0));
+        let y = y.clamp(work.y, work.y + (work.height as i32 - height as i32).max(0));
+        window.rect = Rect::new(x, y, width, height);
+        let new = window.rect;
+        if new == old {
+            return true;
+        }
+        self.damage.push(old);
+        self.damage.push(new);
+        true
+    }
+
+    /// Fills the work area with a window, remembering where it was.
+    ///
+    /// Maximising an already maximised window does nothing: pressing the button again is a
+    /// no-op rather than a window that shrinks to its own size.
+    pub fn maximise(&mut self, id: u32) -> bool {
+        let work = self.work;
+        let Some(window) = self.window_mut(id) else {
+            return false;
+        };
+        if window.restore.is_some() {
+            return false;
+        }
+        let old = window.rect;
+        window.restore = Some(old);
+        window.rect = work;
+        window.minimised = false;
+        self.damage.push(old);
+        self.damage.push(work);
+        true
+    }
+
+    /// Puts a maximised window back where it was.
+    pub fn restore_window(&mut self, id: u32) -> bool {
+        let Some(window) = self.window_mut(id) else {
+            return false;
+        };
+        let Some(restore) = window.restore.take() else {
+            return false;
+        };
+        let old = window.rect;
+        window.rect = restore;
+        self.damage.push(old);
+        self.damage.push(restore);
+        true
+    }
+
+    /// Whether a window is filling the work area.
+    pub fn is_maximised(&self, id: u32) -> bool {
+        self.window(id)
+            .is_some_and(|window| window.restore.is_some())
+    }
+
+    /// Hides a window in the dock. Focus falls to whatever is now in front.
+    ///
+    /// The window stays in the list rather than being removed: a minimised window is not
+    /// closed, and the dock's tile and the shell's handle still point at it.
+    pub fn minimise(&mut self, id: u32) -> bool {
+        let Some(window) = self.window_mut(id) else {
+            return false;
+        };
+        if window.minimised {
+            return false;
+        }
+        window.minimised = true;
+        let rect = window.rect;
+        self.damage.push(rect);
+        if self.focus == Some(id) {
+            self.focus = self
+                .windows
+                .iter()
+                .rev()
+                .find(|w| !w.minimised)
+                .map(|w| w.id);
+        }
+        true
+    }
+
+    /// Brings a minimised window back, in front, and focuses it.
+    pub fn unminimise(&mut self, id: u32) -> bool {
+        let Some(window) = self.window_mut(id) else {
+            return false;
+        };
+        if !window.minimised {
+            return false;
+        }
+        window.minimised = false;
+        self.raise(id)
+    }
+
+    /// Whether a window is on the screen at all.
+    pub fn visible(&self, id: u32) -> bool {
+        self.window(id).is_some_and(|window| !window.minimised)
     }
 
     /// Closes a window, damaging where it was.
@@ -385,6 +571,39 @@ mod tests {
         // Back to front: the first is behind the second.
         let order: Vec<u32> = windows.iter().map(|window| window.id).collect();
         assert_eq!(order, vec![first, second]);
+    }
+
+    #[test]
+    fn a_window_given_widgets_keeps_only_the_widgets_and_damages_itself() {
+        let mut windows = desktop();
+        let id = windows.create("system", lines("one"), 400, 300);
+        let _ = windows.take_damage();
+        let widget = crate::ui::Widget {
+            kind: crate::ui::Kind::Button,
+            action: crate::ui::Action::Command(0),
+            label: String::from("press"),
+            rect: Rect::new(4, 4, 40, 20),
+            state: crate::ui::State::Rest,
+        };
+        assert!(windows.set_widgets(id, vec![widget.clone()]));
+        let (shown, lines_left, scroll, rect) = {
+            let window = windows.window(id).expect("window");
+            (
+                window.widgets.clone(),
+                window.lines.len(),
+                window.scroll,
+                window.rect,
+            )
+        };
+        assert_eq!(shown, vec![widget]);
+        // The text went with it: a window's content is one thing or the other, never both in
+        // the same rectangle.
+        assert_eq!(lines_left, 0);
+        assert_eq!(scroll, 0);
+        // The whole frame is damaged: the body changed and the title bar is repainted with it.
+        assert_eq!(windows.take_damage(), vec![rect]);
+        // A window that is not there answers rather than panicking.
+        assert!(!windows.set_widgets(99, Vec::new()));
     }
 
     #[test]

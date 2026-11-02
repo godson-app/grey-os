@@ -95,6 +95,18 @@ impl Rect {
         }
     }
 
+    /// Whether `(x, y)` is inside this rect.
+    ///
+    /// The right and bottom edges are *outside*: a rect of width 10 starting at 0 covers
+    /// columns 0 to 9, so a point at 10 belongs to whatever is to the right of it. Getting
+    /// that wrong is a hit test that reports two neighbours for one pixel.
+    pub const fn contains(self, x: i32, y: i32) -> bool {
+        x >= self.x
+            && x < self.x + self.width as i32
+            && y >= self.y
+            && y < self.y + self.height as i32
+    }
+
     /// The visible part of this rect on a `width` x `height` surface, as
     /// `(x, y, width, height)` in pixels, or `None` if none of it is visible.
     ///
@@ -120,6 +132,32 @@ impl Rect {
             usize::try_from(top).ok()?,
             usize::try_from(right - left).ok()?,
             usize::try_from(bottom - top).ok()?,
+        ))
+    }
+
+    /// The part of this rect that `other` also covers, or `None` if they do not overlap.
+    ///
+    /// A damage frame is one rect intersected with another, so this is the arithmetic that
+    /// decides how much of the screen a repaint may touch. It runs in `i64` for the same
+    /// reason [`Self::clip`] does: an extreme origin times an extreme extent must come out as
+    /// "no overlap", not as a wrapped rect somewhere else on the screen.
+    pub fn intersection(self, other: Rect) -> Option<Rect> {
+        let left = i64::from(self.x).max(i64::from(other.x));
+        let top = i64::from(self.y).max(i64::from(other.y));
+        let right = i64::from(self.x)
+            .saturating_add(i64::from(self.width))
+            .min(i64::from(other.x).saturating_add(i64::from(other.width)));
+        let bottom = i64::from(self.y)
+            .saturating_add(i64::from(self.height))
+            .min(i64::from(other.y).saturating_add(i64::from(other.height)));
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(Rect::new(
+            i32::try_from(left).ok()?,
+            i32::try_from(top).ok()?,
+            u32::try_from(right - left).ok()?,
+            u32::try_from(bottom - top).ok()?,
         ))
     }
 }
@@ -157,6 +195,14 @@ impl<'a> Canvas<'a> {
 
     pub fn geometry(&self) -> Geometry {
         self.geometry
+    }
+
+    /// The channel order the pixels are stored in.
+    ///
+    /// A buffer built to receive a copy of this surface has to agree with it: the copy is by
+    /// bytes, so a buffer in the other order would put red where blue belongs.
+    pub fn order(&self) -> ChannelOrder {
+        self.order
     }
 
     /// Fills the whole surface, stride padding included, so no stale pixel of an
@@ -387,7 +433,72 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Blends `source` over this surface at the same coordinates, using the source's fourth
+    /// Blends `source` over this surface at the same coordinates, with each source pixel's
+    /// alpha scaled by `coverage` at that absolute position.
+    ///
+    /// This is [`Self::blend_surface`] plus a mask, and the mask is what makes a window's
+    /// content fit a rounded frame: the content's own pixels are opaque squares, so without a
+    /// coverage function the bottom two corners of a window would be filled in and the curve
+    /// would disappear. The mask is asked about the *destination's* coordinates, never the
+    /// source's, so a frame that paints one damage rect at a time lands the same arc every
+    /// time.
+    ///
+    /// Alpha from the source and coverage from the mask multiply: a translucent source inside
+    /// a masked corner is translucent twice, which is what a drop shadow under a rounded
+    /// panel needs.
+    pub fn blit_masked(
+        &mut self,
+        source: &Canvas<'_>,
+        rect: Rect,
+        coverage: impl Fn(i32, i32) -> u8,
+    ) {
+        if self.order != source.order
+            || self.geometry.bytes_per_pixel != source.geometry.bytes_per_pixel
+        {
+            return;
+        }
+        let Some((x, y, width, height)) = rect.clip(self.geometry.width, self.geometry.height)
+        else {
+            return;
+        };
+        let width = width.min(source.geometry.width.saturating_sub(x));
+        let height = height.min(source.geometry.height.saturating_sub(y));
+        if width == 0 || height == 0 {
+            return;
+        }
+        let destination_stride = self.geometry.stride * BYTES_PER_PIXEL;
+        let source_stride = source.geometry.stride * BYTES_PER_PIXEL;
+        let offset = x * BYTES_PER_PIXEL;
+        for row in 0..height {
+            let from = (y + row) * source_stride + offset;
+            let to = (y + row) * destination_stride + offset;
+            let source_row = &source.pixels[from..from + width * BYTES_PER_PIXEL];
+            let destination_row = &mut self.pixels[to..to + width * BYTES_PER_PIXEL];
+            for (column, (src, dst)) in source_row
+                .as_chunks::<BYTES_PER_PIXEL>()
+                .0
+                .iter()
+                .zip(destination_row.as_chunks_mut::<BYTES_PER_PIXEL>().0)
+                .enumerate()
+            {
+                let cover = coverage(x as i32 + column as i32, y as i32 + row as i32);
+                if cover == 0 {
+                    continue;
+                }
+                let alpha = (u32::from(src[3]) * u32::from(cover) / u32::from(u8::MAX)) as u8;
+                match alpha {
+                    0 => {}
+                    u8::MAX => dst.copy_from_slice(src),
+                    alpha => {
+                        for (destination, source) in dst.iter_mut().zip(src.iter()).take(3) {
+                            *destination = blend_channel(*destination, *source, alpha);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// byte as per-pixel alpha, clipped to both surfaces.
     ///
     /// The destination is treated as opaque: this is the step that puts a window's own
@@ -438,6 +549,74 @@ impl<'a> Canvas<'a> {
                 }
             }
         }
+    }
+}
+
+/// Fills `rect` with `color`, keeping inside `clip` when there is one.
+///
+/// Every rectangle the desktop paints goes through here or [`blend_clipped`]: an incremental
+/// frame is only correct if the pieces it repaints cannot write outside the part of the screen
+/// they own, and one `fill_rect` that forgot the clip is a window's pixels replaced by the
+/// colour of whatever was drawn after it.
+pub fn fill_clipped(canvas: &mut Canvas<'_>, rect: Rect, color: Color, clip: Option<Rect>) {
+    let Some(area) = within(rect, clip) else {
+        return;
+    };
+    canvas.fill_rect(area, color);
+}
+
+/// Fills `shape` through a rounded-rectangle coverage function, keeping inside `clip`.
+///
+/// The clip narrows the *area* painted, never the shape: the coverage function is asked about
+/// each pixel's absolute position, so a damage rect covering only one corner still lands the
+/// same arc a full repaint would have. That - and the blend being a fixed function of the two
+/// colours - is what makes an incremental frame identical to a whole one.
+pub fn blend_clipped(
+    canvas: &mut Canvas<'_>,
+    shape: Rect,
+    corners: Corners,
+    color: Color,
+    clip: Option<Rect>,
+) {
+    let Some(area) = within(shape, clip) else {
+        return;
+    };
+    canvas.blend_where(area, color, |x, y| {
+        rounded_rect_coverage(shape, corners, x, y)
+    });
+}
+
+/// Fills `shape` through a rounded-rectangle coverage function at `alpha`, keeping inside
+/// `clip`.
+///
+/// The shadow a window casts is the reason this exists: it is a rounded shape blended at the
+/// theme's own strength rather than at whatever coverage the corner happens to give. The clip
+/// behaves exactly as it does in [`blend_clipped`], so a shadow repainted through a damage
+/// rect lands on the same pixels a whole frame would.
+pub fn blend_clipped_alpha(
+    canvas: &mut Canvas<'_>,
+    shape: Rect,
+    corners: Corners,
+    color: Color,
+    alpha: u8,
+    clip: Option<Rect>,
+) {
+    let Some(area) = within(shape, clip) else {
+        return;
+    };
+    let alpha = u32::from(alpha);
+    canvas.blend_where(area, color, |x, y| {
+        let coverage = u32::from(rounded_rect_coverage(shape, corners, x, y));
+        // Both are 0..=255, so the product fits a 32-bit word: 65025 of them.
+        (coverage * alpha / 255) as u8
+    });
+}
+
+/// The part of `rect` inside `clip`, or `None` if there is nothing to paint.
+fn within(rect: Rect, clip: Option<Rect>) -> Option<Rect> {
+    match clip {
+        Some(clip) => rect.intersection(clip),
+        None => (rect.width > 0 && rect.height > 0).then_some(rect),
     }
 }
 

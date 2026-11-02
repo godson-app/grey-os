@@ -239,15 +239,18 @@ mod tests {
         let mut desktop = Compositor::new(240, 180, GREY);
         let mut panel = Panel::new(240, 180);
         let mut presenter = buffer();
-        presenter.paint_all(&mut desktop, &mut panel.canvas(), (8, 8));
+        // Below the top panel, which is painted over the wallpaper: the pixel outside the
+        // triangle is the wallpaper, so "the blit put it back" is a claim about the desktop
+        // rather than about which band the pointer happened to be over.
+        presenter.paint_all(&mut desktop, &mut panel.canvas(), (8, 40));
 
-        desktop.windows.damage(pointer_rect(8, 8));
-        assert!(presenter.paint_damage(&mut desktop, &mut panel.canvas(), (8, 8)) > 0);
+        desktop.windows.damage(pointer_rect(8, 40));
+        assert!(presenter.paint_damage(&mut desktop, &mut panel.canvas(), (8, 40)) > 0);
 
-        assert_eq!(panel.pixel(8, 8), GREY.pointer_edge);
-        assert_eq!(panel.pixel(9, 8), GREY.pointer);
+        assert_eq!(panel.pixel(8, 40), GREY.pointer_edge);
+        assert_eq!(panel.pixel(9, 40), GREY.pointer);
         // Inside the damaged rect, outside the triangle: the blit put the desktop back.
-        assert_eq!(panel.pixel(11, 8), GREY.desktop);
+        assert_eq!(panel.pixel(11, 40), GREY.desktop);
     }
 
     #[test]
@@ -255,13 +258,13 @@ mod tests {
         let mut desktop = Compositor::new(240, 180, GREY);
         let mut panel = Panel::new(240, 180);
         let mut presenter = buffer();
-        presenter.paint_all(&mut desktop, &mut panel.canvas(), (10, 10));
-        assert_eq!(panel.pixel(11, 10), GREY.pointer);
+        presenter.paint_all(&mut desktop, &mut panel.canvas(), (10, 40));
+        assert_eq!(panel.pixel(11, 40), GREY.pointer);
 
         // No window moved, no line was added: the move is the whole frame.
         let painted = presenter.paint_damage(&mut desktop, &mut panel.canvas(), (200, 150));
         assert_eq!(painted, 0, "a pointer move repaints no damage rects");
-        assert_eq!(panel.pixel(11, 10), GREY.desktop, "the old one was erased");
+        assert_eq!(panel.pixel(11, 40), GREY.desktop, "the old one was erased");
         assert_eq!(panel.pixel(201, 150), GREY.pointer, "the new one was drawn");
     }
 

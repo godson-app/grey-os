@@ -10,7 +10,7 @@
 //! the theme: a 4K panel wants a larger font in the same window, and that is a layout
 //! decision, not a compositor one.
 
-use crate::canvas::Color;
+use crate::canvas::{Color, Rect};
 
 /// Everything the compositor asks the theme for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -19,6 +19,9 @@ pub struct Theme {
     pub name: &'static str,
     /// Behind every window.
     pub desktop: Color,
+    /// The wallpaper's grid rules: a few steps lighter than the ground, so the desktop reads
+    /// as a surface with a texture rather than as a flat void.
+    pub wallpaper_line: Color,
     /// A window's body.
     pub window: Color,
     /// The title bar of a window that does not have focus.
@@ -56,6 +59,76 @@ pub struct Theme {
     pub cascade: i32,
     /// The scale text is drawn at.
     pub text_scale: usize,
+    /// The scale a window's title is drawn at: one step larger than the body.
+    pub display_scale: usize,
+    /// The scale the smallest labels are drawn at.
+    pub label_scale: usize,
+    /// The top panel: the bar the clock and the window count sit in.
+    pub panel: Color,
+    /// Text on the panel.
+    pub panel_text: Color,
+    /// The floating dock at the bottom of the screen.
+    pub dock: Color,
+    /// A dock tile that is not being pointed at.
+    pub dock_tile: Color,
+    /// A dock tile under the pointer, or whose window is focused.
+    pub dock_tile_active: Color,
+    /// A desktop tile: one of the large launcher squares.
+    pub tile: Color,
+    /// Text on a desktop tile.
+    pub tile_text: Color,
+    /// The minimise and maximise affordances in a title bar.
+    pub control: Color,
+    /// The close affordance, which is the one that loses data.
+    pub control_close: Color,
+    /// What a shadow is painted with; its strength is [`Self::shadow_alpha`].
+    pub shadow: Color,
+    /// A button at rest in a window's own content.
+    pub button: Color,
+    /// A button under the pointer.
+    pub button_hover: Color,
+    /// A button that is being held down.
+    pub button_active: Color,
+    /// Text on a button.
+    pub button_text: Color,
+    /// A raised surface inside a window: a sidebar, a card, a list row.
+    pub content_raised: Color,
+    /// The height of the top panel, in pixels.
+    pub panel_height: u32,
+    /// The height of the dock, in pixels.
+    pub dock_height: u32,
+    /// The side of a dock tile, in pixels.
+    pub dock_tile_size: u32,
+    /// Space between dock tiles.
+    pub dock_gap: u32,
+    /// Space between the dock and the bottom of the panel.
+    pub dock_margin: u32,
+    /// The side of a desktop launcher tile, in pixels.
+    pub tile_size: u32,
+    /// Space between desktop tiles.
+    pub tile_gap: u32,
+    /// The diameter of a title bar affordance.
+    pub affordance: u32,
+    /// Space between two affordances.
+    pub affordance_gap: u32,
+    /// Space between the affordances and the title bar's right edge.
+    pub affordance_margin: u32,
+    /// How far a shadow is offset below the window that casts it.
+    pub shadow_offset: i32,
+    /// How strongly a shadow is blended: 0 would be no shadow, 255 a black rectangle.
+    pub shadow_alpha: u8,
+    /// How opaque a window's chrome is. Below 255 the desktop shows through it, which is
+    /// the translucency the desktop is allowed to have: the chrome, never the text on it.
+    pub chrome_alpha: u8,
+    /// The height of a button in a window's content, in pixels.
+    pub button_height: u32,
+    /// Space between two rows of content.
+    pub row_gap: u32,
+    /// The width a window may not be dragged below: narrower and its title bar has no room
+    /// for its own affordances.
+    pub min_window_width: u32,
+    /// The height a window may not be dragged below.
+    pub min_window_height: u32,
 }
 
 /// The only theme, for now. Its colours are a cool grey with a blue accent: legible on the
@@ -64,6 +137,7 @@ pub struct Theme {
 pub const GREY: Theme = Theme {
     name: "grey",
     desktop: Color::new(0x1f, 0x6f, 0x8b),
+    wallpaper_line: Color::new(0x25, 0x79, 0x96),
     window: Color::new(0x1a, 0x20, 0x26),
     title: Color::new(0x2e, 0x38, 0x42),
     title_focused: Color::new(0x2f, 0x6f, 0xa8),
@@ -80,9 +154,160 @@ pub const GREY: Theme = Theme {
     padding: 8,
     cascade: 36,
     text_scale: 2,
+    display_scale: 3,
+    label_scale: 1,
+    panel: Color::new(0x12, 0x18, 0x1d),
+    panel_text: Color::new(0xcf, 0xdb, 0xe4),
+    dock: Color::new(0x16, 0x1c, 0x22),
+    dock_tile: Color::new(0x2b, 0x35, 0x3e),
+    dock_tile_active: Color::new(0x2f, 0x6f, 0xa8),
+    tile: Color::new(0x16, 0x54, 0x6b),
+    tile_text: Color::new(0xe8, 0xf2, 0xf6),
+    control: Color::new(0x9a, 0xa8, 0xb4),
+    control_close: Color::new(0xe0, 0x6c, 0x6c),
+    shadow: Color::new(0x00, 0x00, 0x00),
+    button: Color::new(0x2e, 0x38, 0x42),
+    button_hover: Color::new(0x3a, 0x47, 0x53),
+    button_active: Color::new(0x2f, 0x6f, 0xa8),
+    button_text: Color::new(0xe6, 0xee, 0xf4),
+    content_raised: Color::new(0x22, 0x2a, 0x32),
+    panel_height: 30,
+    dock_height: 68,
+    dock_tile_size: 44,
+    dock_gap: 10,
+    dock_margin: 12,
+    tile_size: 132,
+    tile_gap: 16,
+    affordance: 12,
+    affordance_gap: 10,
+    affordance_margin: 10,
+    shadow_offset: 4,
+    shadow_alpha: 56,
+    chrome_alpha: 242,
+    button_height: 30,
+    row_gap: 8,
+    min_window_width: 220,
+    min_window_height: 140,
 };
 
 impl Theme {
+    /// The title bar: inside the border, the full inner width, [`Self::title_height`] tall.
+    ///
+    /// One function rather than the same arithmetic in three places: the compositor draws the
+    /// bar from it, the hit test asks what was clicked from it, and a window dragged by its
+    /// bar is dragged by a rect this produced. A title bar the drawing and the hit test
+    /// disagree about is a window that cannot be grabbed exactly where it looks grabbable.
+    pub fn title_rect(&self, frame: Rect) -> Rect {
+        let border = self.border_width;
+        Rect::new(
+            frame.x + border as i32,
+            frame.y + border as i32,
+            frame.width.saturating_sub(border * 2),
+            self.title_height,
+        )
+    }
+
+    /// The client area: inside the border, below the title bar. What a window's content gets.
+    pub fn body_rect(&self, frame: Rect) -> Rect {
+        let border = self.border_width;
+        let title = self.title_rect(frame);
+        Rect::new(
+            title.x,
+            title.y + title.height as i32,
+            title.width,
+            frame
+                .height
+                .saturating_sub(border * 2 + self.title_height)
+                .max(1),
+        )
+    }
+
+    /// The three title bar affordances, right to left: close, minimise, maximise.
+    ///
+    /// Right to left because close is the one reached for most, and the right-hand corner is
+    /// where every desktop puts it. One private function for all three so they cannot drift
+    /// apart: a spacing change moves them together or not at all.
+    fn affordances(&self, frame: Rect, index: u32) -> Rect {
+        let title = self.title_rect(frame);
+        let size = self.affordance;
+        let step = size + self.affordance_gap;
+        let right = title.x + title.width as i32 - self.affordance_margin as i32;
+        let left = right - size as i32 - (index * step) as i32;
+        Rect::new(
+            left,
+            title.y + (title.height.saturating_sub(size)) as i32 / 2,
+            size,
+            size,
+        )
+    }
+
+    /// The close affordance: the rightmost of the three.
+    pub fn close_rect(&self, frame: Rect) -> Rect {
+        self.affordances(frame, 0)
+    }
+
+    /// The minimise affordance.
+    pub fn minimise_rect(&self, frame: Rect) -> Rect {
+        self.affordances(frame, 1)
+    }
+
+    /// The maximise affordance.
+    pub fn maximise_rect(&self, frame: Rect) -> Rect {
+        self.affordances(frame, 2)
+    }
+
+    /// The work area on a `width` by `height` panel: everything between the top panel and the
+    /// dock. A maximised window fills exactly this, and nothing may be dragged into either bar.
+    pub fn work_area(&self, width: u32, height: u32) -> Rect {
+        let top = self.panel_height;
+        let bottom = self.dock_height + self.dock_margin;
+        Rect::new(
+            0,
+            top as i32,
+            width,
+            height.saturating_sub(top).saturating_sub(bottom).max(1),
+        )
+    }
+
+    /// The dock: centred at the bottom of the panel, as wide as `tiles` of them need.
+    pub fn dock_rect(&self, width: u32, height: u32, tiles: u32) -> Rect {
+        let tile = self.dock_tile_size;
+        let inner = tiles * tile + tiles.saturating_sub(1) * self.dock_gap;
+        let surround = (self.dock_gap + self.padding) * 2;
+        let dock_width = (inner + surround).min(width);
+        Rect::new(
+            width.saturating_sub(dock_width) as i32 / 2,
+            height.saturating_sub(self.dock_height + self.dock_margin) as i32,
+            dock_width,
+            self.dock_height,
+        )
+    }
+
+    /// The `index`th dock tile inside `dock`, centred vertically in it.
+    pub fn dock_tile_rect(&self, dock: Rect, index: u32) -> Rect {
+        let tile = self.dock_tile_size;
+        let step = tile + self.dock_gap;
+        Rect::new(
+            dock.x + (self.dock_gap + self.padding) as i32 + (index * step) as i32,
+            dock.y + dock.height.saturating_sub(tile) as i32 / 2,
+            tile,
+            tile,
+        )
+    }
+
+    /// The `index`th desktop launcher tile, laid out in rows of `columns` from `origin`.
+    pub fn tile_rect(&self, origin: Rect, columns: u32, index: u32) -> Rect {
+        let step = self.tile_size + self.tile_gap;
+        let column = index % columns.max(1);
+        let row = index / columns.max(1);
+        Rect::new(
+            origin.x + (column * step) as i32,
+            origin.y + (row * step) as i32,
+            self.tile_size,
+            self.tile_size,
+        )
+    }
+
     /// The frame a window occupies: its rect plus the border, which the caller's rect does
     /// not include.
     ///

@@ -15,8 +15,12 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use grey_os::{
     acpi, apps, arena, canvas, compositor, disk, display, frame, framebuffer, fs, gdt, halt_loop,
     heap, idt, keyboard, memory, mouse, paging, pic, presenter, qemu, scheduler, serial, sync,
-    theme, timer, usermode, vm, window,
+    theme, timer, ui, usermode, vm, window,
 };
+// The desktop's furniture and the pointer's state machine are the shell's: a press on a dock
+// tile or a title bar is only meaningful in a build somebody can point at.
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
+use grey_os::{desk, wm};
 // The shell only exists in the builds that can type into it: the acceptance run, whose keys
 // come from the harness, and a preview, whose keys come from the person at the keyboard. A
 // normal boot has no way to type into it and a kernel that waited for a command would hang the
@@ -906,7 +910,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // been a log on a screen; from here the screen is a desktop, and later lines go to serial
     // only - `display::set_quiet` is what stops a `println!` from painting over the windows.
     let mut desktop = compositor::Compositor::new(panel.0 as u32, panel.1 as u32, theme::GREY);
-    let free_frames = frame::FRAMES.stats().map_or(0, |stats| stats.free);
     let log_window = desktop.create(
         "log",
         alloc::vec![
@@ -932,19 +935,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         440,
         260,
     );
-    let system = desktop.create(
-        "system",
-        alloc::vec![
-            alloc::format!("{free_frames} frames free"),
-            alloc::format!("{} KiB on the arena", HEAP.stats().bytes_in_use / 1024),
-            alloc::format!(
-                "greyfs: {} file(s)",
-                storage.as_ref().map_or(0, |filesystem| filesystem.count())
-            ),
-        ],
-        420,
-        240,
-    );
+    let system = desktop.create("system", alloc::vec::Vec::new(), 420, 240);
+    // The one window whose body is widgets rather than text: a heading, three facts and the
+    // button this build has. `system_content` builds it, so what the boot paints and what the
+    // button paints after a press are the same call - the numbers cannot drift from the frame.
+    let files = storage.as_ref().map_or(0, |filesystem| filesystem.count());
+    let content = system_content(&desktop, system, files);
+    let _ = desktop.windows.set_widgets(system, content);
     println!(
         "grey-os: theme \"{}\": title {}px, border {}px, padding {}px, text scale {}",
         theme::GREY.name,
@@ -1657,11 +1654,6 @@ fn with_desktop<R>(draw: impl FnOnce(&mut compositor::Compositor) -> R) -> Optio
     Some(draw(unsafe { &mut *pointer }))
 }
 
-/// Paints the whole desktop and then the pointer.
-///
-/// Used when the panel has to be right rather than merely repaired: the first frame, and once
-/// more before an acceptance run ends, so the screenshot a harness takes is the desktop as it
-/// stands rather than whichever damage rect happened to be painted last.
 /// Paints the whole desktop and the pointer, and returns how many windows it drew.
 ///
 /// Used when the panel has to be right rather than merely repaired: the first frame, and once
@@ -1671,7 +1663,12 @@ fn with_desktop<R>(draw: impl FnOnce(&mut compositor::Compositor) -> R) -> Optio
 /// The frame is built in the presenter's back buffer and copied onto the panel. With no
 /// buffer - one whose allocation failed - this paints the panel directly, which is what every
 /// frame did before M13.
+///
+/// The clock is handed to the compositor first, because a transition is a function of the tick
+/// as much as of the window list: a frame drawn without one would be drawn for whatever tick
+/// the last caller happened to leave behind.
 fn paint_all(desktop: &mut compositor::Compositor) -> usize {
+    desktop.set_tick(timer::ticks());
     let pointer = mouse::position();
     let mut drawn = None;
     framebuffer::with_screen(|screen| {
@@ -1702,6 +1699,10 @@ fn paint_all(desktop: &mut compositor::Compositor) -> usize {
 /// and adds the other half: the rect the pointer has left is copied from the buffer, so a
 /// pointer that moves is erased in the same frame that draws it.
 fn redraw(desktop: &mut compositor::Compositor) -> usize {
+    // The tick first: a title bar fading between two colours is a function of the clock, and
+    // the answer to "has this transition finished" has to be today's answer, not the one the
+    // last frame was drawn with.
+    desktop.set_tick(timer::ticks());
     let pointer = mouse::position();
     let mut painted = None;
     framebuffer::with_screen(|screen| {
@@ -1721,6 +1722,56 @@ fn redraw(desktop: &mut compositor::Compositor) -> usize {
         }
     });
     painted.unwrap_or(0)
+}
+
+/// The number on the system window's button: read the machine again.
+const SYSTEM_REFRESH: u8 = 0;
+
+/// The system window's content: what this machine has, and a button that reads it again.
+///
+/// A window's content is a column of [`ui`] widgets when it has any, and this is the only window
+/// in the build that does: the boot creates it, and a press on its button rebuilds it with the
+/// same call. So the numbers the frame shows and the numbers the button refreshes are one
+/// function's output rather than two lists that could drift - and the button is what makes the
+/// toolkit's hover, press and command paths reachable from the machine instead of only from a
+/// test.
+///
+/// The facts come from the statics the boot read them from, which is why the refresh needs
+/// nothing passed in beyond the file count the boot already had.
+fn system_content(
+    desktop: &compositor::Compositor,
+    window: u32,
+    files: usize,
+) -> alloc::vec::Vec<ui::Widget> {
+    let Some(frame) = desktop.windows.window(window).map(|window| window.rect) else {
+        return alloc::vec::Vec::new();
+    };
+    // The content is laid out in the body, which is the area the theme says the widgets own:
+    // the compositor paints the column from that corner and the window list hit tests from it.
+    let body = desktop.theme.body_rect(frame);
+    let frames = alloc::format!(
+        "{} frames free",
+        frame::FRAMES.stats().map_or(0, |stats| stats.free)
+    );
+    let arena = alloc::format!("{} KiB on the arena", HEAP.stats().bytes_in_use / 1024);
+    let storage = alloc::format!("greyfs: {files} file(s)");
+    ui::column(
+        &desktop.theme,
+        body.width,
+        body.height,
+        &[
+            (ui::Kind::Heading, ui::Action::None, "system"),
+            (ui::Kind::Label, ui::Action::None, frames.as_str()),
+            (ui::Kind::Label, ui::Action::None, arena.as_str()),
+            (ui::Kind::Label, ui::Action::None, storage.as_str()),
+            (ui::Kind::Separator, ui::Action::None, ""),
+            (
+                ui::Kind::Button,
+                ui::Action::Command(SYSTEM_REFRESH),
+                "read again",
+            ),
+        ],
+    )
 }
 
 /// Adds a line to the tasks window and damages it, so the next [`redraw`] paints it.
@@ -1967,8 +2018,10 @@ fn user_demo() {
 /// The shell, driven by the keyboard's queue.
 ///
 /// Typing goes through the editor, which is where the line and its history live; a submitted
-/// line is parsed, executed and answered in the window. The pointer's first job is here too:
-/// a click raises whatever is under it.
+/// line is parsed, executed and answered in the window. The pointer is the other half: a press
+/// picks a target - the desktop's furniture, a window's title bar, an edge or one of its
+/// affordances - and holds it until the release, so a window can be raised, moved, resized,
+/// minimised, maximised or closed from the window itself.
 ///
 /// Two builds reach this: the acceptance run, whose input comes from the harness and whose
 /// loop must end on its own, and a preview, where a person types and `SHELL_TICKS` is `None`.
@@ -1989,8 +2042,19 @@ fn run_shell(
     // arriving. Every movement is a packet, and raising whatever the pointer passed over would
     // rearrange the desktop under somebody's hand - and repaint it a packet at a time, which is
     // the flicker the first preview showed while the mouse was moved.
+    //
+    // The session is the whole of what the pointer is doing: a press picks a target and keeps
+    // it until the release, which is what lets a title bar follow a pointer that has left the
+    // window. `wm` owns that state machine and the theme owns the geometry it asks about, so
+    // there is nothing here but the three edges: press, moved, release.
     const LEFT_BUTTON: u8 = 0x01;
-    let mut pressed = mouse::buttons() & LEFT_BUTTON != 0;
+    let mut pointer = wm::Session::new();
+    // The window whose widgets are lit, so that leaving one can clear it: hover is a level, and
+    // a level nobody is standing on any more has to be turned off by somebody.
+    let mut hovered = None;
+    // Whether the current press has said what it is dragging: the first movement of a drag is
+    // worth a line, the ten thousandth is not.
+    let mut announced = false;
     while deadline.is_none_or(|deadline| timer::ticks() < deadline) {
         let mut submitted = None;
         while let Some(event) = keyboard::pop() {
@@ -2004,18 +2068,36 @@ fn run_shell(
             seen_packets = mouse::packets();
             let (x, y) = mouse::position();
             let down = mouse::buttons() & LEFT_BUTTON != 0;
-            let clicked = down && !pressed;
-            pressed = down;
             // The pointer is drawn by `redraw` below, which is also what erases the one it
             // moved away from; drawing it here as well would only draw it twice.
-            let raised = if clicked {
-                desktop.windows.click(x, y)
-            } else {
-                None
-            };
-            if let Some(id) = raised {
-                println!("grey-os: shell: click at {x},{y} raised window #{id}");
+            if down && !pointer.is_down() {
+                press(desktop, &mut pointer, storage, x, y);
+                // A new press gets its own line if it drags something. One line per press, on
+                // the first movement that changes the frame: a drag sends a packet per pixel,
+                // and a packet per line of serial would flood the console the harness reads.
+                announced = false;
+            } else if down {
+                // A movement with something held is a drag. The window list damages what it
+                // moved from and what it moved to, so `redraw` paints both.
+                if pointer.moved(&mut desktop.windows, x, y) && !announced {
+                    if let Some(id) = pointer.grab().window() {
+                        announced = true;
+                        println!("grey-os: shell: moving window #{id} to {x},{y}");
+                    }
+                }
+            } else if pointer.is_down() {
+                // The end of a drag, when there was one: a grab nobody released leaves a window
+                // following the pointer for the rest of the session, so it is worth a line.
+                if let Some(id) = pointer.grab().window() {
+                    println!("grey-os: shell: released window #{id}");
+                }
+                pointer.release();
             }
+            // After the press, not before it: a press can raise a window, close one, or start a
+            // grab, and the widgets that are lit have to be the ones under the pointer once that
+            // has happened. The change damages its frame, which is what `redraw` paints below -
+            // a hover that did not change asks for nothing.
+            let _ = point_at(desktop, &mut hovered, x, y, down);
         }
         if let Some(line) = submitted {
             shell_push(desktop, window, alloc::format!("> {line}"));
@@ -2035,6 +2117,187 @@ fn run_shell(
         keyboard::events(),
         keyboard::dropped()
     );
+}
+
+/// Starts a press at `(x, y)`: the window list first, the furniture second.
+///
+/// A window can stand on a launcher tile, because the launcher is painted before the windows
+/// are, so a press that lands on a window belongs to that window - with whatever grab it takes,
+/// which a launch would leave pointing at another one. The panel and the dock are outside the
+/// work area, so nothing can be over them, and a press there is the furniture's: a press on a
+/// dock tile must raise *its* window, not whichever window the point happens to be over.
+///
+/// The window list's half is [`wm::Session::press`]'s: it classifies the point against the same
+/// theme rects the compositor draws from, raises what it landed on and takes the grab that a
+/// title bar or an edge needs. The target it answers with is what a press *on a window* means,
+/// and the raise has already happened, which is why a press that closes a window still puts it
+/// in front first - the focus a close hands on is the one the user is looking at.
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
+fn press(
+    desktop: &mut compositor::Compositor,
+    pointer: &mut wm::Session,
+    storage: &Option<fs::Filesystem<disk::Pio>>,
+    x: i32,
+    y: i32,
+) {
+    let (session, target) = wm::Session::press(&desktop.theme, &mut desktop.windows, x, y);
+    *pointer = session;
+    if target.window().is_none() {
+        match desktop.desk.hit(&desktop.windows, x, y) {
+            desk::Hit::Dock(id) => {
+                // A dock tile is its window's handle: a press brings it back from the dock.
+                let _ = desktop.windows.unminimise(id);
+                let _ = desktop.windows.raise(id);
+                println!("grey-os: shell: dock tile raised window #{id}");
+                return;
+            }
+            desk::Hit::Launch(index) => {
+                launch(desktop, index);
+                return;
+            }
+            desk::Hit::Panel => {
+                println!("grey-os: shell: press at {x},{y} on the panel");
+                return;
+            }
+            desk::Hit::Wallpaper => {}
+        }
+    }
+    match target {
+        wm::Target::Close(id) => {
+            if desktop.windows.close(id) {
+                println!("grey-os: shell: closed window #{id}");
+            }
+        }
+        wm::Target::Minimise(id) => {
+            if desktop.windows.minimise(id) {
+                println!("grey-os: shell: minimised window #{id}");
+            }
+        }
+        wm::Target::Maximise(id) => {
+            // One affordance for both directions: a window already filling the work area goes
+            // back to the frame it came from.
+            if desktop.windows.restore_window(id) {
+                println!("grey-os: shell: restored window #{id}");
+            } else if desktop.windows.maximise(id) {
+                println!("grey-os: shell: maximised window #{id}");
+            }
+        }
+        // A widget's own action. The window that built the content numbered its buttons, so the
+        // shell runs a number rather than the toolkit knowing what a machine is; the press has
+        // already raised the window, so the command runs in the one the user is looking at.
+        wm::Target::Command { window, action } => command(desktop, storage, window, action),
+        // A title bar or an edge has taken a grab, which becomes visible on the first
+        // movement; a body has only raised its window, which is the whole press.
+        _ => match target.window() {
+            Some(id) => println!("grey-os: shell: press at {x},{y} on window #{id}"),
+            None => println!("grey-os: shell: press at {x},{y} on the wallpaper"),
+        },
+    }
+}
+
+/// What a press on a launcher tile does: brings its application to the front.
+///
+/// A launcher entry names an application, and in this build an application is a window with that
+/// title: a tile whose window is open raises it and takes it out of the dock, and a tile whose
+/// window is not open says so on the serial console. Starting a program from the launcher would
+/// mean a task and a window per press, which is a milestone of its own.
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
+fn launch(desktop: &mut compositor::Compositor, index: usize) {
+    let Some(&name) = desk::LAUNCHER.get(index) else {
+        return;
+    };
+    let id = desktop
+        .windows
+        .iter()
+        .find(|window| window.title.eq_ignore_ascii_case(name))
+        .map(|window| window.id);
+    let Some(id) = id else {
+        println!("grey-os: shell: launcher: {name} is not running");
+        return;
+    };
+    let _ = desktop.windows.unminimise(id);
+    let _ = desktop.windows.raise(id);
+    println!("grey-os: shell: launcher: raised window #{id}");
+}
+
+/// What a press on a widget does: runs the number the window that built the content chose.
+///
+/// A button carries a number rather than a closure because the number has to survive being
+/// stored in a window and pressed by a loop that owns nothing but the desktop. Which numbers
+/// mean what is the content builder's business - in this build there is one builder, the system
+/// window, and one command - so an unclaimed number is said on serial rather than swallowed: a
+/// button that does nothing is a bug in whoever built the content, and a line is how the harness
+/// sees it.
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
+fn command(
+    desktop: &mut compositor::Compositor,
+    storage: &Option<fs::Filesystem<disk::Pio>>,
+    window: u32,
+    action: ui::Action,
+) {
+    let ui::Action::Command(number) = action else {
+        return;
+    };
+    if number != SYSTEM_REFRESH {
+        println!("grey-os: shell: command {number} on window #{window} has no handler");
+        return;
+    }
+    let files = storage.as_ref().map_or(0, |filesystem| filesystem.count());
+    let content = system_content(desktop, window, files);
+    if desktop.windows.set_widgets(window, content) {
+        println!(
+            "grey-os: shell: command {SYSTEM_REFRESH} on window #{window} re-read the machine"
+        );
+    }
+}
+
+/// Points whatever window is under the pointer at it, and answers whether anything changed.
+///
+/// Hover is a level rather than an edge: whatever is under the pointer is lit for as long as it
+/// is there, and the button being down is the only difference between hovered and pressed. The
+/// `last` window is what makes leaving work - [`ui::point`] is told `None` for it, which is the
+/// only way a widget learns the pointer has gone - and both changes damage the whole frame,
+/// because that is the smallest rectangle the caller can be sure holds a widget.
+#[cfg(any(grey_os_input_test, grey_os_interactive))]
+fn point_at(
+    desktop: &mut compositor::Compositor,
+    last: &mut Option<u32>,
+    x: i32,
+    y: i32,
+    down: bool,
+) -> bool {
+    let theme = desktop.theme;
+    let over = desktop.windows.hit(x, y);
+    let mut changed = false;
+    if *last != over {
+        if let Some(previous) = *last {
+            let left = desktop
+                .windows
+                .window_mut(previous)
+                .map(|window| (ui::point(&mut window.widgets, None, false), window.rect));
+            if let Some((lit, rect)) = left {
+                if lit {
+                    changed = true;
+                    desktop.windows.damage(rect);
+                }
+            }
+        }
+        *last = over;
+    }
+    if let Some(id) = *last {
+        let pointed = desktop.windows.window_mut(id).map(|window| {
+            let body = theme.body_rect(window.rect);
+            let at = Some((x - body.x, y - body.y));
+            (ui::point(&mut window.widgets, at, down), window.rect)
+        });
+        if let Some((lit, rect)) = pointed {
+            if lit {
+                changed = true;
+                desktop.windows.damage(rect);
+            }
+        }
+    }
+    changed
 }
 
 /// Replaces the prompt line with the editor's current text.

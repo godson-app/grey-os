@@ -94,6 +94,88 @@ pub fn draw_str(
     pen
 }
 
+/// Draws `text` from `x`, `y` rightwards, painting only what `clip` keeps, and returning the
+/// pen position after the last character.
+///
+/// Masking per pixel rather than dropping glyphs whole. A glyph that straddles the edge of a
+/// damage rect paints the part of itself inside it, which is what a whole frame would have put
+/// there; skipping it instead would leave a gap exactly where a window's edge crossed a line of
+/// text, and the incremental frame would stop being the whole frame minus nothing.
+///
+/// `clip` of `None` draws everything, which is [`draw_str`].
+pub fn draw_str_clipped(
+    canvas: &mut Canvas<'_>,
+    x: i32,
+    y: i32,
+    text: &str,
+    color: Color,
+    scale: usize,
+    clip: Option<Rect>,
+) -> i32 {
+    let Some(clip) = clip else {
+        return draw_str(canvas, x, y, text, color, scale);
+    };
+    let (advance, height) = cell_size(scale);
+    let (advance, height) = (advance as i32, height as i32);
+    // A row the clip does not touch costs nothing to skip, and a row it only partly covers is
+    // drawn, because the part it covers is the part that matters.
+    if y >= clip.y + clip.height as i32 || y + height <= clip.y {
+        return x;
+    }
+    let mut pen = x;
+    for ch in text.chars() {
+        // Stopping at the right edge is not an optimisation: the rest of the string is outside
+        // the clip by construction, and continuing would be one glyph per character of a line
+        // that can be hundreds long.
+        if pen >= clip.x + clip.width as i32 {
+            break;
+        }
+        draw_char_clipped(canvas, pen, y, ch, color, scale, Some(clip));
+        pen = pen.saturating_add(advance);
+    }
+    pen
+}
+
+/// Draws one character, keeping only the pixels inside `clip`.
+///
+/// The glyph is sampled against its own corner and the clip narrows the area sampled, so the
+/// scale blocks stay whole: a damage rect cutting through a character cuts through the same
+/// pixels the whole frame painted, not through the middle of a scaled-up bitmap cell.
+pub fn draw_char_clipped(
+    canvas: &mut Canvas<'_>,
+    x: i32,
+    y: i32,
+    ch: char,
+    color: Color,
+    scale: usize,
+    clip: Option<Rect>,
+) {
+    let Some(clip) = clip else {
+        draw_char(canvas, x, y, ch, color, scale);
+        return;
+    };
+    let scale = clamp_scale(scale);
+    let rows = font::glyph_or_fallback(ch);
+    let (cell_width, cell_height) = cell_size(scale);
+    let block = scale as u32;
+    let glyph = Rect::new(x, y, cell_width, cell_height);
+    let Some(area) = glyph.intersection(clip) else {
+        return;
+    };
+    // `fill_where` hands the mask the pixel's position inside `area`, and the bitmap lives at
+    // the glyph's corner: this is the difference between the two.
+    let offset_x = (area.x - x) as u32;
+    let offset_y = (area.y - y) as u32;
+    canvas.fill_where(area, color, |column, row| {
+        let column = column + offset_x;
+        let row = row + offset_y;
+        let Some(bits) = rows.get((row / block) as usize) else {
+            return false;
+        };
+        bits & (1 << (column / block)) != 0
+    });
+}
+
 /// Width and height in pixels `text` occupies at `scale`, as `(width, height)`.
 ///
 /// Nothing is clipped: this is what a caller needs to decide whether the text fits.

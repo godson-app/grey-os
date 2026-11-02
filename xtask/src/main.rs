@@ -114,9 +114,56 @@ const SMP_STARTED: &str = "grey-os: smp: 1 of 4 cpu(s) started";
 /// Printed by a normal boot once the keyboard has been configured and its handler installed
 /// (M6). The mouse's line follows it, but a machine without a pointer is allowed.
 const INPUT_READY: &str = "grey-os: input: keyboard on irq1";
+/// Printed by the shell when a press was classified against the desktop, with the window it
+/// landed on. The click phase asserts on it: a keystroke can be checked by its echo, and a press
+/// has no echo of its own, so the shell says what it did with it.
+const MOUSE_PRESS: &str = "grey-os: shell: press at";
+/// Printed once per press, on the first movement that moved the window it grabbed. The half of
+/// the phase the press line cannot claim: a press that takes a grab and a movement that follows
+/// it are two packets, and this is the line that says both arrived.
+const MOUSE_DRAG: &str = "grey-os: shell: moving window #";
+/// Printed when the button comes up on a grab. A drag nobody released leaves a window following
+/// the pointer for the rest of the session, and nothing else in the build would say so.
+const MOUSE_RELEASE: &str = "grey-os: shell: released window #";
+/// The left button going down, as one QEMU input event.
+const MOUSE_DOWN: &str = r#"{"type":"btn","data":{"down":true,"button":"left"}}"#;
+/// The left button coming up.
+const MOUSE_UP: &str = r#"{"type":"btn","data":{"down":false,"button":"left"}}"#;
+/// A drag: both axes in one command, so the packet that carries them moves in x and in y. Two
+/// events in one `events` array, which is why this constant holds a comma and the single events
+/// above do not.
+const MOUSE_MOVE: &str = r#"{"type":"rel","data":{"axis":"x","value":40}},{"type":"rel","data":{"axis":"y","value":20}}"#;
+/// How long the harness leaves between the events of one step.
+///
+/// Not a delay between steps - those wait for the guest to answer, because the emulated mouse
+/// accumulates motion and button state into a three-byte packet, so a press and a movement sent
+/// back to back reach the guest as one packet at the destination and there is no drag at all.
+/// That is what the first version of this phase did, and what it saw.
+const CLICK_SPACING: Duration = Duration::from_millis(150);
+/// The steps of the click phase, in order. Each one is sent only after the guest has answered the
+/// last, so the phase proves a press, a drag and a release one packet at a time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Click {
+    /// Press the left button. Acknowledged by [`MOUSE_PRESS`].
+    Press,
+    /// Move with the button down. Acknowledged by [`MOUSE_DRAG`].
+    Drag,
+    /// Let the button up. Acknowledged by [`MOUSE_RELEASE`].
+    Release,
+    /// Every step answered.
+    Done,
+}
 
-/// The theme's desktop colour, which the screenshot check looks for in the corners.
+/// The theme's desktop colour - the wallpaper's ground - which the screenshot check looks for in
+/// the bottom corners, under the shell's panel. The colours here are copied from
+/// `kernel/src/theme.rs`: this crate cannot depend on a `no_std` kernel.
 const DESKTOP_COLOUR: [u8; 3] = [0x1f, 0x6f, 0x8b];
+/// The theme's wallpaper rule colour. The wallpaper is a grid of lines one pixel wide and one
+/// runs along the frame's left edge, so a corner holds the ground or a rule.
+const WALLPAPER_LINE_COLOUR: [u8; 3] = [0x25, 0x79, 0x96];
+/// The shell's panel, which the desk paints across the top of the wallpaper: the frame's top
+/// corners are the panel, not the desktop.
+const PANEL_COLOUR: [u8; 3] = [0x12, 0x18, 0x1d];
 /// A window's body colour, from the same theme. A preview's screenshot is judged on it: the
 /// boot log's background is [`DESKTOP_COLOUR`], so a log line painted after the desktop was
 /// composited replaces window pixels with the desktop's colour and the body stops matching.
@@ -602,6 +649,13 @@ fn input_path(options: &Options) -> Result<()> {
     // something the host can take for granted.
     let mut pending: Vec<&str> = SHELL_COMMANDS.to_vec();
     let mut awaiting: Option<(&str, Instant, u32)> = None;
+    // The click phase: press, drag, release, one step at a time. Each step is sent only after the
+    // desktop has said it saw the last - the shell's own lines are the acknowledgement, exactly as
+    // a command's echo is - because the emulated mouse accumulates motion and button state into a
+    // packet and a burst of events reaches the guest as one packet that is only the last of them.
+    let mut click = Click::Press;
+    let mut clicks = 0;
+    let mut clicked_at = Instant::now();
     loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
@@ -635,6 +689,17 @@ fn input_path(options: &Options) -> Result<()> {
                 }
                 if line.contains(SHELL_LISTENING) {
                     shell_listening = true;
+                }
+                // Each line is the acknowledgement of one step of the click, so the next step is
+                // sent only after the guest has said it saw this one.
+                if click == Click::Press && line.contains(MOUSE_PRESS) {
+                    click = Click::Drag;
+                    clicks = 0;
+                } else if click == Click::Drag && line.contains(MOUSE_DRAG) {
+                    click = Click::Release;
+                    clicks = 0;
+                } else if click == Click::Release && line.contains(MOUSE_RELEASE) {
+                    click = Click::Done;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -670,6 +735,34 @@ fn input_path(options: &Options) -> Result<()> {
                     if pending.is_empty() && awaiting.is_none() {
                         typed_shell = true;
                     }
+                }
+                // The click's next step, after the same silence the typing waits for: the press has
+                // to land on the frame the screenshot was taken of, and the movement has to arrive
+                // while the shell is idle rather than inside the frame that paints the press.
+                if shell_listening
+                    && click != Click::Done
+                    && last_output.elapsed() >= SHELL_SETTLE
+                    && (clicks == 0 || clicked_at.elapsed() >= SHELL_ECHO_TIMEOUT)
+                {
+                    if clicks >= SHELL_TRIES {
+                        bail!(
+                            "the desktop never answered the `{click:?}` step of the click after \
+                             {clicks} attempts, so the pointer's events are not reaching it\
+                             \n--- serial ---\n{log}"
+                        );
+                    }
+                    let events = match click {
+                        Click::Press => MOUSE_DOWN,
+                        Click::Drag => MOUSE_MOVE,
+                        Click::Release | Click::Done => MOUSE_UP,
+                    };
+                    println!(
+                        "click: sending the `{click:?}` step to the machine's mouse (attempt {})",
+                        clicks + 1
+                    );
+                    mouse(&socket, events)?;
+                    clicks += 1;
+                    clicked_at = Instant::now();
                 }
                 if started.elapsed() > TEST_TIMEOUT {
                     let _ = child.kill();
@@ -743,6 +836,21 @@ fn input_path(options: &Options) -> Result<()> {
     }
     println!(
         "pass: `ls`, `mem`, `cpus`, `run fib`, `run nope` and `exit` typed into the shell, the answers and the program's output on serial, `{SHELL_EXIT}` seen"
+    );
+    // The click: a press has to have landed on a window, the movement that followed it has to
+    // have moved that window, and the button coming up has to have let it go. Three packets, three
+    // lines, and none of them is a host test calling the window manager - this is the machine's
+    // own mouse and the shell's own loop.
+    if click != Click::Done {
+        bail!("the click phase stopped at `{click:?}`\n--- serial ---\n{log}");
+    }
+    let landed = log
+        .lines()
+        .find(|line| line.contains(MOUSE_PRESS))
+        .unwrap_or(MOUSE_PRESS);
+    println!(
+        "pass: a click through qmp was classified as `{landed}`, `{MOUSE_DRAG}` followed on the \
+         movement and `{MOUSE_RELEASE}` on the release"
     );
     Ok(())
 }
@@ -875,6 +983,23 @@ fn inject(socket: &Path) -> Result<()> {
         &mut reader,
         r#"{"execute":"input-send-event","arguments":{"events":[{"type":"rel","data":{"axis":"x","value":25}},{"type":"rel","data":{"axis":"y","value":-10}}]}}"#,
     )?;
+    Ok(())
+}
+
+/// Sends input events to the machine's mouse, through the same monitor the keys go through.
+///
+/// `events` is the contents of QEMU's `events` array, so one constant can hold one event and
+/// another the two a drag needs. The command is answered before the function returns, and the
+/// events inside it are one packet by the time the guest reads them - which is why the click phase
+/// sends one *step* per call and waits for the desktop to say it saw it.
+fn mouse(socket: &Path, events: &str) -> Result<()> {
+    let (mut stream, mut reader) = monitor(socket)?;
+    qmp(
+        &mut stream,
+        &mut reader,
+        &format!(r#"{{"execute":"input-send-event","arguments":{{"events":[{events}]}}}}"#),
+    )?;
+    std::thread::sleep(CLICK_SPACING);
     Ok(())
 }
 
@@ -1040,10 +1165,10 @@ fn read_panel(path: &Path) -> Result<(usize, usize, Vec<u8>)> {
 
 /// Checks that the screenshot is a desktop rather than a blank panel.
 ///
-/// Three claims, each of which a compositor that drew nothing or drew it wrong would fail:
-/// the corners are the theme's desktop colour, the frame holds several distinct colours (so
-/// windows were painted on it), and the pointer's fill appears somewhere. The file is kept
-/// under `target/` so a person can look at what the test measured.
+/// Four claims, each of which a compositor that drew nothing or drew it wrong would fail: the top
+/// corners are the shell's panel, the bottom corners are the wallpaper it covers, the frame holds
+/// several distinct colours (so windows were painted on it), and the pointer's fill appears
+/// somewhere. The file is kept under `target/` so a person can look at what the test measured.
 fn check_screenshot(path: &Path) -> Result<()> {
     let (width, height, pixels) = read_panel(path)?;
     let pixel = |x: usize, y: usize| -> [u8; 3] {
@@ -1051,15 +1176,23 @@ fn check_screenshot(path: &Path) -> Result<()> {
         [pixels[index], pixels[index + 1], pixels[index + 2]]
     };
 
+    for (x, y, corner) in [(0, 0, "top left"), (width - 1, 0, "top right")] {
+        let colour = pixel(x, y);
+        if colour != PANEL_COLOUR {
+            bail!(
+                "the {corner} corner of the panel is {colour:?}, not the shell's {PANEL_COLOUR:?} panel"
+            );
+        }
+    }
     for (x, y, corner) in [
-        (0, 0, "top left"),
-        (width - 1, 0, "top right"),
         (0, height - 1, "bottom left"),
+        (width - 1, height - 1, "bottom right"),
     ] {
         let colour = pixel(x, y);
-        if colour != DESKTOP_COLOUR {
+        if !is_wallpaper(colour) {
             bail!(
-                "the {corner} corner of the panel is {colour:?}, not the desktop's {DESKTOP_COLOUR:?}"
+                "the {corner} corner of the panel is {colour:?}, so the wallpaper under the shell's \
+                 panel does not reach it"
             );
         }
     }
@@ -1098,16 +1231,22 @@ fn check_screenshot(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a pixel is the wallpaper: its ground or one of its grid rules.
+fn is_wallpaper(colour: [u8; 3]) -> bool {
+    colour == DESKTOP_COLOUR || colour == WALLPAPER_LINE_COLOUR
+}
+
 /// Checks that a window's corner is blended, which is what tells rounded chrome from a square
 /// one drawn in a rounded-looking colour.
 ///
-/// The desktop is a single colour, so the topmost leftmost pixel that is not it is the corner
-/// of the window nearest the panel's own top left. A frame drawn without antialiasing puts
-/// exactly three colours inside that corner: the desktop, then the frame's edge, then the
-/// body - one hard step from one to the next. Coverage-blended corners instead leave a run of
-/// intermediate colours between them, because a corner pixel is partly inside the shape. Five
-/// distinct colours in a 6x6 square is that run, with room for the pointer not being there at
-/// all; a staircase has three and fails.
+/// The wallpaper is flat between its rules and the shell's panel covers the top of the screen, so
+/// the topmost leftmost pixel below the panel that is not wallpaper is the corner of the window
+/// nearest the panel's own top left - no window is composited above the panel, which is where the
+/// work area starts. A frame drawn without antialiasing puts exactly three colours inside that
+/// corner: the wallpaper, then the frame's edge, then the body - one hard step from one to the
+/// next. Coverage-blended corners instead leave a run of intermediate colours between them,
+/// because a corner pixel is partly inside the shape. Five distinct colours in a 6x6 square is
+/// that run, with room for the pointer not being there at all; a staircase has three and fails.
 fn check_rounded_corner(path: &Path) -> Result<()> {
     /// How wide a corner the blend is looked for in. The theme's corner radius is smaller
     /// than this, and a diagonal fade has to cross it a column at a time.
@@ -1117,10 +1256,19 @@ fn check_rounded_corner(path: &Path) -> Result<()> {
         let index = (y * width + x) * 3;
         [pixels[index], pixels[index + 1], pixels[index + 2]]
     };
+    // The row the wallpaper starts on: the panel and the edge under it are behind by then, and
+    // the desk paints the wallpaper across the whole width, so the left edge of the screen says
+    // where the panel stops and the wallpaper starts.
+    let Some(wallpaper) = (0..height).find(|&y| is_wallpaper(pixel(0, y))) else {
+        bail!(
+            "{} holds no wallpaper under the shell's panel, so the desk was not painted",
+            path.display()
+        );
+    };
     let mut corner = None;
-    'find: for y in 0..height {
+    'find: for y in wallpaper..height {
         for x in 0..width {
-            if pixel(x, y) != DESKTOP_COLOUR {
+            if !is_wallpaper(pixel(x, y)) {
                 corner = Some((x, y));
                 break 'find;
             }
@@ -1128,7 +1276,7 @@ fn check_rounded_corner(path: &Path) -> Result<()> {
     }
     let Some((x, y)) = corner else {
         bail!(
-            "{} is entirely {DESKTOP_COLOUR:?}, so no window was composited onto it",
+            "{} holds nothing but wallpaper below the panel, so no window was composited onto it",
             path.display()
         );
     };
@@ -1140,7 +1288,7 @@ fn check_rounded_corner(path: &Path) -> Result<()> {
     }
     if colours.contains(&POINTER_COLOUR) {
         bail!(
-            "the first non-desktop pixel at {x},{y} is the pointer, not a window's corner, so \
+            "the first pixel on the wallpaper at {x},{y} is the pointer, not a window's corner, so \
              this check measured the wrong thing"
         );
     }
@@ -1152,7 +1300,7 @@ fn check_rounded_corner(path: &Path) -> Result<()> {
         );
     }
     println!(
-        "pass: the corner at {x},{y} fades through {} colours between the desktop and the frame",
+        "pass: the corner at {x},{y} fades through {} colours between the wallpaper and the frame",
         colours.len() - 1
     );
     Ok(())
